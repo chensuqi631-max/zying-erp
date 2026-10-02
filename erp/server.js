@@ -133,6 +133,9 @@ const linkJobStore = new linkJobs.JobStore(path.join(DATA, 'link-jobs'));
 /* 知识产权查重 (上架风控) —— 直连官方商标/外观设计库, 见 ip-check.js 顶部说明。
  * ★ 打包/分发时文件白名单必须带上 ip-check.js。 */
 const ipCheck = require('./ip-check.js');
+/* ★ 2026-10-03 新增: 智赢插件 API 通道 —— 复用插件自己的签名请求层, 直接拿结构化 JSON,
+ *   取代"开页面读 DOM"(8~13s/商品 → 实测 43ms/商品)。详见 _dev-tools\ZYING-API-逆向成果.md */
+const zyApi = require('./zying-api.js');
 
 /* 批量知产查重的作业状态(内存态, 重启即清) —— 查重是"一串串行外部请求",
  * 一次批量几十分钟, 不能让 HTTP 连接挂着等, 所以学采集那样做成"后台跑 + 轮询进度"。 */
@@ -2367,6 +2370,159 @@ function fillCatFromPanel(item) {
   item.catSrc = 'panel';
   if (!item.catPath) item.catPath = narrow ? (broad + ' > ' + narrow) : broad;
   return item;
+}
+
+/**
+ * ★ 2026-10-03 新增: 把【智赢插件 API】返回的商品记录合并进库内商品。
+ *
+ * 为什么值得单独写一个合并器: 这条通道拿到的字段是【插件服务端口径】, 比 DOM 抓取更权威 ——
+ *   · BSR[] 带类目名与榜单链接 → 直接给出父类(宽)/子类(细)排名, 不用再解析页面文本
+ *     (页面文本解析正是 2026-09-13 那批"串页脏数据"的成因, 见 dropContaminatedBsr 注释)
+ *   · SellerCountry → 权威卖家国家, 取代"从插件国旗图标猜"的启发式
+ *   · FirstTime → 真实上架日期(页面 Date First Available 常缺)
+ *   · Offers[] → 全部跟卖 + 是否 FBA + 是否拿购物车, DOM 里要翻弹窗才能凑齐
+ *   · BrandHasRecord → 品牌备案
+ * 实测覆盖率(20 条 de 样本): Offers 20/20, SellerCountry 18/20, FirstTime 14/20, BSR 2/20, Sales 2/20。
+ *   ⇒ 接口不是万能的, 缺的字段仍要靠 DOM/详情页补, 所以这里只做"有就覆盖", 绝不编造。
+ *
+ * 覆盖原则: 接口值是权威 → 覆盖; 接口没给的字段一律不碰(尤其 price, 接口根本不返回)。
+ * 父/子排名口径: API 的 BSR 里 Rank 最大者 = 宽类目(实测与面板「店铺选品」一致:
+ *   597725 Auto & Motorrad ↔ 面板店铺选品 #597725 Auto & Motorrad), 最小者 = 细类目(榜单选品)。
+ */
+function mergeZyApiRecord(it, rec) {
+  if (!it || !rec || typeof rec !== 'object') return false;
+  let n = 0;
+  const S = (v) => (v == null ? null : (String(v).trim() || null));
+
+  if (S(rec.Brand) && (!it.brand || it.brand === 'Unknown')) { it.brand = S(rec.Brand); n++; }
+  if (S(rec.Manufacturer) && !it.manufacturer) { it.manufacturer = S(rec.Manufacturer); n++; }
+
+  // ① BSR → 权威排名 (覆盖)
+  const bs = (Array.isArray(rec.BSR) ? rec.BSR : [])
+    .filter((b) => b && b.Rank != null && Number(b.Rank) > 0)
+    .map((b) => ({ rank: Number(b.Rank), category: S(b.Title), link: S(b.Link), id: S(b.Id) }));
+  if (bs.length) {
+    const main = bs.reduce((a, b) => (b.rank > a.rank ? b : a));
+    const subs = bs.filter((x) => x !== main).sort((a, b) => a.rank - b.rank);
+    it.bsr = [{ rank: main.rank, category: main.category, level: 'main' }]
+      .concat(subs.map((x) => ({ rank: x.rank, category: x.category, level: 'sub' })));
+    it.bsrShop = main.rank; it.bsrShopCat = main.category;
+    it.bsrShopLink = main.link || null;
+    it.bsrCat = subs.length ? subs[0].rank : null;
+    it.bsrCatName = subs.length ? subs[0].category : null;
+    it.bsrCatLink = subs.length ? (subs[0].link || null) : null;
+    it.rankSrc = 'zying-api';
+    it.rankAt = now();
+    n++;
+  }
+
+  // ② 权威卖家国家 (取代国旗猜解) —— chinaSeller 三态口径与全库一致
+  const cc = S(rec.SellerCountry) ? String(rec.SellerCountry).trim().toUpperCase() : null;
+  if (cc && /^[A-Z]{2}$/.test(cc)) {
+    it.sellerCountryCode = cc;
+    // 复用 links-collector 里唯一那份大中华区判定(CN/HK/TW/MO), 不另立一份口径
+    it.chinaSeller = linksCollector.isChinaRegionCode(cc);
+    it.sellerCountrySrc = 'zying-api';
+    n++;
+  }
+  if (S(rec.SellerName) && !it.mainSeller) { it.mainSeller = S(rec.SellerName); n++; }
+  if (S(rec.SellerId) && !it.sellerId) { it.sellerId = S(rec.SellerId); n++; }
+
+  // ③ 跟卖 Offers[] → 跟卖数 / 主卖家 / 配送方式
+  const of = Array.isArray(rec.Offers) ? rec.Offers.filter((o) => o && (o.SellerId || o.SellerName)) : [];
+  if (of.length) {
+    it.followCount = of.length;
+    it.offers = of.map((o) => ({
+      sellerId: S(o.SellerId), currency: S(o.Currency), listing: o.Listing == null ? null : Number(o.Listing),
+      shipping: o.Shipping == null ? null : Number(o.Shipping), isFba: o.IsFba === true,
+      buyBox: o.IsBuyBoxWinner === true, shipsFrom: S(o.ShipsFrom), prime: o.IsPrime === true,
+      feedbackCount: o.FeedbackCount == null ? null : Number(o.FeedbackCount),
+      positiveRate: o.SellerPositiveFeedbackRating == null ? null : Number(o.SellerPositiveFeedbackRating),
+    }));
+    it.offersAt = now();
+    const bb = of.find((o) => o.IsBuyBoxWinner === true) || of[0];
+    if (bb) {
+      it.fulfill = bb.IsFba === true ? 'FBA' : 'FBM';       // ★ 直接给出 FBA/FBM, 不用猜
+      if (!it.mainSeller && S(bb.SellerId)) it.mainSeller = S(bb.SellerId);
+    }
+    n++;
+  }
+  if (rec.ShipByAmazon === true || rec.ShipByAmazon === false) { it.shipByAmazon = rec.ShipByAmazon === true; n++; }
+
+  // ④ 真实上架日期 (页面 Date First Available 经常读不到)
+  const ft = S(rec.FirstTime) || '';
+  const m = ft.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})/);
+  if (m) {
+    const iso = m[1] + '-' + String(m[2]).padStart(2, '0') + '-' + String(m[3]).padStart(2, '0');
+    it.firstAvailable = iso;
+    if (!it.listedAt) it.listedAt = iso;
+    it.firstAvailableSrc = 'zying-api';
+    n++;
+  }
+
+  // ⑤ 变体属性 (颜色/尺寸) —— 与已有 variantAttrs 合并, 不覆盖已有键
+  if (rec.Variations && typeof rec.Variations === 'object') {
+    const va = (it.variantAttrs && typeof it.variantAttrs === 'object') ? it.variantAttrs : {};
+    let add = 0;
+    for (const [k, v] of Object.entries(rec.Variations)) { if (v != null && va[k] == null) { va[k] = String(v); add++; } }
+    if (add) { it.variantAttrs = va; n++; }
+  }
+
+  // ⑥ 卖点
+  if (Array.isArray(rec.BulletPoint) && rec.BulletPoint.length && !(Array.isArray(it.bulletPoints) && it.bulletPoints.length)) {
+    it.bulletPoints = rec.BulletPoint.map((x) => String(x).slice(0, 400)).slice(0, 8);
+    n++;
+  }
+
+  // ⑦ 月销 (接口有值才写; DOM 那套存在伪造值的历史, 这里以接口为准)
+  if (rec.Sales != null && Number(rec.Sales) >= 0) { it.monthlySales = Number(rec.Sales); it.salesSrc = 'zying-api'; n++; }
+
+  // ⑧ 品牌备案
+  if (typeof rec.BrandHasRecord === 'boolean') {
+    it.brandHasRecord = rec.BrandHasRecord;
+    if (rec.BrandHasRecord) it.brandStatus = 'registered';
+    if (Array.isArray(rec.BrandSources) && rec.BrandSources.length) it.brandSources = rec.BrandSources.map(String).slice(0, 10);
+    n++;
+  }
+
+  // ⑨ 尺寸/包裹尺寸: 原样保留, 【不】硬塞进 size/weight —— API 只给数值数组+单位,
+  //    没有明确字段语义, 猜错等于伪造数据(库里已有过这类教训)。留给后续人工核对后再用。
+  if (Array.isArray(rec.Dimensions) && rec.Dimensions.length) { it.apiDimensions = rec.Dimensions.slice(0, 4); it.apiDimensionsUnit = S(rec.DimensionsUnit); n++; }
+  if (Array.isArray(rec.PackageDimensions) && rec.PackageDimensions.length) { it.apiPackageDimensions = rec.PackageDimensions.slice(0, 4); n++; }
+  if (Array.isArray(rec.SuggestMarket) && rec.SuggestMarket.length) { it.suggestMarket = rec.SuggestMarket.map(String).slice(0, 10); n++; }
+
+  it.apiAt = now();
+  it.apiSrc = 'zying-api';
+  return n > 0;
+}
+
+/* API 采集任务状态 (长任务: 全库回填要十几分钟, 同步 HTTP 会超时 —— 与 brand-batch 同一教训) */
+let zyApiJob = null;
+function apiJobPublic() {
+  if (!zyApiJob) return { running: false, total: 0 };
+  const j = zyApiJob;
+  return {
+    running: j.running, startedAt: j.startedAt, finishedAt: j.finishedAt || null,
+    site: j.site, mode: j.mode, dryRun: j.dryRun, total: j.total, done: j.done, got: j.got,
+    merged: j.merged, failed: j.failed, rateLimited: j.rateLimited,
+    ms: j.ms, perItemMs: j.perItemMs, fieldHits: j.fieldHits, samples: j.samples,
+    stopped: j.stopped, error: j.error, lastLog: j.lastLog || null,
+  };
+}
+
+/**
+ * 预演版: 用【与真实合并完全相同的实现】跑一遍, 再 diff 出会变的字段名。
+ * 为什么不另写一份"预演逻辑": 两份实现必然随时间漂移, 预演就会撒谎。
+ */
+function zyApiWouldChange(it, rec) {
+  const before = JSON.stringify(it);
+  const clone = JSON.parse(before);
+  if (!mergeZyApiRecord(clone, rec)) return false;
+  const changedKeys = [];
+  const keys = new Set(Object.keys(JSON.parse(before)).concat(Object.keys(clone)));
+  const b0 = JSON.parse(before);
+  for (const k of keys) if (JSON.stringify(b0[k]) !== JSON.stringify(clone[k])) changedKeys.push(k);
+  return { keys: changedKeys };
 }
 
 // ===== 变体族(SPU)识别 (2026-09) =====
@@ -11067,6 +11223,92 @@ const server = http.createServer((req, res) => {
       // 阶段2 (CDP): 代表商品详情页 → 品牌跳转链接 → 品牌页列表 (+翻页, 列表可判条件先预筛)
       // 阶段3 (CDP): 通过预筛的候选逐个读完整详情页 → 品牌名校验 → 统一采集筛选 → 每品牌保留 maxPerBrand 个
       // 采集筛选与「类目搜索采集」完全同一套 (canonical filter → canonicalToCollectFilter → applyCollectFilter)
+      /* ★ 2026-10-03 新增: 走【智赢插件 API】采集/回填商品字段 (不开页面、不读 DOM)
+       *   POST /api/collect/api-run   { mode, asins?, site, limit, batch, gapMs, dryRun }
+       *     mode: 'given'          只跑给定 asins
+       *           'missing-country'  库里缺 sellerCountryCode 的(默认, 用于把"国旗猜的"换成权威值)
+       *           'missing-rank'     库里缺 rankParent 的
+       *           'all'              该站点全部
+       *   长任务 → 立即返回 jobId, 进度查 GET /api/collect/api-status
+       *   实测 (20/批): 43 ms/商品; 但接口有配额, 连打多轮会短暂失败(插件统一报"网络连接失败"),
+       *   数分钟自恢复 → 所以必须限速(gapMs)且可断点续跑(失败批次不阻塞整体)。 */
+      if (p === '/api/collect/api-run' && req.method === 'POST') {
+        if (zyApiJob && zyApiJob.running) return send(409, { ok: false, error: '已有一个 API 采集任务在跑', job: apiJobPublic() });
+        const site = String(j.site || 'de').toLowerCase();
+        const mode = String(j.mode || 'given');
+        const dryRun = j.dryRun === true;
+        const limit = Math.max(0, Number(j.limit) || 0);
+        let asins = Array.isArray(j.asins) ? j.asins.map((x) => String(x).trim().toUpperCase()).filter((x) => /^[A-Z0-9]{10}$/.test(x)) : [];
+        if (mode !== 'given') {
+          let pool = products.filter((x) => (x.site || '') === site);
+          if (mode === 'missing-country') pool = pool.filter((x) => !x.sellerCountryCode);
+          else if (mode === 'missing-rank') pool = pool.filter((x) => x.rankParent == null);
+          asins = pool.map((x) => x.asin);
+        }
+        if (limit) asins = asins.slice(0, limit);
+        if (!asins.length) return send(200, { ok: true, total: 0, note: '没有需要处理的商品' });
+
+        zyApiJob = {
+          running: true, startedAt: now(), site, mode, dryRun, total: asins.length,
+          done: 0, got: 0, merged: 0, fieldHits: {}, failed: 0, rateLimited: 0, ms: 0,
+          perItemMs: null, stopped: false, error: null, samples: [],
+          asins,
+        };
+        const job = zyApiJob;
+        (async () => {
+          try {
+            const { data, stats } = await zyApi.moreAboutAsin(asins, site, {
+              batch: Math.min(20, Math.max(1, Number(j.batch) || 20)),
+              gapMs: j.gapMs == null ? 900 : Math.max(0, Number(j.gapMs)),
+              retries: j.retries == null ? 3 : Number(j.retries),
+              log: (m) => { job.lastLog = m; },
+              onProgress: (pr) => { job.done = pr.done; job.got = pr.got; },
+            });
+            if (job.stopped) { job.running = false; return; }
+            let merged = 0;
+            const byAsin = new Map(products.map((x, i) => [x.asin, i]));
+            for (const [asin, rec] of Object.entries(data || {})) {
+              const idx = byAsin.get(asin);
+              if (idx == null) { job.failed++; continue; }
+              const it = products[idx];
+              const before = { bsr: it.bsrShop, cc: it.sellerCountryCode, ft: it.firstAvailable, off: it.followCount, ful: it.fulfill, ms: it.monthlySales };
+              const changed = dryRun ? zyApiWouldChange(it, rec) : mergeZyApiRecord(it, rec);
+              if (changed) {
+                merged++;
+                if (!dryRun) products[idx] = applyRankFields(it);
+                for (const k of (changed.keys || [])) job.fieldHits[k] = (job.fieldHits[k] || 0) + 1;
+                if (job.samples.length < 8) job.samples.push({ asin, before, after: { bsr: rec.BSR ? rec.BSR.length + '条' : null, cc: rec.SellerCountry || null, ft: rec.FirstTime || null, off: (rec.Offers || []).length, sales: rec.Sales == null ? null : rec.Sales, changed: changed.keys } });
+              }
+            }
+            if (!dryRun && merged) save('products.json', products);   // 覆盖前自动备份
+            job.merged = merged;
+            Object.assign(job, { failed: job.failed + (stats.failedBatches || 0), rateLimited: stats.rateLimited || 0, ms: stats.ms, perItemMs: stats.perItemMs, got: stats.got });
+          } catch (e) {
+            job.error = String((e && e.message) || e).slice(0, 300);
+          } finally {
+            job.running = false; job.finishedAt = now();
+          }
+        })();
+        return send(200, { ok: true, started: true, job: apiJobPublic() });
+      }
+      if (p === '/api/collect/api-status' && req.method === 'GET') {
+        return send(200, apiJobPublic());
+      }
+      if (p === '/api/collect/api-stop' && req.method === 'POST') {
+        if (zyApiJob) { zyApiJob.stopped = true; zyApiJob.running = false; }
+        return send(200, { ok: true, stopped: true });
+      }
+      if (p === '/api/collect/api-selftest' && req.method === 'GET') {
+        // 快速自检: 会话能否建立 + 插件是否已登录 + 配额值 (不消耗商品配额)
+        try {
+          const s = await zyApi.session();
+          let limitVal = null, ver = null;
+          try { limitVal = await zyApi.apiLimit(); } catch (e) {}
+          try { ver = (await zyApi.pluginVersion()).Number; } catch (e) {}
+          return send(200, { ok: true, extId: s.extId, page: s.pageUrl, modules: s.modules, apiMod: s.apiMod, reqMod: s.reqMod, pluginVersion: ver, apiLimit: limitVal });
+        } catch (e) { return send(500, { ok: false, error: String(e.message).slice(0, 300) }); }
+      }
+
       if (p === '/api/collect/brand-batch' && req.method === 'POST') {
         /* ★ 2026-10-02 修: 站点原来只认 j.site, 缺省写死 'au' —— 而前端「批量品牌采集」表单里
          * 根本没有 site 字段 → 界面上用这个功能永远只按【澳洲站】找线索品牌, 别的站点一律报
