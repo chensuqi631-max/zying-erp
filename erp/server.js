@@ -1927,8 +1927,11 @@ function itemMatchesBadge(item, badge) {
  *   · 榜单选品 (细分类目, 数字小, 如 #1129 Car Armrests) → 入库写进 bsr / bsrCatName  ← 小排名
  * 历史坑: bsr 数组早先只装「榜单选品」(小排名), 于是各处拿 max(bsr) 当排名用 → 与界面上显示的
  * rank(大排名) 不是一个数: 商品管理排名筛选按小排名过, 采集筛选更是直接读 item.bsr (面板链路的商品
- * 根本没有 bsr 数组) → 一设排名区间就整批跳过。现在采集筛选 / 商品管理筛选 / 列表预筛 / 界面显示
- * 全部走 bigRankOf(), 一个口径。
+ * 根本没有 bsr 数组) → 一设排名区间就整批跳过。
+ * ★ 2026-10-02 再次纠正: 排名的"唯一口径"是 rankParentOf()(父类排名), 不是 bigRankOf ——
+ *   bigRankOf 会把"只有一条页面原生BSR"(按设计属子类)也算进来, 与界面卡片显示对不上。
+ *   采集筛选 / 商品管理筛选 / 列表预筛 / 界面显示 / 导出 现在全部走 rankParentOf()。
+ *   bigRankOf 仅保留给"排名明细汇总"这类确实需要看全部排名的场景。
  * ==========================================================================*/
 function itemRankNums(item) {
   if (!item) return [];
@@ -1962,6 +1965,40 @@ function bigRankOf(item) {
   const a = itemRankNums(item);
   return a.length ? Math.max.apply(null, a) : null;
 }
+/* ===== ★ 2026-10-02 「父类排名(大)」唯一口径 ==========================================
+ * 背景(用户实测反馈): 卡片上「父类排名」显示"未采到", 但勾了「排除没有排名的商品」
+ * 它却还在 —— 因为两处用了不同的字段:
+ *   · 界面卡片显示的是 rankParent          (1239 条)
+ *   · 筛选判的是 bigRankOf(=所有排名取最大) (2757 条) ← 多了 1518 条
+ * 那 1518 条只有**一条页面原生 BSR**: 按 §排名字段分离的设计, 单条原生 BSR 归【子类】,
+ * 父类位置一律 null(绝不拿子类顶替)。所以 bigRankOf 把它们当"有排名"是错的 ——
+ * bigRankOf 是"所有排名里的最大值", 不等于"有父类排名"。
+ *
+ * 现在起:**「大排名」只有一个定义 = rankParentOf()**, 界面 / 筛选 / 导出全部用它，
+ * 用户所见即所得。bigRankOf 只保留给"排名明细汇总"这类需要看所有排名的场景。
+ *
+ * 规则与 applyRankFields() 完全一致(必须一致, 否则又会分叉):
+ *   ① 面板「店铺选品」 bsrShop      → 父类(权威)
+ *   ② 页面原生 BSR 有 >=2 条时取最大 → 父类(宽类目在前)
+ * 已入库的商品直接读字段; 还没入库的原始卡片(采集筛选场景)按同一规则现算。
+ * ★ 不再有"历史大排名(legacy rank)兜底": legacy rank 是旧代码写的 max(bsr), 本身混了子类排名,
+ *   拿它当父类就是脏数据成因(详见 applyRankFields 里的说明)。
+ * ============================================================================== */
+function rankParentOf(item) {
+  if (!item) return null;
+  // 已入库: 字段是权威(applyRankFields 写的), 有键就用键(哪怕是 null —— 表示确实没有)
+  if (Object.prototype.hasOwnProperty.call(item, 'rankParent')) {
+    return item.rankParent == null ? null : Number(item.rankParent);
+  }
+  // 原始卡片(采集筛选): 现算(与 applyRankFields 同一规则)
+  const e = itemRankEntries(item);
+  const pickMax = (arr) => (arr.length ? arr.reduce((a, b) => (b.rank > a.rank ? b : a)) : null);
+  const par = e.filter((x) => x.src === 'bsrShop');
+  const bar = e.filter((x) => x.src === 'bsr');
+  let P = pickMax(par);
+  if (!P && bar.length >= 2) P = pickMax(bar);
+  return P ? P.rank : null;
+}
 /* ===== 排名字段分离: 父类排名 / 子类排名 (两个字段严格分开, 绝不互相顶替) ==============
  * 口径 (唯一): 排名数值【最大】的是父类排名(宽类目), 数值【最小】的是子类排名(细分类目)。
  * 来源归属 (插件面板一次给两个排名, 千万别混):
@@ -1986,12 +2023,16 @@ function itemRankEntries(item) {
   if (Array.isArray(item.bsr)) for (const b of item.bsr) add(b && b.rank, b && (b.category || b.name), 'bsr');
   return out;
 }
-/** 父类排名 = 所有排名里的最大值 (取不到 → null) */
+/* ⚠️ 2026-10-02 弃用警告: parentRankOf / childRankOf 是"所有排名取最大/最小"的旧口径,
+ * 它们把【子类排名】(单条页面原生BSR、榜单选品)也算进父类 —— 正是"卡片显示未采到、
+ * 筛选却认为有排名"的成因。现在没有任何地方在用它们(仅保留定义, 防止外部误用)。
+ * 要取父类排名请一律用 rankParentOf(); 要"看所有排名汇总"用 bigRankOf()。 */
+/** 父类排名 = 所有排名里的最大值 (取不到 → null) —— ⚠️ 已弃用, 见上方警告 */
 function parentRankOf(item) {
   const a = itemRankEntries(item).map((x) => x.rank);
   return a.length ? Math.max.apply(null, a) : null;
 }
-/** 子类排名 = 所有排名里的最小值 (取不到 → null) */
+/** 子类排名 = 所有排名里的最小值 (取不到 → null) —— ⚠️ 已弃用, 见上方警告 */
 function childRankOf(item) {
   const a = itemRankEntries(item).map((x) => x.rank);
   return a.length ? Math.min.apply(null, a) : null;
@@ -2047,7 +2088,43 @@ function sanitizeProductFields(item) {
   if (item.rankParent != null && !item.rankParentCat) {
     item.rankParentCat = item.bsrShopCat || item.bsrCatName || null;
   }
+  /* ⑦ ★ 2026-10-02 「上架日期」不能等于【这一条的采集日期】。
+   * 实测(全库 9526 条): listedAt 与 collectedAt 同一天的有 2909 条 = 92.3%。
+   *   一个采集批次里成百上千个来自几百个不同店铺的商品"恰好全都在采集当天上架"是不可能的 ——
+   *   那是插件面板把"数据时间/抓取时间"当成了"上架时间"(或解析落到了别的字段)。
+   * 后果(用户实测反馈): 「上架天数区间」筛 1~3650 天只出来 2 条 —— 真正可靠的上架日期来源是
+   *   firstAvailable(详情页 Date First Available, 全库仅 3 条); 而 listedAt 这个被污染的字段
+   *   又被上架天数筛选忽略, 于是两边都不可用。
+   * 处置: 与既有口径一致(本文件多处写着"读不到上架日期 → null (不写今天)") —— 等于采集当天的置 null,
+   *   宁可"未知", 不留假值。真实日期(明显早于采集日的, 如 "8 Sep 2023")照常保留。
+   * ⚠️ 必须跟 item.collectedAt 比, 不能跟"今天"比 —— 采集是几周前做的, 拿今天比一条都抓不到(踩过这个坑)。
+   * 注意: 只清 listedAt, 不动 firstAvailable; 上架天数筛选优先用 firstAvailable, 其次退回 listedAt。 */
+  if (item.listedAt) {
+    const d = parseFirstAvailable(String(item.listedAt));
+    const c = parseFirstAvailable(String(item.collectedAt || ''));
+    const base = c || new Date();                     // 没有采集时间就退回"今天"
+    if (d && d.getFullYear() === base.getFullYear() && d.getMonth() === base.getMonth() && d.getDate() === base.getDate()) {
+      item.listedAt = null; listedAtSameAsCollectDropped++;
+    }
+  }
   return item;
+}
+
+/** 统计: 被判定为"面板把采集当天当上架日期"而丢弃的条数 (排查用, 不参与业务) */
+let listedAtSameAsCollectDropped = 0;
+
+/**
+ * 上架日期(取最可靠的那个) —— 「上架天数区间」筛选用。
+ * 来源优先级:
+ *   ① firstAvailable = 商品详情页的 "Date First Available" ← 唯一权威来源
+ *   ② listedAt       = 插件面板的「上架」(已被 sanitizeProductFields 剔掉"等于今天"的假值)
+ * 两个都没有 → null(严格模式: 不满足, 会被筛掉; 这是"没采到"不是"不符合")。
+ */
+function listedDateOf(item) {
+  if (!item) return null;
+  const a = parseFirstAvailable(item.firstAvailable);
+  if (a) return a;
+  return parseFirstAvailable(item.listedAt);
 }
 
 /** 统一写入父类/子类排名字段 (所有入库入口调用; 幂等, 可重复执行) */
@@ -2059,11 +2136,17 @@ function applyRankFields(item) {
   const par = e.filter((x) => x.src === 'bsrShop');                        // 面板店铺选品 = 父类(权威)
   const chi = e.filter((x) => x.src === 'bsrCat');                         // 面板榜单选品 = 子类
   const bar = e.filter((x) => x.src === 'bsr');                            // 页面原生 BSR
-  const unk = e.filter((x) => x.src === 'rank' || x.src === 'maxRank');
-  // 父类: ① 面板店铺选品 ② 页面原生 BSR 有 >=2 条时取最大(宽类目在前) ③ 历史大排名兜底
+  /* ★ 2026-10-02 去掉"历史大排名(rank/maxRank)兜底"这条父类来源。
+   * 为什么必须去掉(实测): 旧代码写 rank 时用的是 `max(bsr)` —— 而 bsr 数组里装的是
+   *   【榜单选品/小排名】(见本文件上方"历史坑"注释)。所以 legacy rank 本身就混了子类排名,
+   *   拿它当父类排名正是这批脏数据的成因 —— 也正是文件里那条铁律禁止的事:
+   *   "父类来源缺失时 rankParent 一律 null, 绝不拿子类数值顶替父类"。
+   * 代价(要如实告知): 全库约 1518 条"只有一条页面原生BSR/只有 legacy rank"的商品,
+   *   父类排名会变成"未采到" —— 但它们的【子类排名】照常保留(那才是它们真正的排名),
+   *   而且界面卡片与筛选从此完全一致(所见即所得)。需要父类排名就补采。
+   * 唯一合法的父类来源(两条): ① 面板「店铺选品」bsrShop ② 页面原生 BSR 有 >=2 条时取最大。 */
   let P = pickMax(par);
   if (!P && bar.length >= 2) P = pickMax(bar);
-  if (!P && !bar.length && !chi.length && unk.length) P = pickMax(unk);
   // 子类: 面板榜单选品 + 页面原生 BSR 中【不等于父类值】的那些里取最小
   const childPool = chi.concat(bar).filter((x) => !(P && x.rank === P.rank));
   let C = pickMin(childPool);
@@ -2075,6 +2158,17 @@ function applyRankFields(item) {
   item.rankChild = C ? C.rank : null;
   item.rankChildCat = C ? C.category : null;
   item.rankChildSrc = C ? C.src : null;
+  /* ★ 2026-10-02 同步历史字段 rank (= 大排名): 必须与权威字段 rankParent 一致。
+   * 为什么必须同步(实测代价): 父/子排名分离之前, 旧代码把"所有排名取最大"写进了 rank,
+   *   分离之后 rankParent 只认父类来源 → 两者的差是 1518 条(只有一条页面原生BSR的商品,
+   *   按设计归子类)。rank 不同步就会留下矛盾:
+   *     · 导出列「大排名」取的是 rank  → 导出看着有排名、界面卡片却显示"未采到"
+   *     · itemRankEntries() 会把 rank 当成一条排名参与 max 计算 → 反过来污染父类判定
+   *   所以在这里一次性对齐(幂等: 下次读到的 rank 已经等于 rankParent)。
+   *   rank 仍是字符串形式("#191727"), 保持与历史数据的兼容。 */
+  item.rank = item.rankParent == null ? null : ('#' + item.rankParent);
+  item.rankMain = item.rankParent;              // 数值形态, 供导出/统计用
+  item.rankMainText = item.rankParent == null ? null : ('#' + item.rankParent);
   /* ★ 2026-09-25 未上榜三态 (铁律: 只做"有/没有/没采到"的记录, 绝不编造数字)
    *   'ok'         有这一侧的排名
    *   'not_listed' 插件面板【已分析完】且确实读到了排名行, 就是没有这一侧的排名 → 未上榜
@@ -2311,9 +2405,10 @@ function applyCollectFilter(item, filter) {
   if (f.aplus === true && !item.aplus) return false;                          // 旧字段兼容: 仅有 A+
   else if (f.aplus === false && item.aplus) return false;                     // 旧字段兼容: 排除 A+
   if (f.rankMin != null || f.rankMax != null) {                                    // 大排名区间
-    // ★ 用大排名 (max 所有排名来源): 面板链路的商品只有 bsrShop/bsrCat, 没有 bsr 数组 ——
-    //   旧写法只读 item.bsr → 判成"无排名" → 排名区间一设就整批跳过 (实测 4/4 全跳过)。
-    const bigR = bigRankOf(item);
+    // ★ 2026-10-02: 统一用 rankParentOf()(= 界面卡片「父类排名」的同一口径)。
+    //   旧写法用 bigRankOf(所有排名取最大) → 会把"只有一条页面原生BSR"(属子类)的商品
+    //   也算成有父类排名, 造成"卡片显示未采到、却被排名区间筛出来"。
+    const bigR = rankParentOf(item);
     if (bigR == null) return false;                                                // 严格模式: 没有排名 = 不满足
     if (f.rankMin != null && bigR < f.rankMin) return false;
     if (f.rankMax != null && bigR > f.rankMax) return false;
@@ -2361,17 +2456,17 @@ function applyCollectFilter(item, filter) {
   if (f.followMax != null && !((item.followCount || 0) <= f.followMax)) return false;
   // 卖家维度: 排除亚马逊自营
   if (f.noAmz === true && item.amazonSell) return false;
-  // 无排名 (旧字段, 与商品管理同一口径: bigRankOf == null 才算无排名)
+  // 无排名 (旧字段, 与商品管理同一口径: rankParentOf == null 才算无排名)
   // ★ 2026-09-25 大排名三态筛选: 'ok' 有大排名 / 'not_listed' 未上榜 / 'unknown' 未采集到
   //   注意: 未上榜 = 插件面板已分析完、确实没有根类目排名行 —— 与"没采到"是两回事, 必须能分开筛
   if (f.rankState) {
     const st = rankParentStateOf(item);
     if (st !== f.rankState) return false;
   }
-  if (f.noRank === true && bigRankOf(item) != null) return false;
-  // ★ 2026-09-24 只看有排名 (= 排除没有排名的商品): 判据与 noRank 完全一致 (bigRankOf == null), 语义相反;
-  //   与商品库 /api/products?hasRankOnly=1 同一口径。
-  if (f.hasRankOnly === true && bigRankOf(item) == null) return false;
+  if (f.noRank === true && rankParentOf(item) != null) return false;
+  // ★ 2026-09-24 只看有排名 (= 排除没有排名的商品); ★ 2026-10-02 口径统一为 rankParentOf()
+  //   —— 必须与界面卡片「父类排名」完全一致, 否则用户会看到"勾了排除无排名、结果里还有未采到的"。
+  if (f.hasRankOnly === true && rankParentOf(item) == null) return false;
   // ★ 2026-09-25 大排名三态(列表页卡片就能判: 面板已就绪但没有根类目行 = 未上榜)
   if (f.rankState && rankParentStateOf(item) !== f.rankState) return false;
   if (f.sites && f.sites.length && item.site && !f.sites.includes(item.site)) return false; // 站点多选 (勾选之外跳过)
@@ -2386,13 +2481,14 @@ function applyCollectFilter(item, filter) {
   if (f.brandStatus === 'notfound' && item.brandStatus !== 'notfound') return false;      // 品牌状态: 仅未查到
   if (f.brandStatus === 'tm' && (item.tmMark || /TM|注册商标/.test(item.brandStatus || ''))) return false; // 品牌状态: 排除TM申请中
   if (f.newDaysMin != null || f.newDaysMax != null) {                              // 上架天数区间 (新品)
-    const d = parseFirstAvailable(item.firstAvailable);
+    // ★ 2026-10-02: 与商品库同一口径 listedDateOf() (firstAvailable 优先, 退回 listedAt)
+    const d = listedDateOf(item);
     if (!d) return false;
     const days = (Date.now() - d.getTime()) / 86400000;
     if (f.newDaysMin != null && days < f.newDaysMin) return false;
     if (f.newDaysMax != null && days > f.newDaysMax) return false;
   } else if (f.newDays != null) {                                                  // 旧字段兼容: 上架 ≤ N 天
-    const d = parseFirstAvailable(item.firstAvailable);
+    const d = listedDateOf(item);
     if (!d || (Date.now() - d.getTime()) > f.newDays * 86400000) return false;
   }
   return true;
@@ -2726,7 +2822,7 @@ function preFilterByList(item, filter) {
   if (f.fulfill === 'AMZ') { if (!item.amazonSell) return false; }
   else if (f.fulfill && item.fulfill && item.fulfill !== f.fulfill) return false;   // 插件标签明确不匹配 → 筛掉; 无标签 → 保留
   if (f.rankMax != null || f.rankMin != null) {
-    const bigR = bigRankOf(item);                                                  // ★ 大排名口径
+    const bigR = rankParentOf(item);                                               // ★ 大排名唯一口径(与界面卡片一致)
     if (bigR != null) {                                                            // 未知 → 保留待详情确认
       if (f.rankMin != null && bigR < f.rankMin) return false;
       if (f.rankMax != null && bigR > f.rankMax) return false;
@@ -5189,9 +5285,9 @@ async function cdpFollowShopChain(url, opts = {}) {
       if (pf.priceMin != null && lp < pf.priceMin) return false;
       if (pf.priceMax != null && lp > pf.priceMax) return false;
     }
-    // 排名 (大排名口径; 未知留待详情)
+    // 排名 (大排名唯一口径 rankParentOf; 未知留待详情)
     if (pf.rankMax != null || pf.rankMin != null) {
-      const bigR = bigRankOf(it);
+      const bigR = rankParentOf(it);
       if (bigR != null) {
         if (pf.rankMin != null && bigR < pf.rankMin) return false;
         if (pf.rankMax != null && bigR > pf.rankMax) return false;
@@ -9393,13 +9489,32 @@ const server = http.createServer((req, res) => {
 
       // 统一过滤条件: 空模板 + 字段清单 (前端面板与后端同一份定义; 两个页面共用)
       if (p === '/api/filter/spec' && req.method === 'GET') {
+        /* ★ 2026-10-02 「排除商标国家」多选下拉的选项来源(用户要求把这个条件做成多选下拉框)。
+         * = 常用商标局(固定前置) ∪ 库内实际出现过的国家 —— 保证"能勾的都真有数据"。
+         * 库里没有时(cur 为空)下拉只显示常用项 + 一句提示, 不会给一堆点了 0 条的选项。 */
+        const TM_COMMON = ['欧盟', '英国', '美国', '德国', '法国', '意大利', '西班牙', '荷兰', '瑞典', '波兰',
+          '日本', '中国', '韩国', '澳大利亚', '加拿大', '墨西哥', '巴西', '印度', '新加坡', '阿联酋', '土耳其', '马德里'];
+        const tmSeen = new Map();
+        for (const x of products) {
+          if (!Array.isArray(x.tmCountries)) continue;
+          for (const c of x.tmCountries) { const k = String(c || '').trim(); if (k) tmSeen.set(k, (tmSeen.get(k) || 0) + 1); }
+        }
+        const tmOpts = TM_COMMON.slice();
+        [...tmSeen.keys()].sort((a, b) => tmSeen.get(b) - tmSeen.get(a)).forEach((c) => { if (tmOpts.indexOf(c) < 0) tmOpts.push(c); });
         return send(200, {
           empty: normFilter({}),
           keys: FILTER_KEYS,
           groups: {
             productOnly: ['noRank', 'collectedFrom', 'collectedTo', 'cat1', 'cat2', 'cat1Cn', 'famFilter', 'famKey', 'famAny'],   // ★ 补登记: 这些条件采集侧无对应判定 (badgeNot/hasRankOnly 两处同义, 故不在此列)
-            collectOnly: ['shopAplus', 'brandShop', 'brandStore'],
+            /* ★ 2026-10-02 修: dropOtherBrand(他牌商品/剔除他牌) 原来不在 collectOnly,
+             *   于是商品管理面板里也画了它 —— 但 /api/products 的查询链路根本不认这个键,
+             *   用户点了"没反应"(实测 dropOtherBrand=0 → 返回全库 9526 条, 一个都没筛)。
+             *   它是采集侧概念(采集时要不要把非目标品牌的商品也收下), 商品库里没有这个维度,
+             *   所以登记成 collectOnly: 采集面板照常显示, 商品管理面板不再显示。 */
+            collectOnly: ['shopAplus', 'brandShop', 'brandStore', 'dropOtherBrand'],
           },
+          tmCountryOptions: tmOpts,
+          tmCountryCounts: [...tmSeen.entries()].sort((a, b) => b[1] - a[1]).slice(0, 40).map(([c, n]) => ({ country: c, count: n })),
         });
       }
       // 过滤条件 → 命中数 (采集前预估 / 商品管理实时计数共用)
@@ -9856,11 +9971,13 @@ const server = http.createServer((req, res) => {
         // ★ 这里曾经用 max(bsr) 当排名 —— 那是「榜单选品/小排名」, 与界面上显示的 rank(大排名, 店铺选品)
         //   不是一个数, 导致「界面显示 #363439 超区间, 却被小排名 12473 筛进 1-200000」。现统一用 bigRankOf()。
         const rr = parseRange(q.get('rankRange'));
-        // ★ 2026-09-24 修正口径不一致: 界面「大排名」列读的是 rankParent, 而筛选曾用 bigRankOf()
-        //   (= 所有排名取最大, 把 Amazon 页面原生 BSR 的【小排名】也算进去) → 实测出现
-        //   "界面显示未采到、却被 大排名≤150000 筛出来" 共 9,026 条 (如 B0GWPLFHNT 小排名102/无大排名)。
-        //   现与界面同口径: 只认 rankParent。
-        const rankOf = (x) => (x.rankParent == null ? null : Number(x.rankParent));
+        // ★ 2026-10-02 口径统一(修用户实测反馈): 界面卡片「父类排名」显示的、筛选判定的、
+        //   导出用的, 现在全部是同一个 rankParentOf()。
+        //   历史教训(这段注释别删): 曾经界面读 rankParent、筛选读 bigRankOf(=所有排名取最大),
+        //   两者差 1518 条(只有一条页面原生BSR的商品) → 用户看到"卡片明明显示未采到, 
+        //   勾了「排除没有排名的商品」却还在" / "排名区间筛不到它"。
+        //   单条页面原生BSR 按设计归【子类】, 父类位置必须 null —— 所以 bigRankOf 不能当大排名用。
+        const rankOf = (x) => rankParentOf(x);
         if (rr) list = list.filter((x) => { const r = rankOf(x); return r != null && r >= rr.min && r <= rr.max; });
         else {
           if (q.get('rankMax') !== null && q.get('rankMax') !== '') { const rl = parseInt(q.get('rankMax'), 10); list = list.filter((x) => { const r = rankOf(x); return r != null && r <= rl; }); }
@@ -9893,10 +10010,12 @@ const server = http.createServer((req, res) => {
             });
           }
         }
-        // 上架天数区间 (新品): 用 firstAvailable 计算天数
+        // 上架天数区间 (新品): ★ 2026-10-02 改用 listedDateOf() —— 优先详情页 firstAvailable,
+        //   退回面板 listedAt(已剔除"等于采集当天"的假值)。
+        //   旧写法只认 firstAvailable(全库仅 3 条) → 用户筛 1~3650 天只出来 2 条, 看着像筛选坏了。
         const nd = parseRange(q.get('newDaysRange'));
         if (nd) list = list.filter((x) => {
-          const d = parseFirstAvailable(x.firstAvailable);
+          const d = listedDateOf(x);
           if (!d) return false;
           const days = (Date.now() - d.getTime()) / 86400000;
           return days >= nd.min && days <= nd.max;
@@ -9921,11 +10040,10 @@ const server = http.createServer((req, res) => {
         if (q.get('tmMax') !== null && q.get('tmMax') !== '') list = list.filter((x) => (x.trademarkCount || 0) <= parseInt(q.get('tmMax'), 10));
         if (q.get('followMin') !== null && q.get('followMin') !== '') list = list.filter((x) => (x.followCount || 0) >= parseInt(q.get('followMin'), 10)); // 跟卖数 ≥ N
         if (q.get('followMax') !== null && q.get('followMax') !== '') list = list.filter((x) => (x.followCount || 0) <= parseInt(q.get('followMax'), 10)); // 跟卖数 ≤ N
-        // 无排名: noRank=1 —— 判定必须与排名区间同一个口径 (bigRankOf), 否则会出现
-        // "既有 rank 却又没有排名" 的商品: 排名区间筛不到它, 勾无排名也不认它 → 两边都掉队。
-        if (q.get('noRank') === '1') list = list.filter((x) => x.rankParent == null);
-        // ★ 只看有排名 (排除没有排名的商品) hasRankOnly=1 —— 与 noRank 同一判据 (bigRankOf), 语义相反
-        if (q.get('hasRankOnly') === '1') list = list.filter((x) => bigRankOf(x) != null);
+        // 无排名: noRank=1 —— ★ 2026-10-02 与 rankParentOf 同一口径(界面卡片「父类排名」)
+        if (q.get('noRank') === '1') list = list.filter((x) => rankParentOf(x) == null);
+        // ★ 只看有排名 (排除没有排名的商品) hasRankOnly=1 —— 同一口径(rankParentOf), 语义相反
+        if (q.get('hasRankOnly') === '1') list = list.filter((x) => rankParentOf(x) != null);
         // ★ 2026-09-25 大排名三态(未上榜 / 未采集到 / 有大排名) —— 三态互斥, 旧数据算"未采集到"
         const rankStateQ = q.get('rankState');
         if (rankStateQ === 'ok' || rankStateQ === 'not_listed' || rankStateQ === 'unknown') {
@@ -9966,10 +10084,21 @@ const server = http.createServer((req, res) => {
         //   为什么不用上面的 category 包含匹配: 那是拿整条面包屑字符串做子串匹配,
         //   既会把二级类目名误当大类目命中, 也没法用类目树里的准确值。类目树(/api/products/cat-tree)给的
         //   就是 cat1/cat2 原值, 所以这里精确判等。
-        if (q.get('cat1')) { const c1 = String(q.get('cat1')); list = list.filter((x) => String(x.cat1 || '') === c1); }
+        // ★ 2026-10-02 修: 分类树里有一个大类目叫「(未分类)」(全库 78.9% 的商品没有 cat1)。
+        //   旧写法 String(x.cat1||'') === '(未分类)' → 数据侧是空串, 永远不相等 →
+        //   用户点这个大类目必然 0 条(实测 7517 条计数、0 条结果), 看着像"分类筛选不准"。
+        //   现在两边统一: 空 / null / '(未分类)' 三种写法都归到「(未分类)」这一个桶。
+        const cat1Key = (x) => { const v = String(x.cat1 == null ? '' : x.cat1).trim(); return v || '(未分类)'; };
+        if (q.get('cat1')) { const c1 = String(q.get('cat1')); list = list.filter((x) => cat1Key(x) === c1); }
         if (q.get('cat2')) { const c2 = String(q.get('cat2')); list = list.filter((x) => String(x.cat2 || '') === c2); }
         // ★ 2026-09 中文大类目: 按【归并后的中文大类】筛 (库内 cat1 是多语言细类目名, 无法直接给用户选)
-        if (q.get('cat1Cn')) { const cn = String(q.get('cat1Cn')); list = list.filter((x) => catCnOf(x.cat1 || '(未分类)') === cn); }
+        //   ★ 2026-10-02: catCnOf('(未分类)') 返回的是「未分类」(少一对括号), 与树里的「(未分类)」
+        //   对不上 → 点它也是 0 条。这里做一次别名归一, 两种写法都能命中。
+        if (q.get('cat1Cn')) {
+          const cn = String(q.get('cat1Cn'));
+          const cnAlias = (v) => (v === '(未分类)' || v === '未分类' ? '未分类' : v);
+          list = list.filter((x) => cnAlias(catCnOf(cat1Key(x))) === cnAlias(cn));
+        }
         // ★ 2026-09 变体族筛选 (字段由 rebuild-variant-groups 写入)
         const famKeyOfX = (x) => (x && (x.parentAsin || x.asin)) || null;
         const isMultiFam = (x) => Number(x.variantCount || 0) >= 2;
