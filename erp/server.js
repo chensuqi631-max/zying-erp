@@ -7008,8 +7008,31 @@ async function cdpBrandBatch(opts = {}) {
         await new Promise((r) => setTimeout(r, 8000));
         const guard2 = await cdpPageGuard(send);
         if (guard2 === 'captcha') { rec.error = '品牌页触发验证码/风控'; break; }
-        for (let i = 0; i < 4; i++) { await send('Runtime.evaluate', { expression: `window.scrollTo(0, ${(i + 1) * 4000})` }); await new Promise((r) => setTimeout(r, 900)); }
-        await new Promise((r) => setTimeout(r, 1200));
+        /* ★ 2026-10-02 删掉原来的「滚动 4×4000px」—— 实测证明它对读商品【零增量】:
+         *   对照实验(amazon.de/s?k=NaNMiBHd): 不滚动 9s 读到 16 条, 21s 仍 16 条;
+         *   滚 4 次后还是 16 条, 只有文档高变了(10255→10384, 那是懒加载图片不是新商品卡)。
+         *   代价却是每页 ~4.8 秒。而且 links-collector.waitCardsReady 里早就记录过同一结论
+         *   ("列表页滚动对插件数据的增量是 0... 滚一遍反而引起重渲染"), 那套已经不滚了,
+         *   这里是漏改的遗留。
+         *   改成【轮询到卡片数稳定】: 卡片数连续 3 轮不变就认为渲染完, 既不用死等, 也不会
+         *   在亚马逊重渲染(瞬时 0 卡)时把整页读成空。 */
+        {
+          let prev = -1, stable = 0;
+          const countCards = async () => {
+            const c = await send('Runtime.evaluate', {
+              expression: `document.querySelectorAll('div[data-asin][data-component-type="s-search-result"]').length`,
+              returnByValue: true,
+            });
+            return Number(c.result.value) || 0;
+          };
+          for (let k = 0; k < 10; k++) {
+            const n = await countCards();
+            if (n > 0 && n === prev) { stable++; if (stable >= 3) break; }
+            else { stable = 0; }
+            prev = n;
+            await new Promise((r) => setTimeout(r, 900));
+          }
+        }
         const rl = await send('Runtime.evaluate', { expression: BRAND_LIST_JS, returnByValue: true });
         let items = [];
         try { items = JSON.parse(rl.result.value || '[]'); } catch (e) { items = []; }
