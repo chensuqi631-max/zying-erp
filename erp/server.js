@@ -2453,10 +2453,26 @@ function catCnOfRaw(raw) {
  *  (例: 家居类商品的二级 "Car Freshener" 会被归成"汽车用品"), 排除一级会连带砍掉它。 */
 function catMatchText(x) {
   const c1 = String(x.cat1 || '(未分类)');
+  /* ★ 2026-10-02 修(用户实测反馈「排除了类目还在商品库里显示」):
+   * 全库 70.2% 的商品 cat1/cat2/catPath 都是空的, 只有 category 有值
+   *   (实测 283 条 category = "Boot Mats" / "Front & Radiator Grilles" / "Steering Wheel Covers" …,
+   *    全是 Amazon 给的叶子类目名, 但明显是汽车配件)。
+   * 旧匹配串里 category 是【原样】拼进去的 → 里面只有英文 "boot mats",
+   *   没有中文大类名 → 排除「汽车用品」匹配不到 → 它们留在结果里,
+   *   可用户看到的类目列就是 "Boot Mats" —— 于是反馈"排除了还在显示"。
+   * 修法: cat1 为空时, 把 category 也过一遍 catCnOf 归并, 让中文大类名出现在匹配串里。
+   * 只在 cat1 为空时加 —— 有 cat1 的商品(29.8%)行为完全不变, 零误伤。
+   * ⚠️ 必须排除【采集模式名】(Links/FollowShop/ListDirect/Search/Shop…): 它们不是商品类目,
+   *   归并只会落到「其他类目」兜底桶 —— 实测不加这个护栏, "排除其他类目" 会从 310 条
+   *   暴涨到 6953 条(把 6690 条没类目的商品全牵连进来), 语义就乱了。 */
+  const CAT_MODE_NAMES = /^(Links|FollowShop|ListDirect|ListFiltered|Search|Shop|Category|Brand|Asin|ListPage|List|其他)$/i;
+  const extra = (c1 === '(未分类)' && x.category && !CAT_MODE_NAMES.test(String(x.category).trim()))
+    ? catCnOf(String(x.category)) : '';
   return [
     c1,
     String(x.cat2 || ''),
     catCnOf(c1),
+    extra,
     String(x.catPath || ''),
     String(x.category || ''),
   ].join(' | ').toLowerCase();
@@ -10079,8 +10095,16 @@ const server = http.createServer((req, res) => {
         let list = [...products];
         if (q.get('risk')) list = list.filter((x) => x.aiRiskLevel === q.get('risk'));
         if (q.get('fba')) list = list.filter((x) => x.fulfill === q.get('fba'));
-        if (q.get('sell') === 'amz') list = list.filter((x) => x.amazonSell);   // AMZ 自营
-        if (q.get('sell') === 'third') list = list.filter((x) => !x.amazonSell); // 第三方卖家
+        /* ★ 2026-10-02 修正「仅第三方」的口径不严(用户实测反馈) ——
+         * 原写法: 仅自营 = x.amazonSell(严格) / 仅第三方 = !x.amazonSell(宽松)
+         *   → 两侧不对称: 全库 amazonSell=true 41 条、false 3127 条、null 6360 条,
+         *     「仅第三方」返回 9487(把 6360 条"没采到自营标记"的也算成第三方了)。
+         * 语义定位: 「仅第三方」「非中国卖家」是【正向选择】, 按本文件既定约定
+         *   "商品库里未知字段视为不满足" → 必须用 === false 严格判定。
+         *   (而「排除 A+」「排除已备案」「排除 1688」是【排除语义】, 未知不该被排除 → 保持宽松, 不动。)
+         * 修后: 仅自营 41 + 仅第三方 3127 + 未知 6360 = 9528, 三块互斥不重叠。 */
+        if (q.get('sell') === 'amz') list = list.filter((x) => x.amazonSell === true);
+        if (q.get('sell') === 'third') list = list.filter((x) => x.amazonSell === false);
         if (q.get('saved') === '1') list = list.filter((x) => x.saved);          // 只看已保存
         if (q.get('real') === '1') list = list.filter((x) => x.real);            // 只看真实采集
         // 自定义筛选: 区间(支持 "100-200" / "100-"(≥100) / "-200"(≤200)) + 阈值
@@ -10197,8 +10221,9 @@ const server = http.createServer((req, res) => {
         } else if (rankStateQ === 'not_listed_or_unknown') {
           list = list.filter((x) => rankParentStateOf(x) !== 'ok');           // 所有"没有大排名"的
         }
-        if (q.get('china') === '1') list = list.filter((x) => x.chinaSeller);
-        if (q.get('china') === '0') list = list.filter((x) => !x.chinaSeller);
+        // ★ 2026-10-02 同上: 「中国卖家 / 非中国卖家」是正向选择, 未知(没读到国旗)视为不满足。
+        if (q.get('china') === '1') list = list.filter((x) => x.chinaSeller === true);
+        if (q.get('china') === '0') list = list.filter((x) => x.chinaSeller === false);
         // 站点: 支持多选 (逗号分隔, 如 "uk,us,de")
         if (q.get('site')) {
           const sites = q.get('site').split(',').map((s) => s.trim()).filter(Boolean);
@@ -12357,8 +12382,43 @@ const server = http.createServer((req, res) => {
         return send(200, { ...prod, compliance: complianceCheck(prod) });
       }
 
-      if (p === '/api/branddb') return send(200, { total: branddb.length, items: branddb });
+      /* ★ 2026-10-02 按「卖家」批量回填卖家国家(中国卖家) —— 供国旗采集脚本用。
+       * 背景: 存量 9526 条的 chinaSeller 是旧代码硬编码的 false, 从没真采过。
+       *   重采全部商品代价太大(每个详情页 8~13 秒), 但【卖家国家只取决于卖家】——
+       *   799 个唯一卖家就覆盖了 7693 条商品, 所以只要拿到「卖家→国家」映射就能一次回填。
+       * 入参: { map: { "卖家名": "CN" | "US" | "GB" | ... } }  (显式 false 也接受, 表示"明确非中国")
+       * 语义与采集侧一致(三态): 给了国家代码 → 按大中华区判定 true/false; 没给的卖家不动(保持未知)。
+       * 返回: 命中并更新的商品数 + 覆盖到的卖家数。 */
+      if (p === '/api/products/seller-country' && req.method === 'POST') {
+        const map = (j && j.map && typeof j.map === 'object') ? j.map : null;
+        if (!map) return send(400, { error: '缺少 map 参数: { map: { "卖家名": "CN" } }' });
+        const keys = Object.keys(map);
+        if (!keys.length) return send(400, { error: 'map 为空' });
+        let updated = 0;
+        const hitSellers = new Set();
+        const applied = {};
+        products.forEach((x) => {
+          const s = x.seller || x.mainSeller;
+          if (!s) return;
+          const code = map[s];
+          if (code == null || code === '') return;
+          const cc = String(code).toUpperCase();
+          const china = linksCollector.isChinaRegionCode(cc);
+          if (x.sellerCountryCode !== cc) { x.sellerCountryCode = cc; updated++; }
+          if (x.chinaSeller !== china) { x.chinaSeller = china; }
+          hitSellers.add(s);
+          applied[cc] = (applied[cc] || 0) + 1;
+        });
+        if (updated) save('products.json', products, true);
+        return send(200, {
+          ok: true, updated, matchedSellers: hitSellers.size, inputSellers: keys.length,
+          byCountry: Object.keys(applied).sort((a, b) => applied[b] - applied[a]).slice(0, 20).map((c) => c + '×' + applied[c]),
+          chinaTrue: products.filter((x) => x.chinaSeller === true).length,
+          chinaFalse: products.filter((x) => x.chinaSeller === false).length,
+        });
+      }
 
+      if (p === '/api/branddb') return send(200, { total: branddb.length, items: branddb });
       if (p === '/api/rules') return send(200, { total: rules.length, items: rules });
 
       if (p === '/api/compliance/check' && req.method === 'POST') {
