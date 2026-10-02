@@ -46,7 +46,6 @@
  *   所以复制过去即可用，只要按第 4 部分传入那些函数。
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-
 'use strict';
 /**
  * 多链接采集器（第五步编排 + 采集筛选）
@@ -246,7 +245,7 @@ function panelLabelRe(name) {
 }
 
 /** 解析插件面板文本 → 结构化字段 */
-function parsePanelText(txt) {
+function parsePanelText(txt, flagInfo) {
   const f = (name) => {
     const m = txt.match(panelLabelRe(name));
     if (!m) return null;
@@ -288,23 +287,92 @@ function parsePanelText(txt) {
     weight: f('重量'),
     fbaFee: (txt.match(/FBA费用\s*[:：]\s*([^\s|]+)/) || [])[1] || null,
     tmStatus: tm ? { count: Number(tm[1]), status: tm[2] } : null,
+    /* ★ 2026-10-02 卖家国家 —— 数据来自【国旗图标】(DOM), 不是面板文本, 所以由调用方把
+     * readSellerFlag() 的结果当第二个参数传进来(卡片链路走 __flag, 详情页链路走 EXPR_DETAIL_PANEL.flag)。
+     * 三态很重要, 别把"没读到"当成"非中国":
+     *   chinaSeller === true   → 大中华区(CN/HK/TW/MO, 与插件国旗分组一致) → 中国卖家
+     *   chinaSeller === false  → 读到了国旗, 但不是大中华区 → 明确非中国卖家
+     *   chinaSeller === null   → 没读到国旗(插件未登录 / 面板没渲染完) → 未知
+     * 采集筛选用严格模式: 勾了「中国卖家」时未知不满足 —— 否则会把非中国卖家一起采回来。 */
+    sellerCountryCode: (flagInfo && flagInfo.code) ? String(flagInfo.code).toUpperCase() : null,
+    sellerFlagCode: (flagInfo && flagInfo.flagCode) ? String(flagInfo.flagCode).toUpperCase() : null,
+    chinaSeller: (flagInfo && flagInfo.code) ? isChinaRegionCode(flagInfo.code) : null,
   };
 }
+
+/* ===== ★ 2026-10-02 卖家国家（国旗图标）=================================================
+ * 需求来源: 用户要按「中国卖家」筛商品。智赢插件面板在【卖家】那一行画了一面国旗:
+ *     <div class="zying-flag-conmp-wrap">
+ *       <img src="chrome-extension://<扩展id>/assets/flag/XX.svg"/>
+ *       <span>  </span>
+ *     </div>
+ * 从插件源码(assets/js/content.js 模块 84614)反推 + 实测确认:
+ *     const t = { HK:"CN", TW:"CN", MO:"CN" }        // 港澳台也画 CN 旗
+ *     <img src={SI(t[code] || code)} />               // 图上用的是"映射后"的代码
+ *     <span>{ t[code] ? code : "" }</span>            // 只有港澳台才在 span 里写出真实代码
+ * 所以判定规则(实测样本 amazon.de/dp/B0FPBX31HQ → code=CN, span 为空 → 中国大陆):
+ *     img 末段 = XX, span 为空        → 真实代码就是 XX
+ *     img 末段 = CN, span = HK/TW/MO  → 真实代码是 span 里的那个(港澳台)
+ * ⚠️ 位置纪律: 国旗是【卖家行】的子节点(实测父链: wrap → span → div"卖家：xxx" → 行容器)。
+ *    页面别处(如 icp-nav-flag-de)也有 flag 类名, 但那是亚马逊自己的站点选择器, 必须排除 ——
+ *    所以只认 `.zying-flag-conmp-wrap` 这个插件专属类名。
+ * ====================================================================================== */
+const READ_FLAGS_FN = `
+  /**
+   * 读卖家国家国旗。root 可以是卡片元素、面板根节点或 shadowRoot。
+   * @returns {{code:string, flagCode:string, spanCode:string, src:string}|null}
+   *   code     = 归一后的真实国家代码 (CN / HK / TW / MO / 其他国家)
+   *   flagCode = 图标文件里的代码 (港澳台会显示 CN)
+   */
+  function readSellerFlag(root) {
+    if (!root || !root.querySelectorAll) return null;
+    let wraps = [];
+    try { wraps = root.querySelectorAll('.zying-flag-conmp-wrap'); } catch (e) { return null; }
+    for (const w of wraps) {
+      const img = w.querySelector('img');
+      if (!img) continue;
+      const src = img.getAttribute('src') || img.src || '';
+      const m = src.match(/\\/flag\\/([A-Za-z]{2})\\.svg/);
+      if (!m) continue;
+      const flagCode = m[1].toUpperCase();
+      const sp = w.querySelector('span');
+      const spanCode = sp ? (sp.textContent || '').trim().toUpperCase() : '';
+      const code = /^(HK|TW|MO)$/.test(spanCode) ? spanCode : flagCode;
+      return { code: code, flagCode: flagCode, spanCode: spanCode || null, src: src };
+    }
+    return null;
+  }
+`;
+/** 大中华区口径: 与插件国旗的分组一致(港澳台也画 CN 旗) —— 它们都算「中国卖家」。
+ *  想细分就自己看 item.sellerCountryCode。 */
+const CHINA_REGION_CODES = ['CN', 'HK', 'TW', 'MO'];
+function isChinaRegionCode(c) { return CHINA_REGION_CODES.indexOf(String(c || '').toUpperCase()) >= 0; }
 
 /** 读商品详情页的插件面板（含加载完成判定：既无"正在分析"也无"正在加载"） */
 const EXPR_DETAIL_PANEL = `(() => {
   ${COLLECT_FN}
+  ${READ_FLAGS_FN}
   const HOSTS = ['#zying-amazon-float', '#zying-global-react-host', '.zy-tool-detail', '.zying-shadow-root'];
   const parts = [];
-  for (const sel of HOSTS) document.querySelectorAll(sel).forEach((h) => { const t = collect(h.shadowRoot || h, 0).replace(/\\s+/g,' ').trim(); if (t) parts.push(t) });
+  let flagRoot = null, flagLen = 0;
+  for (const sel of HOSTS) document.querySelectorAll(sel).forEach((h) => {
+    const r = h.shadowRoot || h;
+    const t = collect(r, 0).replace(/\\s+/g,' ').trim();
+    if (t) parts.push(t);
+    // ★ 卖家国旗: 在同一个面板根里找, 取文本最长的那个面板(与排名读取同一套"最大即主面板"约定)
+    const tl = (r.textContent || '').length;
+    if (/ASIN\\s*[:：]/.test(r.textContent || '') && tl > flagLen) { flagLen = tl; flagRoot = r }
+  });
   const txt = parts.join(' || ').trim();
-  if (!txt) return JSON.stringify({ ok: false });
-  return JSON.stringify({ ok: true, analyzing: /正在分析|正在加载/.test(txt), loading: (txt.match(/正在加载/g)||[]).length, txt });
+  const flag = flagRoot ? readSellerFlag(flagRoot) : null;
+  if (!txt) return JSON.stringify({ ok: false, flag: flag });
+  return JSON.stringify({ ok: true, analyzing: /正在分析|正在加载/.test(txt), loading: (txt.match(/正在加载/g)||[]).length, txt, flag: flag });
 })()`;
 
 /** ★ 详情页读【结构化排名行】(标签位置会变, 必须按 DOM 读; 见 READ_RANKS_FN 注释) */
 const EXPR_DETAIL_RANKS = `(() => {
   ${READ_RANKS_FN}
+  ${READ_FLAGS_FN}
   const HOSTS = ['#zying-amazon-float', '#zying-global-react-host', '.zy-tool-detail', '.zying-shadow-root'];
   let root = null, len = 0;
   for (const sel of HOSTS) document.querySelectorAll(sel).forEach((h) => {
@@ -314,6 +382,7 @@ const EXPR_DETAIL_RANKS = `(() => {
   });
   if (!root) return JSON.stringify({ ok: false });
   const info = readRanks(root);
+  info.flag = readSellerFlag(root);          // ★ 顺手把卖家国旗一起带回来(同一次 evaluate, 不额外开销)
   info.ok = true;
   return JSON.stringify(info);
 })()`;
@@ -374,9 +443,12 @@ const EXPR_READ_AOD = `(() => {
     // ★ 2026-09-24: 之前只认英/德文 → FR/ES/IT 站的跟卖卖家配送方式永远为 null; 且 "Sold by" 单独出现就判 FBM 过宽
     const fulfill = FBA_PAGE_RE.test(noFee) ? 'FBA' : (FBM_PAGE_RE.test(noFee) ? 'FBM' : null);
     const eta = (txt.match(/(\\d{1,2}\\s*-\\s*\\d{1,2}\\s+\\w+|\\w+\\s+\\d{1,2}\\s*-\\s*\\d{1,2})/) || [])[1] || null;
-    const n = parseFloat(String(price || '').replace(/[^0-9.]/g, '')) || Infinity;
+    // ★ 2026-10-02 价格比较用 parseMoneyText 的口径(见 opts.parseMoneyText 注入)。
+    //   旧写法 replace(/[^0-9.]/g,'') 在 de 站会把 "29,99 €" 读成 2999 —— 拿它比价会选错卖家。
+    const money = (typeof opts.parseMoneyText === 'function') ? opts.parseMoneyText : (v) => { const x = parseFloat(String(v == null ? '' : v).replace(/[^0-9.]/g, '').replace(',', '.')); return isFinite(x) ? x : null; };
+    const n = money(price) || Infinity;
     const prev = map.get(sellerId);
-    const pn = prev ? (parseFloat(String(prev.price || '').replace(/[^0-9.]/g, '')) || Infinity) : Infinity;
+    const pn = prev ? (money(prev.price) || Infinity) : Infinity;
     if (!prev || n < pn) map.set(sellerId, { idx: i, sellerId, name, price, fulfill, eta, shopLink, detailsLink, offers: (prev ? prev.offers : 0) + 1 });
     else prev.offers++;
   });
@@ -393,6 +465,7 @@ const EXPR_READ_AOD = `(() => {
 const EXPR_READ_SHOP = `(() => {
   ${COLLECT_FN}
   ${READ_RANKS_FN}
+  ${READ_FLAGS_FN}
   const out = { cards: [], total: null, range: null, mixed: 0, brandFilter: null };
   const body = document.body ? document.body.textContent : '';
   out.total = (body.match(/of\\s+(?:over\\s+)?([\\d,]+)\\s+results/i) || [])[1] || null;
@@ -425,6 +498,9 @@ const EXPR_READ_SHOP = `(() => {
       if (/ASIN\\s*[:：]/.test(t) && t.length > panelTxt.length) { panelTxt = t; panelRoot = n.shadowRoot || n; panelLen = t.length }
     });
     const rankInfo = panelRoot ? readRanks(panelRoot) : null;
+    // ★ 2026-10-02 卖家国家: 国旗挂在【卖家行】上, 不一定在面板根里 —— 所以先在卡片整体里找,
+    //   找不到再退回面板根找(兼容不同版本的 DOM 结构)。
+    const flagInfo = readSellerFlag(el) || (panelRoot ? readSellerFlag(panelRoot) : null);
 
     const titleEl = el.querySelector('h2 span, h2');
     const priceEl = el.querySelector('.a-price .a-offscreen, .a-price-whole');
@@ -444,6 +520,7 @@ const EXPR_READ_SHOP = `(() => {
       hasPanel: !!panelTxt,
       __panelTxt: panelTxt,
       __rank: rankInfo,
+      __flag: flagInfo,          // ★ 卖家国家国旗(采集结束后由 parsePanelText 消费, 不进商品字段)
     };
     out.cards.push(rec);
   });
@@ -586,7 +663,6 @@ async function attachPageInner(opts) {
   throw lastErr || new Error('无法建立 CDP 会话');
 }
 
-
 /** 协作停止的统一判定（用户点「停止」或任务编排层的批次超时）。
  *  注意: 各步骤循环里用的是这个, 而不是直接调 collectStopRequested ——
  *  否则批次超时只在最外层生效, 内层循环会继续翻页/滚动, 尾部拖很久。 */
@@ -707,7 +783,7 @@ async function readProductPanel(sess, asin, site, opts) {
     for (let k = 1; k <= 16; k++) {
       const p = await evalExpr(sess, EXPR_DETAIL_PANEL);
       if (p && p.ok && !p.analyzing) {
-        return { ok: true, asin, url, panelText: p.txt, fields: parsePanelText(p.txt), retried: round === 2 };
+        return { ok: true, asin, url, panelText: p.txt, fields: parsePanelText(p.txt, p.flag || null), flag: p.flag || null, retried: round === 2 };
       }
       if (stopWanted(opts)) return { ok: false, err: '用户已停止' };
       await wait(opts, 3000);
@@ -824,7 +900,6 @@ async function waitCardsReady(sess, opts) {
     return JSON.stringify({ cards: cards.length, withPanel, withBrand, withCount, withShopRank, full, notLogged });
   })()`;
 
-
   let stat = null;
   let blankStreak = 0;                 // 连续空白(重渲染中)次数
   let bestShopRank = -1, stall = 0;    // 「店铺选品(父类)」增长停滞计数
@@ -892,11 +967,17 @@ async function readDetailRank(sess, asin, site, opts) {
     if (String(check || '') !== String(asin)) continue;          // 防串页: 导航没到位就不读
     const p = await evalExpr(sess, EXPR_DETAIL_PANEL);
     if (!p || !p.ok) continue;
-    last = parsePanelText(p.txt);
+    // ★ 2026-10-02 卖家国旗: 详情页面板里也读一次(排名闸门进详情页时顺手把卖家国家补上)
+    last = parsePanelText(p.txt, p.flag || null);
     // ★ 结构化排名行(权威): 覆盖文本正则, 并给出"未上榜/没采到"三态
     const rr = await evalExpr(sess, EXPR_DETAIL_RANKS);
     if (rr && rr.ok) {
       const rk = classifyRanks(rr);
+      if (rr.flag && last.chinaSeller == null) {                 // 面板那里没读到 → 用排名读取那一次的结果兜底
+        last.sellerCountryCode = String(rr.flag.code || '').toUpperCase() || null;
+        last.sellerFlagCode = String(rr.flag.flagCode || '').toUpperCase() || null;
+        last.chinaSeller = rr.flag.code ? isChinaRegionCode(rr.flag.code) : null;
+      }
       if (rk.rankRows && rk.rankRows.length) {
         last.bsrShop = rk.bsrShop; last.bsrShopCat = rk.bsrShopCat;
         last.bsrCat = rk.bsrCat; last.bsrCatName = rk.bsrCatName;
@@ -990,8 +1071,8 @@ async function collectShopProducts(sess, sellerId, site, opts) {
     for (const c of d.cards) {
       if (seen.has(c.asin)) continue;
       seen.add(c.asin);
-      if (c.__panelTxt) Object.assign(c, parsePanelText(c.__panelTxt));
-      delete c.__panelTxt;
+      if (c.__panelTxt) Object.assign(c, parsePanelText(c.__panelTxt, c.__flag || null));
+      delete c.__panelTxt; delete c.__flag;
       // ★ 结构化排名行优先于文本正则(旧正则会跨行把子类目数字写成大排名)
       if (c.__rank) {
         const rk = classifyRanks(c.__rank);
@@ -1081,8 +1162,8 @@ async function collectBrandProducts(sess, brand, brandLink, site, opts) {
     for (const c of same) {
       if (seen.has(c.asin)) continue;
       seen.add(c.asin);
-      if (c.__panelTxt) Object.assign(c, parsePanelText(c.__panelTxt));
-      delete c.__panelTxt;
+      if (c.__panelTxt) Object.assign(c, parsePanelText(c.__panelTxt, c.__flag || null));
+      delete c.__panelTxt; delete c.__flag;
       // ★ 结构化排名行优先于文本正则(旧正则会跨行把子类目数字写成大排名)
       if (c.__rank) {
         const rk = classifyRanks(c.__rank);
@@ -1856,6 +1937,8 @@ module.exports = {
   EXPR_READ_SHOP,
   EXPR_DETAIL_RANKS,
   READ_RANKS_FN,
+  READ_FLAGS_FN,              // ★ 卖家国家(国旗图标)读取片段 —— 采集表达式里插值用
+  isChinaRegionCode,          // ★ 大中华区代码判定(CN/HK/TW/MO)
   classifyRanks,
   rankCatOf,
   EXPR_READ_AOD,

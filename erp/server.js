@@ -1495,10 +1495,17 @@ async function cdpShopListCollect(url, opts = {}) {
       if (typeof x.reviews === 'string') { const m = String(x.reviews).replace(/[.,]/g, '').match(/(\d+)/); x.reviews = m ? parseInt(m[1], 10) : null; }
       if (x.panelTxt) {
         let pd = null;
-        try { pd = linksCollector.parsePanelText(x.panelTxt); } catch (e) { pd = null; }   // 面板文案变化不应中断采集
+        try { pd = linksCollector.parsePanelText(x.panelTxt, x.__flag || null); } catch (e) { pd = null; }   // 面板文案变化不应中断采集
         if (pd) {
           if (pd.fulfill) x.fulfill = pd.fulfill;                        // 插件面板配送标签比卡片启发式可靠
           if (pd.brand && !x.brand) x.brand = pd.brand;
+          /* ★ 2026-10-02 卖家国家(国旗图标) 落地 —— 用户要按「中国卖家」筛商品。
+           * 三态必须保留(见 links-collector.parsePanelText 注释):
+           *   true/false = 读到了国旗; null = 没读到(插件未登录/面板没渲染完), 不能当成"非中国"。 */
+          if (pd.sellerCountryCode) x.sellerCountryCode = pd.sellerCountryCode;
+          if (pd.sellerFlagCode) x.sellerFlagCode = pd.sellerFlagCode;
+          if (pd.chinaSeller != null) x.chinaSeller = pd.chinaSeller;
+          else if (!Object.prototype.hasOwnProperty.call(x, 'chinaSeller')) x.chinaSeller = null;
           if (pd.tmStatus && pd.tmStatus.count != null) { x.trademarkCount = pd.tmStatus.count; x.tmText = pd.tmStatus.count + '个' + pd.tmStatus.status; }
           if (pd.sales30d) x.monthlySales = parseInt(String(pd.sales30d).replace(/[^\d]/g, ''), 10) || 0;
           if (pd.sellerCount != null) x.followCount = parseInt(String(pd.sellerCount).replace(/[^\d]/g, ''), 10) || 0;
@@ -1580,13 +1587,13 @@ async function cdpShopListCollect(url, opts = {}) {
   for (const p of kept) {
     if (used.has(p.asin)) continue;
     used.add(p.asin);
-    const price = (p.price != null && !isNaN(p.price)) ? p.price : (parseFloat(String(p.price || '').replace(/[^0-9.,]/g, '').replace(',', '.')) || null);   // 价格读不到 → null (绝不随机伪造)
+    const price = (p.price != null && !isNaN(Number(p.price))) ? Number(p.price) : parseMoneyText(p.price, p.site || site);   // ★ 站点感知   // 价格读不到 → null (绝不随机伪造)
     const maxRank = Array.isArray(p.bsr) && p.bsr.length ? Math.max(...p.bsr.map((b) => b.rank)) : null;
     const item = {
       id: p.asin, asin: p.asin, rank: maxRank != null ? '#' + maxRank : null, title: p.title, brand: p.brand || null,
       // ★ 2026-09: 这 3 个字段旧实现写死 0 (全靠跳详情页补), 现在直接取卡片插件面板的解析结果
       brandStatus: 'unchecked', bgMark: false, tmMark: /TM|注册商标/.test(p.tmText || ''), patentRisk: false, trademarkCount: p.trademarkCount || 0,
-      followCount: p.followCount || 0, chinaSeller: false, fulfill: p.fulfill || null, amazonSell: p.amazonSell != null ? !!p.amazonSell : null,
+      followCount: p.followCount || 0, chinaSeller: chinaSellerOf(p), sellerCountryCode: sellerCountryCodeOf(p), fulfill: p.fulfill || null, amazonSell: p.amazonSell != null ? !!p.amazonSell : null,
       mainImage: p.mainImage || null,
       price, currency, monthlySales: p.monthlySales || 0, reviews: p.reviews != null ? p.reviews : null, rating: (typeof p.rating === 'number' ? p.rating : (parseFloat(String(p.rating || '').match(/[\d.]+/)?.[0]) || null)), stock: 0,
       listedAt: null, size: null, weight: null, variations: 0,   // 卡片刻表读不到上架日期 → null (不写"今天")
@@ -1684,7 +1691,7 @@ async function cdpPanelCollect(url, maxItems = 5) {
 }
 
 // 面板文本 → 结构化字段 (与 zying-panel-collect.js 相同逻辑)
-function parsePanelText(t, asinFallback, title) {
+function parsePanelText(t, asinFallback, title, flagInfo) {
   const nextKey = (start) => {
     const keys = ['品牌', '卖家', '尺寸', '包装尺寸', '重量', '包装重量', 'FBA费用', '商品类型', '上架', '近30天销量', 'ASIN', '榜单选品', '变体', 'color', 'colour', 'size'];
     let best = -1;
@@ -1769,6 +1776,12 @@ function parsePanelText(t, asinFallback, title) {
     variantSize,
     sales30d: salesRaw ? (salesRaw.match(/^<*\s*[\d.,]+/) ? salesRaw.match(/^<*\s*[\d.,]+/)[0] : null) : null,
     bsr: ranks,
+    /* ★ 2026-10-02 卖家国家(国旗图标) —— 这个解析器只拿到文本, 国旗是 DOM 里的 <img>,
+     * 所以必须由调用方把 readSellerFlag() 的结果当第 4 个参数传进来。
+     * 三态: true=大中华区 / false=明确非中国 / null=没读到(不能当成"非中国")。 */
+    sellerCountryCode: (flagInfo && flagInfo.code) ? String(flagInfo.code).toUpperCase() : null,
+    sellerFlagCode: (flagInfo && flagInfo.flagCode) ? String(flagInfo.flagCode).toUpperCase() : null,
+    chinaSeller: (flagInfo && flagInfo.code) ? linksCollector.isChinaRegionCode(flagInfo.code) : null,
   };
 }
 
@@ -1965,6 +1978,62 @@ function bigRankOf(item) {
   const a = itemRankNums(item);
   return a.length ? Math.max.apply(null, a) : null;
 }
+/* ===== 卖家国家(中国卖家)三态归一 ==================================================
+ * 背景(2026-10-02 用户实测): 全库 9526 条 chinaSeller 100% 是 false —— 因为 11 个入库
+ *   路径里都写死了 `chinaSeller: false`(见各处注释), 界面上「中国卖家」自然一条都筛不出来。
+ *   真实数据来源有且只有一个: 插件面板【卖家】行上的国旗图标
+ *   (links-collector.readSellerFlag → item.chinaSeller / sellerCountryCode)。
+ * 三态(必须保住, 别把"没读到"当成"非中国"):
+ *   true  = 读到了国旗且是大中华区(CN/HK/TW/MO, 与插件国旗分组一致)
+ *   false = 读到了国旗但不是大中华区
+ *   null  = 没读到(插件未登录 / 面板没渲染完 / 该链路不读面板) → 未知
+ * 想细分港澳台 vs 大陆: 看 sellerCountryCode(CN / HK / TW / MO)。
+ * ================================================================================= */
+function chinaSellerOf(src) {
+  if (!src) return null;
+  if (src.chinaSeller === true || src.chinaSeller === false) return src.chinaSeller;
+  return null;
+}
+function sellerCountryCodeOf(src) {
+  if (!src) return null;
+  return src.sellerCountryCode || null;
+}
+
+/* ===== ★ 2026-10-02 金额文本解析（站点感知）==========================================
+ * 为什么必须单独立这个函数(实测代价):
+ *   全库德国站 7196 条有效价格里, 末两位是 99/00 的占 22.8%(uk 只有 3.8%), 中位数 4460 ——
+ *   因为解析用的是 `String(price).replace(/[^0-9.]/g,'')`, 把德语的【小数点逗号】当杂质删了:
+ *        "29,99 €"    → "2999"    → 2999      (真实 29.99, 虚高 100 倍)
+ *        "1.234,56 €" → "1.23456" → 1.23456   (真实 1234.56, 缩水 1 万倍)
+ *   连带 netProfit / aiSuggestPrice / referralFee 全错, 「价格区间」筛选也跟着错。
+ * 规则(按站点决定分隔符含义, 不靠猜):
+ *   · 逗号和点同时出现 → 后出现的那个是小数点 ("1.234,56" / "1,234.56" 都无歧义)
+ *   · 只有逗号 → 逗号小数点站点(de/fr/it/es/nl/be/se/pl/tr/br) = 小数点; 其余(uk/us/au/ca…)= 千分位
+ *   · 只有点   → 逗号小数点站点且恰 3 位小数且整数部分 1~3 位 → 千分位("1.234" = 1234); 其余 = 小数点
+ * 拿不准就返回 null(未知), 不编数 —— 与全文件"读不到就 null"的口径一致。
+ * ================================================================================= */
+const COMMA_DECIMAL_SITES = ['de', 'fr', 'it', 'es', 'nl', 'be', 'se', 'pl', 'tr', 'br'];
+function isCommaDecimalSite(site) { return COMMA_DECIMAL_SITES.indexOf(String(site || '').toLowerCase()) >= 0; }
+function parseMoneyText(raw, site) {
+  let t = String(raw == null ? '' : raw).replace(/[^\d.,]/g, '').replace(/[.,]+$/, '');
+  if (!t || !/\d/.test(t)) return null;
+  const c = t.lastIndexOf(',');
+  const d = t.lastIndexOf('.');
+  if (c >= 0 && d >= 0) {
+    t = (c > d) ? t.replace(/\./g, '').replace(/,/g, '.')     // 1.234,56 → 1234.56
+      : t.replace(/,/g, '');                                  // 1,234.56 → 1234.56
+  } else if (c >= 0) {
+    t = isCommaDecimalSite(site) ? t.replace(/,/g, '.')       // de: "29,99" → 29.99
+      : t.replace(/,/g, '');                                  // uk: "1,234" → 1234
+  } else if (d >= 0 && isCommaDecimalSite(site)) {
+    const parts = t.split('.');
+    if (parts.length === 2 && parts[1].length === 3 && parts[0].length >= 1 && parts[0].length <= 3) {
+      t = t.replace(/\./g, '');                               // de: "1.234" → 1234 (千分位)
+    }
+  }
+  const n = parseFloat(t);
+  return isFinite(n) && n > 0 ? n : null;
+}
 /* ===== ★ 2026-10-02 「父类排名(大)」唯一口径 ==========================================
  * 背景(用户实测反馈): 卡片上「父类排名」显示"未采到", 但勾了「排除没有排名的商品」
  * 它却还在 —— 因为两处用了不同的字段:
@@ -2023,8 +2092,7 @@ function itemRankEntries(item) {
   if (Array.isArray(item.bsr)) for (const b of item.bsr) add(b && b.rank, b && (b.category || b.name), 'bsr');
   return out;
 }
-/* ⚠️ 2026-10-02 弃用警告: parentRankOf / childRankOf 是"所有排名取最大/最小"的旧口径,
- * 它们把【子类排名】(单条页面原生BSR、榜单选品)也算进父类 —— 正是"卡片显示未采到、
+/* ⚠️ 2026-10-02 弃用警告: parentRankOf / childRankOf 是"所有排名取最大/最小"的旧口径, * 它们把【子类排名】(单条页面原生BSR、榜单选品)也算进父类 —— 正是"卡片显示未采到、
  * 筛选却认为有排名"的成因。现在没有任何地方在用它们(仅保留定义, 防止外部误用)。
  * 要取父类排名请一律用 rankParentOf(); 要"看所有排名汇总"用 bigRankOf()。 */
 /** 父类排名 = 所有排名里的最大值 (取不到 → null) —— ⚠️ 已弃用, 见上方警告 */
@@ -2413,7 +2481,7 @@ function applyCollectFilter(item, filter) {
     if (f.rankMin != null && bigR < f.rankMin) return false;
     if (f.rankMax != null && bigR > f.rankMax) return false;
   }
-  const pr = (typeof item.price === 'number') ? item.price : parseFloat(String(item.price || '').replace(/[^0-9.,]/g, '').replace(',', '.'));
+  const pr = (typeof item.price === 'number') ? item.price : parseMoneyText(item.price, item.site);   // ★ 站点感知
   if (f.priceMin != null && !(pr != null && pr >= f.priceMin)) return false;       // 价格 ≥ 下限
   if (f.priceMax != null && !(pr != null && pr <= f.priceMax)) return false;       // 价格 ≤ 上限
   const rt = (typeof item.rating === 'number') ? item.rating : parseFloat(String(item.rating || '').match(/[\d.]+/)?.[0]);
@@ -2456,6 +2524,18 @@ function applyCollectFilter(item, filter) {
   if (f.followMax != null && !((item.followCount || 0) <= f.followMax)) return false;
   // 卖家维度: 排除亚马逊自营
   if (f.noAmz === true && item.amazonSell) return false;
+  /* ★ 2026-10-02 卖家国家(中国卖家) —— 补上这条判定。
+   * 背景(用户实测): 面板里能选「中国卖家」, canonicalToCollectFilter 也把 china 映射进来了,
+   *   但 applyCollectFilter 从头到尾没读 f.china → 勾了等于没勾, 静默失效。
+   * 数据来源: 插件面板【卖家】行上的国旗图标 (links-collector.readSellerFlag → item.chinaSeller)。
+   * 三态语义(重要):
+   *   item.chinaSeller === true/false  读到了国旗, 明确是/不是大中华区
+   *   item.chinaSeller === null/undefined  没读到国旗(插件未登录/面板没渲染完) → 未知
+   * 严格模式: 未知视为【不满足】。理由: 用户勾「只要中国卖家」是硬要求, 放行未知
+   *   等于把非中国卖家也采回来, 筛选就白设了 —— 宁可少采, 不要采错。
+   * (代价: 插件没登录时这条筛选会一条都采不到 —— 这是正确行为, 界面上会明确提示。) */
+  if (f.china === true && item.chinaSeller !== true) return false;
+  if (f.china === false && item.chinaSeller === true) return false;
   // 无排名 (旧字段, 与商品管理同一口径: rankParentOf == null 才算无排名)
   // ★ 2026-09-25 大排名三态筛选: 'ok' 有大排名 / 'not_listed' 未上榜 / 'unknown' 未采集到
   //   注意: 未上榜 = 插件面板已分析完、确实没有根类目排名行 —— 与"没采到"是两回事, 必须能分开筛
@@ -3285,7 +3365,7 @@ async function cdpListDirectCollect(url, opts = {}) {
       tmMark: p.trademark ? /注册商标|TM/.test(p.trademark.status) : false,
       patentRisk: false,
       trademarkCount: p.trademark ? (p.trademark.count || 0) : 0,
-      followCount: p.sellerCount || 0, chinaSeller: false,
+      followCount: p.sellerCount || 0, chinaSeller: chinaSellerOf(p), sellerCountryCode: sellerCountryCodeOf(p),
       // ★ 2026-09-24 P0-3c: 列表页读不到的一律 null —— 原为 fulfill||'FBM' / rating||4 / stock:0 /
       //   上架写"今天" (会让商品在新品筛选里假装今天上架) / 佣金净利写 0
       fulfill: p.fulfill || p.panelFulfill || null,
@@ -3532,7 +3612,7 @@ async function cdpListFilteredCollect(url, opts = {}) {
       title: p.title, brand: p.brand || null, brandStatus: 'unchecked',
       bgMark: false, tmMark: false, patentRisk: false,
       trademarkCount: p.trademarkCount || 0, tmCountries: p.tmCountries || [], tmText: p.tmText || null,
-      followCount: p.followCount || p.sellerCount || 0, chinaSeller: false,
+      followCount: p.followCount || p.sellerCount || 0, chinaSeller: chinaSellerOf(p), sellerCountryCode: sellerCountryCodeOf(p),
       // ★ 2026-09-24 P0-3c: 未知一律 null (原为 fulfill||'FBM' / rating||4 / 上架写"今天" / 佣金净利写 0)
       fulfill: p.fulfill || null, amazonSell: p.amazonSell != null ? !!p.amazonSell : null, mainSeller: p.mainSeller || null,
       mainImage: p.mainImage || p.img || null,
@@ -4038,13 +4118,25 @@ const DETAIL_READ_EXPR = `(() => {
     // 类目层级已由 DETAIL_CORE_JS 统一提取
     const b = document.querySelector('#bylineInfo a, #bylineInfo_feature_div a');
     if (b) { const bt = b.textContent.trim().replace(/\\s+/g, ' ').replace(/^Brand:\\s*/i, '').trim(); if (bt && bt.length > 1 && bt.length < 60) out.brand = bt; }
-    const sels = ['#corePrice_feature_div .a-offscreen', '.apex-pricetopay-value', '#price_inside_buybox', '.a-price .a-offscreen'];
-    for (const sel of sels) { const el = document.querySelector(sel); if (el) { const m = (el.textContent || '').match(/([\\d.,]+)/); if (m) { out.price = parseFloat(m[1].replace(/,/g, '')); break; } } }
-    if (out.price == null) { const w = document.querySelector('.a-price-whole'); const f = document.querySelector('.a-price-fraction'); if (w) { const v = parseFloat((w.textContent || '').replace(/[^\\d]/g, '') + '.' + ((f ? (f.textContent || '').replace(/[^\\d]/g, '') : '') || '00')); if (!isNaN(v)) out.price = v; } }
+    const sels = ['#corePrice_feature_div .a-offscreen', '.apex-pricetopayvalue', '#price_inside_buybox', '.a-price .a-offscreen'];
+    /* ★ 2026-10-02 价格: 这里【只取原始文本】, 不在浏览器里 parseFloat。
+     * 旧写法 parseFloat(m[1].replace(/,/g,'')) 把德国站的 "29,99 €" 读成 2999 (虚高 100 倍),
+     * 把 "1.234,56 €" 读成 1.23456 (缩水 1 万倍) —— 因为德语的小数点是逗号。
+     * 现在把原始串带回 Node, 用 parseMoneyText(raw, site) 按站点格式解析。 */
+    for (const sel of sels) {
+      const el = document.querySelector(sel);
+      if (el) { const m = (el.textContent || '').match(/([\\d.,]+)/); if (m) { out.priceRaw = m[1]; break; } }
+    }
+    if (out.priceRaw == null) {
+      const w = document.querySelector('.a-price-whole');
+      const f = document.querySelector('.a-price-fraction');
+      // whole/fraction 是 Amazon 拆好的整数/小数两段, 无歧义 → 直接拼 (不经过千分位判断)
+      if (w) { const v = parseFloat((w.textContent || '').replace(/[^\\d]/g, '') + '.' + ((f ? (f.textContent || '').replace(/[^\\d]/g, '') : '') || '00')); if (!isNaN(v)) out.price = v; }
+    }
     const olp = document.body ? document.body.textContent : '';
     let fm = olp.match(/New\\s*\\(\\d+\\)\\s*from\\s*(?:€|£|A\\$|AU\\$|US\\$|C\\$|\\$)?\\s*([\\d.,]+)/i);
     if (!fm) fm = olp.match(/Neu\\s*\\(\\d+\\)\\s*ab\\s*(?:EUR|€)?\\s*([\\d.,]+)/i);
-    if (fm) out.newFrom = parseFloat(fm[1].replace(/,/g, ''));
+    if (fm) out.newFromRaw = fm[1];   // ★ 同上: 原始串带回 Node 解析
     document.querySelectorAll('table.a-keyvalue.prodDetTable tr').forEach((tr) => {
       const th = tr.querySelector('th'); const td = tr.querySelector('td');
       if (!th || !td) return;
@@ -4114,8 +4206,13 @@ async function cdpReadDetail(send, host, it) {
   if (d.brand) it.brand = d.brand;
   if (d.category) it.category = d.category;
   // 价格: 优先 "New from X" 起价 (最低跟卖参考价), 否则 BuyBox; minPrice/buyBoxPrice 同步, 避免派生字段残留旧价
-  if (d.newFrom != null) { it.price = d.newFrom; it.minPrice = d.newFrom; it.buyBoxPrice = d.price != null ? d.price : null; }
-  else if (d.price != null) { it.price = d.price; it.buyBoxPrice = d.price; it.minPrice = d.price; }
+  // ★ 2026-10-02: 原始价串改在 Node 侧用 parseMoneyText(站点感知)解析 —— de 站 "29,99 €" → 29.99
+  //   (浏览器表达式里旧写法 replace(/,/g,'') 会把它读成 2999)
+  const _siteForPrice = it.site || (String(host || '').match(/amazon\.([a-z.]+)/) || [])[1] || '';
+  const dPrice = (d.price != null) ? d.price : parseMoneyText(d.priceRaw, _siteForPrice);
+  const dNewFrom = (d.newFrom != null) ? d.newFrom : parseMoneyText(d.newFromRaw, _siteForPrice);
+  if (dNewFrom != null) { it.price = dNewFrom; it.minPrice = dNewFrom; it.buyBoxPrice = dPrice != null ? dPrice : null; }
+  else if (dPrice != null) { it.price = dPrice; it.buyBoxPrice = dPrice; it.minPrice = dPrice; }
   if (d.bsr && d.bsr.length) { it.bsr = d.bsr; it.rank = '#' + Math.max.apply(null, d.bsr.map((b) => b.rank)); }
   if (d.firstAvailable) it.firstAvailable = d.firstAvailable;
   if (d.detailOk) {
@@ -4264,6 +4361,12 @@ function mergePanelInto(it, pd) {
   if (pd.tmCountries && pd.tmCountries.length) { it.tmCountries = pd.tmCountries; n++; }
   if (pd.sellerCount != null) { it.sellerCount = pd.sellerCount; n++; }
   if (pd.sales30d) { it.sales30d = pd.sales30d; n++; }
+  /* ★ 2026-10-02 卖家国家(国旗图标) —— 原来这里【没有任何一行】写 chinaSeller,
+   *   于是即便国旗读到了也落不到商品上, 采集筛选的 china 判定永远"未知" → 全被拒。
+   *   三态保留: true/false 是读到的结论; null 表示没读到, 绝不写 false(那会谎报"非中国")。 */
+  if (pd.sellerCountryCode) { it.sellerCountryCode = pd.sellerCountryCode; n++; }
+  if (pd.sellerFlagCode) { it.sellerFlagCode = pd.sellerFlagCode; n++; }
+  if (pd.chinaSeller === true || pd.chinaSeller === false) { it.chinaSeller = pd.chinaSeller; n++; }
   if (pd.fbaFee) { put('fbaFee', pd.fbaFee); }
   put('size', pd.size);
   put('weight', pd.weight);
@@ -4300,17 +4403,19 @@ async function waitPanelInline(send, site, probeMs = 6000, maxMs = 15000) {
     //   改为仍做一次【不等待】的读取: 面板已渲染好就直接用, 没渲染才放弃 —— 成本只有一次 evaluate。
     //   实测正是它导致补采时 pluginTxt=null → 面板新值永远写不进去(脏 weight 永久留存)。
     const quick = await cdpReadZyPanel(send).catch(() => null);
-    if (quick && !/正在分析|正在加载/.test(quick) && /(ASIN\s*[:：]|店铺选品|榜单选品|卖家)/.test(quick)) return quick;
+    if (quick && !/正在分析|正在加载/.test(quick) && /(ASIN\s*[:：]|店铺选品|榜单选品|卖家)/.test(quick)) return { txt: quick, flag: null };
     return null;
   }
   const read = async () => {
     try {
       const r = await send('Runtime.evaluate', {
         expression: `(() => {
+          ${linksCollector.READ_FLAGS_FN}
           const p = document.querySelector('.zy-tool-detail') || document.querySelector('.zying-shadow-root');
           if (!p) return JSON.stringify({ ok: false });
           const t = (p.textContent || '').replace(/\\s+/g, ' ').trim();
-          return JSON.stringify({ ok: true, analyzing: /正在分析/.test(t), txt: t.slice(0, 3000) });
+          // ★ 2026-10-02 卖家国家国旗: 与文本同一次 evaluate 读回来(零额外开销)
+          return JSON.stringify({ ok: true, analyzing: /正在分析/.test(t), txt: t.slice(0, 3000), flag: readSellerFlag(p) });
         })()`, returnByValue: true,
       });
       return JSON.parse(r.result.value);
@@ -4333,10 +4438,12 @@ async function waitPanelInline(send, site, probeMs = 6000, maxMs = 15000) {
   }
   if (!appeared) return null;   // 该站点/页面无智赢插件 → 跳过, 不拖慢采集
   // ② 等分析完成 (仍在"正在分析"时视为失败 → 返回 null, 绝不把"正在分析"当数据解析)
+  // ★ 2026-10-02 返回值从 `string` 改成 `{ txt, flag }` —— 因为卖家国家只在 DOM 的国旗图标里,
+  //   纯文本拿不到。调用方要一起拿到 flag, 否则 applyCollectFilter 的 china 判定会全判"未知"。
   const end = Date.now() + Math.max(0, maxMs);
   for (;;) {
     const st = await read();
-    if (st && st.ok && !st.analyzing && st.txt) { panelFailSites[key] = { fails: 0, until: 0 }; return st.txt; }
+    if (st && st.ok && !st.analyzing && st.txt) { panelFailSites[key] = { fails: 0, until: 0 }; return { txt: st.txt, flag: st.flag || null }; }
     if (Date.now() >= end) { markFail(); return null; }
     await new Promise((r) => setTimeout(r, 1000));
   }
@@ -5328,7 +5435,7 @@ async function cdpFollowShopChain(url, opts = {}) {
         }
         // ===== 插件信息: 页面已打开 → 先等智赢插件分析完成并读取 (配送FBA/FBM、排名、销量、商标、FBA费用) =====
         // 顺序要求: 插件信息 + 商品主信息(主图/价格/类目/评分/BSR) 全部取完, 再去取 aod 跟卖卖家
-        const pluginTxt = await waitPanelInline(send, site, 6000, 15000).catch(() => null);
+        const pluginPa = await waitPanelInline(send, site, 6000, 15000).catch(() => null);
         for (let s = 0; s < 2; s++) { await send('Runtime.evaluate', { expression: `window.scrollTo(0, ${(s + 1) * 3000})` }); await new Promise((r) => setTimeout(r, 600)); }
         await evScrollBottom(send);
         await new Promise((r) => setTimeout(r, 1000));
@@ -5449,9 +5556,9 @@ async function cdpFollowShopChain(url, opts = {}) {
         }
         if (d.mainImage) it.mainImage = d.mainImage;
         // ===== 插件信息合并 (步骤①已取): 商品主信息就绪后合并, 然后才进 ⑥ aod 跟卖 =====
-        if (pluginTxt) {
+        if (pluginPa && pluginPa.txt) {
           try {
-            const pd = parsePanelText(pluginTxt, it.asin, it.title || '');
+            const pd = parsePanelText(pluginPa.txt, it.asin, it.title || '', pluginPa.flag || null);
             let pn = 0;
             // ★ 2026-09-24 采集准确性: 面板读到的值一律【覆盖】旧值。
             //   原实现里 size/weight/packSize/packWeight/productType/listedAt 是"只补空"(&& !it.x) →
@@ -6567,7 +6674,7 @@ function ingestFollowShopProducts(out, withPanel = false, panelLimit = 0) {
       try { pd = cdpReadOnePanel(out.send, p.asin, out.host.replace('www.amazon.', '')); }
       catch { pd = null; }
     }
-    const price = parseFloat(String(p.price).replace(/[^0-9.,]/g, '').replace(',', '.')) || null;
+    const price = parseMoneyText(p.price, p.site || site) || null;   // ★ 站点感知
     // bsr 规范化: 店铺页 ranktag 是纯数字数组, 详情修正后是 {rank,category} 对象数组 → 统一对象
     const pBsr = (Array.isArray(p.bsr) ? p.bsr : []).map((b) => typeof b === 'number' ? { rank: b, category: null } : (b && typeof b === 'object' && b.rank != null ? b : null)).filter(Boolean);
     const tm = pd && pd.tmText || '';
@@ -6663,7 +6770,7 @@ function ingestFollowShopProducts(out, withPanel = false, panelLimit = 0) {
     const item = {
       id: p.asin, asin: p.asin, rank: maxRank != null ? '#' + maxRank : null, title: p.title, brand: brandName,
       brandStatus: 'unchecked', bgMark: false, tmMark: false, patentRisk: false, trademarkCount: 0,
-      followCount: p.followCount || 0, chinaSeller: false,
+      followCount: p.followCount || 0, chinaSeller: chinaSellerOf(p), sellerCountryCode: sellerCountryCodeOf(p),
       // 未知一律 null (绝不伪造成 FBM/4分等); 详情页读成功(detailOk)才有 true/false 判定
       fulfill: p.fulfill || null, amazonSell: p.detailOk ? !!p.amazonSell : null,
       mainSeller: p.mainSeller || null, mainImage: p.mainImage || null,
@@ -6837,9 +6944,12 @@ async function cdpBrandBatch(opts = {}) {
   const maxPages = Math.min(10, Math.max(1, opts.maxPages || 2));
   const filter = opts.filter && typeof opts.filter === 'object' ? opts.filter : {};
   const host = 'www.amazon.' + siteToHostSuffix(site);
-  // 插件面板补全: 显式开启 或 筛选条件需要面板独有字段 (商标数量/月销/品牌状态)
+  // 插件面板补全: 显式开启 或 筛选条件需要面板独有字段 (商标数量/月销/品牌状态/卖家国家)
+  // ★ 2026-10-02: 加上 filter.china —— 卖家国家只存在于面板的国旗图标里, 不读面板就永远判"未知",
+  //   勾了「中国卖家」时一条都保留不下来(实测: 品牌批量采集 已保留 0/10)。
   const needPanel = opts.panel === true || filter.tmMin != null || filter.tmMax != null
-    || filter.salesMin != null || filter.salesMax != null || !!filter.brandStatus;
+    || filter.salesMin != null || filter.salesMax != null || !!filter.brandStatus
+    || filter.china === true || filter.china === false;
 
   const tabs = await cdpGetTabs();
   const page = tabs.find((t) => t.type === 'page' && /amazon\./.test(t.url || '')) || tabs.find((t) => t.type === 'page');
@@ -6929,7 +7039,7 @@ async function cdpBrandBatch(opts = {}) {
       if (filter.badges && filter.badges.length) pre.badges = filter.badges;
       if (filter.is1688 != null) pre.is1688 = filter.is1688;
       const pool = cands.filter((x) => {
-        const pn = String(x.price || '').replace(/[^0-9.,]/g, '').replace(',', '.');
+        const pn = parseMoneyText(x.price, x.site);   // ★ 站点感知
         const hasPrice = pn !== '' && !isNaN(parseFloat(pn));
         const f2 = Object.assign({}, pre);
         if (!hasPrice) { delete f2.priceMin; delete f2.priceMax; }
@@ -6965,9 +7075,9 @@ async function cdpBrandBatch(opts = {}) {
         }
         // 插件面板补全 (就地读, 不重新导航)
         if (needPanel) {
-          const txt = await waitPanelInline(send, site, 6000, 15000);
-          if (txt) {
-            try { mergePanelInto(it, parsePanelText(txt, it.asin, it.title || '')); rec.panel++; } catch (e) { /* 面板解析失败忽略 */ }
+          const pa = await waitPanelInline(send, site, 6000, 15000);
+          if (pa && pa.txt) {
+            try { mergePanelInto(it, parsePanelText(pa.txt, it.asin, it.title || '', pa.flag || null)); rec.panel++; } catch (e) { /* 面板解析失败忽略 */ }
           }
         }
         // 统一采集筛选 (与类目搜索采集同一判定: 不通过则不入库)
@@ -7360,7 +7470,7 @@ function ingestLinksProducts(items, site, source) {
     const currency = siteLinks.siteCurrency(itemSite);
     const num = (v) => { const m = String(v == null ? '' : v).match(/[\d.]+/); return m ? Number(m[0]) : null; };
     const digits = (v) => { const m = String(v == null ? '' : v).replace(/[^\d]/g, ''); return m ? Number(m) : null; };
-    const price = (() => { const n = num(String(p.price == null ? '' : p.price).replace(/[^0-9.]/g, '')); return n && n > 0 ? n : null })();
+    const price = parseMoneyText(p.price, itemSite);   // ★ 站点感知: de 的 "29,99 €" → 29.99 (旧写法会变 2999)
     // 大排名 = 所有可用排名里的【最大值】（口径：所有商品只采最大排名）。
     // 面板给两个排名: 店铺选品(大/宽类目, 如 #349058 Automotive) 与 榜单选品(小/细分类目, 如 #1129 Car Armrests)。
     // 老的跟卖链路(cdp-follow-shop)也是取 max(bsr 各项)，这里统一成同一口径。
@@ -7416,7 +7526,15 @@ function ingestLinksProducts(items, site, source) {
       })(),
       trademarkCount: (typeof p.tmStatus === 'number') ? p.tmStatus : (p.tmStatus ? (digits(p.tmStatus.count) || 0) : 0),
       followCount: sellerCount || 0,
-      chinaSeller: false,
+      /* ★ 2026-10-02 卖家国家(中国卖家) —— 从硬编码 false 改成读国旗图标的真实结果。
+       * 原写法就是这一行 `chinaSeller: false` 让全库 9526 条 100% 是 false,
+       * 界面上「中国卖家」筛选自然一条都筛不出来(不是"没实现", 是被写死了)。
+       * 数据来源: 插件面板【卖家】行上的国旗 (links-collector.readSellerFlag → p.chinaSeller)。
+       * 三态: true/false = 读到国旗; null = 没读到(插件未登录/面板没渲染完) —— 不能当成"非中国"。
+       * 同样把原始国家代码留下来, 便于以后细分(港澳台 vs 大陆)。 */
+      chinaSeller: (p.chinaSeller === true || p.chinaSeller === false) ? p.chinaSeller : null,
+      sellerCountryCode: p.sellerCountryCode || null,
+      sellerFlagCode: p.sellerFlagCode || null,
       // ★ 2026-09-24 P0-3c: 未知一律 null (原为 fulfill||'FBM' / rating||4 / stock:0 / 上架写"今天")
       fulfill: p.fulfill || null,
       amazonSell: p.amazonSell != null ? !!p.amazonSell : null,   // ★ 路线 B: 页面读到才判定, 否则未知
@@ -7574,19 +7692,24 @@ function normalizeListCards(cards) {
     if (typeof x.reviews === 'string') { const m = String(x.reviews).replace(/[.,]/g, '').match(/(\d+)/); x.reviews = m ? parseInt(m[1], 10) : null; }
     if (x.panelTxt) {
       let pd = null;
-      try { pd = linksCollector.parsePanelText(x.panelTxt); } catch (e) { pd = null; }   // 面板文案变化不应中断采集
+      try { pd = linksCollector.parsePanelText(x.panelTxt, x.__flag || null); } catch (e) { pd = null; }   // 面板文案变化不应中断采集
       if (pd) {
         if (pd.fulfill) x.fulfill = pd.fulfill;
         if (pd.brand && !x.brand) x.brand = pd.brand;
         if (pd.tmStatus && pd.tmStatus.count != null) { x.trademarkCount = pd.tmStatus.count; x.tmText = pd.tmStatus.count + '个' + pd.tmStatus.status; }
         if (pd.sales30d) x.monthlySales = parseInt(String(pd.sales30d).replace(/[^\d]/g, ''), 10) || 0;
         if (pd.sellerCount != null) x.followCount = parseInt(String(pd.sellerCount).replace(/[^\d]/g, ''), 10) || 0;
+        /* ★ 2026-10-02 卖家国家(国旗图标) —— 与上面 ingestLinksProducts 同一套三态语义:
+         * true/false = 读到了国旗; null = 没读到(不能当成"非中国")。 */
+        if (pd.sellerCountryCode) x.sellerCountryCode = pd.sellerCountryCode;
+        if (pd.sellerFlagCode) x.sellerFlagCode = pd.sellerFlagCode;
+        if (pd.chinaSeller != null) x.chinaSeller = pd.chinaSeller;
         // ★ 2026-09 变体族: 面板「变体：N个」→ card 级证据(仅当还没 twister 结构时写入, 不覆盖数组)
         if (pd.variants != null && !(Array.isArray(x.variants) ? x.variants.length : (Number(x.variants) > 0))) x.variants = pd.variants;
         mergePanelRanks(x, x.panelTxt);
       }
     }
-    delete x.panelTxt;
+    delete x.panelTxt; delete x.__flag;
   });
   return cards;
 }
@@ -7993,7 +8116,7 @@ function parseMoneyValue(v) {
   const s = String(v).trim();
   const m = s.match(/(A\$|AU\$|US\$|C\$|HK\$|S\$|R\$|[$£€¥₺₹]|zł|kr|AED|SAR|CNY|USD|EUR|GBP|JPY|AUD|CAD|SGD|MXN|BRL|TRY|INR|PLN|SEK)\s*([\d.,]+)/i);
   if (!m) {
-    const n = parseFloat(s.replace(/[^0-9.]/g, ''));
+    const n = parseMoneyText(s, site);   // ★ 站点感知
     return isFinite(n) ? { value: n, currency: null, symbol: null } : null;
   }
   const sym = m[1];
@@ -10417,7 +10540,7 @@ const server = http.createServer((req, res) => {
             brandStatus: it.brandStatus === '已备案' ? 'registered' : it.brandStatus && it.brandStatus !== '未查到' ? 'unchecked' : 'notfound',
             bgMark: false, tmMark: /TM/.test(it.brandStatus || ''), patentRisk: false,
             trademarkCount: (it.brandStatus || '').match(/(\d+)/) ? parseInt((it.brandStatus || '').match(/(\d+)/)[1], 10) : 0,
-            followCount: it.sellerCount || 0, chinaSeller: false,
+            followCount: it.sellerCount || 0, chinaSeller: chinaSellerOf(it), sellerCountryCode: sellerCountryCodeOf(it),
             fulfill: it.fulfill || null, amazonSell: null,   // 未核实的配送/自营 → null (不伪造成 FBM)
             price, currency, monthlySales: parseInt(String(it.sales30d || '').replace(/[<>\s]/g, ''), 10) || null,
             reviews: null, rating: null, stock: null,   // 面板读不到 → null (不写死 0 分 / 4 分)
@@ -10505,13 +10628,13 @@ const server = http.createServer((req, res) => {
         for (const p of out.products) {
           if (used.has(p.asin)) continue;
           used.add(p.asin);
-          const price = parseFloat(String(p.price).replace(/[^0-9.,]/g, '').replace(',', '.')) || null;   // 价格读不到 → null (绝不随机伪造)
+          const price = parseMoneyText(p.price, p.site || site) || null;   // ★ 站点感知   // 价格读不到 → null (绝不随机伪造)
           const pBsr2 = (Array.isArray(p.bsr) ? p.bsr : []).map((b) => (typeof b === 'number' ? { rank: b, category: null } : (b && b.rank != null ? b : null))).filter(Boolean);
           const maxR = pBsr2.length ? Math.max.apply(null, pBsr2.map((b) => b.rank)) : null;
           const item = {
             id: p.asin, asin: p.asin, rank: maxR != null ? '#' + maxR : null, title: p.title, brand: p.brand || null,
             brandStatus: 'unchecked', bgMark: false, tmMark: !!p.tmMark, patentRisk: false, trademarkCount: p.trademarkCount || 0,
-            followCount: 0, chinaSeller: false,
+            followCount: 0, chinaSeller: chinaSellerOf(p), sellerCountryCode: sellerCountryCodeOf(p),
             // 详情页补全后的真实值 (未读到一律 null, 不再写死 FBM / 4 分 / 随机月销)
             fulfill: p.fulfill || null, amazonSell: p.detailOk ? !!p.amazonSell : null, mainSeller: p.mainSeller || null,
             mainImage: p.mainImage || null, aplus: p.detailOk ? !!p.aplus : null,
@@ -10566,11 +10689,11 @@ const server = http.createServer((req, res) => {
         for (const p of out.products) {
           if (used.has(p.asin)) continue;
           used.add(p.asin);
-          const price = (p.price != null && !isNaN(p.price)) ? p.price : (parseFloat(String(p.price || '').replace(/[^0-9.,]/g, '').replace(',', '.')) || null);
+          const price = (p.price != null && !isNaN(Number(p.price))) ? Number(p.price) : parseMoneyText(p.price, p.site || site);   // ★ 站点感知
           const item = {
             id: p.asin, asin: p.asin, rank: null, title: p.title, brand: p.brand || null,
             brandStatus: 'unchecked', bgMark: false, tmMark: false, patentRisk: false, trademarkCount: 0,
-            followCount: 0, chinaSeller: false, fulfill: p.fulfill || null, amazonSell: null,
+            followCount: 0, chinaSeller: chinaSellerOf(p), sellerCountryCode: sellerCountryCodeOf(p), fulfill: p.fulfill || null, amazonSell: null,
             price, currency,
             monthlySales: 0, reviews: null, rating: (typeof p.rating === 'number' ? p.rating : (parseFloat(String(p.rating || '').match(/[\d.]+/)?.[0]) || null)), stock: 0,
             listedAt: null, size: null, weight: null, variations: 0,
@@ -10622,11 +10745,11 @@ const server = http.createServer((req, res) => {
         for (const p of out.products) {
           if (used.has(p.asin)) continue;
           used.add(p.asin);
-          const price = (p.price != null && !isNaN(p.price)) ? p.price : (parseFloat(String(p.price || '').replace(/[^0-9.,]/g, '').replace(',', '.')) || null);
+          const price = (p.price != null && !isNaN(Number(p.price))) ? Number(p.price) : parseMoneyText(p.price, p.site || site);   // ★ 站点感知
           const item = {
             id: p.asin, asin: p.asin, rank: null, title: p.title, brand: p.brand || null,
             brandStatus: 'unchecked', bgMark: false, tmMark: false, patentRisk: false, trademarkCount: 0,
-            followCount: 0, chinaSeller: false, fulfill: p.fulfill || null, amazonSell: null,
+            followCount: 0, chinaSeller: chinaSellerOf(p), sellerCountryCode: sellerCountryCodeOf(p), fulfill: p.fulfill || null, amazonSell: null,
             price, currency,
             monthlySales: 0, reviews: p.reviews != null ? p.reviews : null, rating: (typeof p.rating === 'number' ? p.rating : (parseFloat(String(p.rating || '').match(/[\d.]+/)?.[0]) || null)), stock: 0,
             listedAt: null, size: null, weight: null, variations: 0,
@@ -10674,11 +10797,11 @@ const server = http.createServer((req, res) => {
         for (const p of out.products) {
           if (used.has(p.asin)) continue;
           used.add(p.asin);
-          const price = parseFloat(String(p.price).replace(/[^0-9.,]/g, '').replace(',', '.')) || null;   // 价格读不到 → null (绝不随机伪造)
+          const price = parseMoneyText(p.price, p.site || site) || null;   // ★ 站点感知   // 价格读不到 → null (绝不随机伪造)
           const item = {
             id: p.asin, asin: p.asin, rank: null, title: p.title, brand: out.brandName || null,
             brandStatus: 'unchecked', bgMark: false, tmMark: false, patentRisk: false, trademarkCount: 0,
-            followCount: 0, chinaSeller: false, fulfill: null, amazonSell: null,   // 品牌页列表无配送/自营信息 → null (不写死 FBM)
+            followCount: 0, chinaSeller: chinaSellerOf(p), sellerCountryCode: sellerCountryCodeOf(p), fulfill: null, amazonSell: null,   // 品牌页列表无配送/自营信息 → null (不写死 FBM)
             price, currency, monthlySales: null,   // 品牌页列表不提供月销 → null (原为随机值)
             reviews: null, rating: null, stock: null,   // 不写死 0 评论 / 4 分
             listedAt: null, size: null, weight: null, variations: 0,   // 读不到上架日期 → null (不写"今天")
@@ -10733,7 +10856,7 @@ const server = http.createServer((req, res) => {
             if (used.has(p.asin)) continue;
             used.add(p.asin);
             const pd = p.panel || {};
-            const price = parseFloat(String(p.price).replace(/[^0-9.,]/g, '').replace(',', '.')) || null;   // 价格读不到 → null (绝不随机伪造)
+            const price = parseMoneyText(p.price, p.site || site) || null;   // ★ 站点感知   // 价格读不到 → null (绝不随机伪造)
             // 品牌优先用插件面板的真实品牌
             const brandName = pd.brand || br.name.replace(/ (flagship store|store)$/i, '') || 'Unknown';
             const tm = pd.tmText || '';
@@ -10742,7 +10865,7 @@ const server = http.createServer((req, res) => {
               id: p.asin, asin: p.asin, rank: null, title: p.title, brand: brandName,
               brandStatus: brandStatus || 'unchecked', bgMark: false, tmMark: /TM|注册商标/.test(tm), patentRisk: false,
               trademarkCount: pd.trademarkCount || 0,
-              followCount: pd.sellerCount || 0, chinaSeller: false, fulfill: pd.fulfill || null, amazonSell: null,
+              followCount: pd.sellerCount || 0, chinaSeller: chinaSellerOf(pd), sellerCountryCode: sellerCountryCodeOf(pd), fulfill: pd.fulfill || null, amazonSell: null,
               price, currency, monthlySales: pd.sales30d ? (parseInt(String(pd.sales30d).replace(/[<>\s]/g, ''), 10) || null) : null,
               reviews: null, rating: null, stock: null,   // 面板/列表读不到 → null (不写死 0 评论 / 4 分 / 随机库存)
               listedAt: (pd.listedAt || '').slice(0, 10) || null,   // 读不到上架日期 → null (不写"今天")
@@ -10781,7 +10904,16 @@ const server = http.createServer((req, res) => {
       // 阶段3 (CDP): 通过预筛的候选逐个读完整详情页 → 品牌名校验 → 统一采集筛选 → 每品牌保留 maxPerBrand 个
       // 采集筛选与「类目搜索采集」完全同一套 (canonical filter → canonicalToCollectFilter → applyCollectFilter)
       if (p === '/api/collect/brand-batch' && req.method === 'POST') {
-        const site = String(j.site || 'au').toLowerCase();
+        /* ★ 2026-10-02 修: 站点原来只认 j.site, 缺省写死 'au' —— 而前端「批量品牌采集」表单里
+         * 根本没有 site 字段 → 界面上用这个功能永远只按【澳洲站】找线索品牌, 别的站点一律报
+         * "站点 au 的商品库里没有这些品牌的商品"。现在按优先级取:
+         *   ① 显式 j.site ② 统一过滤条件里的 filter.sites[0](用户在过滤面板勾了站点)
+         *   ③ filter.site ④ 兜底 'au'(保持历史行为)
+         * 线索品牌必须属于目标站点, 否则详情页打不开、读不到品牌跳转链接。 */
+        const site = String(j.site
+          || (j.filter && Array.isArray(j.filter.sites) && j.filter.sites[0])
+          || (j.filter && j.filter.site)
+          || 'au').toLowerCase();
         const filter = buildCollectFilter(j);
         const brandsLimit = Math.min(20, Math.max(1, j.brandsLimit || 2));       // 自动挑品牌时的品牌数
         const maxPerBrand = Math.min(50, Math.max(1, j.maxPerBrand || 5));      // 每个品牌入库数量上限
@@ -10888,7 +11020,7 @@ const server = http.createServer((req, res) => {
               id: asin, asin, rank: maxR != null ? '#' + maxR : null, title: p.title || '', brand: cleanBrandDisplay(p.brand) || cleanBrandDisplay(br.brandName) || br.brand || null,
               brandRaw: p.brand || null,
               brandStatus: p.brandStatus || 'unchecked', bgMark: false, tmMark: !!p.tmMark, patentRisk: false, trademarkCount: p.trademarkCount || 0,
-              followCount: p.sellerCount || 0, chinaSeller: false,
+              followCount: p.sellerCount || 0, chinaSeller: chinaSellerOf(p), sellerCountryCode: sellerCountryCodeOf(p),
               fulfill: p.fulfill || null, amazonSell: p.detailOk ? !!p.amazonSell : null, mainSeller: p.mainSeller || null,
               mainImage: p.mainImage || null, aplus: p.detailOk ? !!p.aplus : null,
               detailOk: !!p.detailOk, detailAt: p.detailAt || null, detailVer: p.detailOk ? DETAIL_VER : null,
@@ -11227,6 +11359,7 @@ const server = http.createServer((req, res) => {
           resolveCollectSite: siteLinks.resolveCollectSite,
           classifySellerLink: siteLinks.classifySellerLink,
           applyCollectFilter, bumpCollectProgress, collectStopRequested,
+          parseMoneyText,                            // ★ 站点感知的金额解析(采集器比价/排序用)
           // 离线集成测试口子: 只有显式设置 ZY_TEST_FAKE_CDP=1 才会走假 CDP。
           // 生产环境这个变量不存在 → 下面这几个字段一个都不会出现, 真实现不被覆盖。
           ...(fakeCdpDeps ? {
@@ -11497,7 +11630,7 @@ const server = http.createServer((req, res) => {
           if (used.has(it.asin)) continue;
           used.add(it.asin);
           const brand = (it.title.split(/[ ,|–—/•]/)[0] || '').replace(/[^A-Za-z0-9&'.\-]/g, '').trim() || 'Unknown';
-          const price = it.priceNum || parseFloat(String(it.price).replace(/[^0-9.,]/g, '').replace(',', '.')) || null;
+          const price = it.priceNum || parseMoneyText(it.price, it.site || site) || null;   // ★ 站点感知
           const tm = false, patent = false;                                  // 店铺卡片读不到商标/专利信息 → 不伪造
           const item = {
             id: it.asin, asin: it.asin, rank: null, title: it.title, brand,
