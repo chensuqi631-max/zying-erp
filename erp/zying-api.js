@@ -9,8 +9,20 @@
  * 详见: D:\智赢erp\_dev-tools\ZYING-API-逆向成果.md
  *       skill: chrome-ext-api-reverse
  *
- * 实测: 20 个/请求 (上限; 30 报 code:500), 20 条约 1.0–2.7s
- * ⚠️ 有配额/限流: 连打多轮后会统一返回"网络连接失败"字样, 数分钟后自行恢复 → 必须限速+退避
+ * 实测: 20 个/请求 (硬上限; 30 报 code:500), 20 条约 0.6~1.0s
+ *
+ * ★★ 关于"配额"的重要更正 (2026-10-03 实测推翻我先前的结论) ★★
+ *   我最初以为撞到了服务端配额(插件把失败统一映射成"网络连接失败,请检查网络后重试"),
+ *   并据此加了 900ms 批间隔。**这个结论是错的**, 实测证据:
+ *     · 无间隔连打 150 批 = 3000 个商品 → 全部成功, 0 次限流, 143.8s (48ms/商品)
+ *     · 两次全量回填 (7271 + 7331 条) → 0 次限流
+ *     累计约 1.8 万次请求, 基本没有遇到服务端限流。
+ *   真正的故障另有其因: **内容脚本实例会"卡死"** —— 跑久了该页面里的
+ *   Runtime.evaluate 一直不返回(超时), 且【重载该页无效】【回收 SW 也无效】,
+ *   只有【新开一个标签页】能立刻恢复(实测 153ms)。
+ *   卡死时插件有时抛"网络连接失败"(于是被我误判成限流), 有时干脆挂住不返回。
+ *   ⇒ 所以批间隔可以设 0; 真正的解法是 rotateToFreshTab() 自动换页。
+ *   唯一真实硬约束: 单批 **不能超过 20 个** (30 → code:500 Specified argument was out of the range)。
  */
 const CDP_PORT = Number(process.env.ZYING_CDP_PORT || 9222);
 const BASE = 'https://amazon.zying.net/api';
@@ -255,7 +267,7 @@ const pluginVersion = () => call('/zbig/Version', null, 'GET');
 async function moreAboutAsin(asins, site = 'de', opts = {}) {
   const list = (Array.isArray(asins) ? asins : [asins]).filter(Boolean);
   const batch = Math.min(opts.batch || 20, 20);          // 实测硬上限
-  const gapMs = opts.gapMs == null ? 900 : opts.gapMs;   // ★ 限速: 批间隔, 防触发配额
+  const gapMs = opts.gapMs == null ? 0 : opts.gapMs;   // ★ 实测无服务端配额, 默认不限速; 需要"客气点"可传 150~500
   const retries = opts.retries == null ? 3 : opts.retries;
   const log = opts.log || (() => {});
 

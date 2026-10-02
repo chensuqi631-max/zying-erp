@@ -11312,7 +11312,7 @@ const server = http.createServer((req, res) => {
 
             const { data, stats } = await zyApi.moreAboutAsin(asins, site, {
               batch: Math.min(20, Math.max(1, Number(j.batch) || 20)),
-              gapMs: j.gapMs == null ? 900 : Math.max(0, Number(j.gapMs)),
+              gapMs: j.gapMs == null ? 0 : Math.max(0, Number(j.gapMs)),   // 实测无服务端配额(150批连打0限流)
               retries: j.retries == null ? 3 : Number(j.retries),
               log: (m) => { job.lastLog = m; },
               onBatch: applyBatch,
