@@ -2080,6 +2080,75 @@ function rankParentOf(item) {
  * 铁律: 父类来源缺失时 rankParent 一律 null —— 绝不拿子类数值顶替父类 (这正是此前的脏数据成因)。
  * 兼容: rank(仍=父类排名) / maxRank / bsrShop / bsrCat / bsr 数组 全部保留不改。
  * ================================================================================== */
+/**
+ * 采集模式名 (Links/FollowShop/ListPage…) —— 它们不是商品类目。
+ * catMatchText 用它防止"排除其他类目"被 6690 条无类目商品牵连;
+ * dropContaminatedBsr 用它排除"类目字段其实是模式名"的记录(实测 228 条), 避免误判成串页污染。
+ * ★ 2026-10-03 从 catMatchText 内部提升到模块作用域 (两处共用, 单一事实来源)。
+ */
+const CAT_MODE_NAMES = /^(Links|FollowShop|ListDirect|ListFiltered|Search|Shop|Category|Brand|Asin|ListPage|List|其他)$/i;
+
+/**
+ * ★ 2026-10-03 新增: 排名数组「跨页串读(串页)」污染检测 —— 入库统一收口。
+ *
+ * 背景(实测定位到的根因): 2026-09-13 的品牌链路采集开了「排名闸门」(卡上没排名就逐个进详情页补),
+ *   而当时的采集代码在 Page.navigate 之后【没有校验当前页面是不是目标 ASIN】就直读排名
+ *   (防串页校验 EXPR_PAGE_ASIN 直到 2026-09-28 才进代码库 —— git log -S 可查)。
+ *   Amazon 的 /dp/ 跳转是异步的, 读得太早就会落在【上一个商品的页面】上, 于是
+ *   前一个商品的 BSR 被写进了这一条 —— 并且被 fillCatFromPanel 提升成了 cat1。
+ *
+ * 遗留后果(库内实测): 121 条全是 2026-09-13 那一天的 source='brand-links', 全部缺 catSrc,
+ *   bsr 条目数分布 {0:77, 1:1, 2:9, 3:31, 5:3}; 其中 3 条出现【2 个 level=main】(物理上不可能,
+ *   一个商品只有一个根类目排名); 另有 12 组 (排名,类目) 对同时挂在 2~3 个互不相关的商品上。
+ *   典型受害者 B0D1CG2T6G: 标题是婚纱裙, 库里 cat1 却是 Automotive ——
+ *   而它的真实页面【根本没有 BSR】, 插件面板也【不给任何排名】, 那两个数只可能来自别的商品。
+ *
+ * 为什么必须收口在这里: sanitizeProductFields 是 applyRankFields 内 22 个入库入口的公共清洗点,
+ *   一处生效即覆盖全部链路; 而且必须在 itemRankEntries 之前跑, 否则 rankParent/Child 已经按脏 bsr 算完了。
+ *
+ * 判据(两条结构性规则, 不需要类目字典, 对"没打 level 标签"的旧数据同样有效):
+ *   ① 出现 ≥2 条 level='main'  → 一个商品只可能有一个根类目排名, 多出来的一定是别的商品的
+ *   ② 同一个 category 出现 ≥2 个不同 rank → 同一类目下的排名只能是唯一值
+ * 处置: 整组 bsr 判为不可信 → 清空 (排名回落到"未采到")。
+ *   铁律: 宁可"未采到", 绝不把别的商品的排名留在库里冒充数据。
+ */
+function dropContaminatedBsr(item) {
+  if (!item || !Array.isArray(item.bsr) || item.bsr.length < 2) return null;
+  /* 类目字段其实是【采集模式名】的记录不算数(实测 228 条: cat1/bsr 类目被写成 ListPage 等)。
+   * 那是另一个已知脏值(模式名漏进类目字段), 不是串页污染 —— 必须排除, 否则误伤 228 条。 */
+  const realCat = (b) => { const c = b && b.category ? String(b.category).trim() : ''; return c && !CAT_MODE_NAMES.test(c) ? c : ''; };
+  const bad = new Set();                                  // 判定"不可信"的那些类目名
+  let why = null;
+  const mains = item.bsr.filter((b) => b && b.level === 'main' && realCat(b));
+  if (mains.length >= 2) {
+    why = { rule: '多个根类目(main)', n: mains.length };
+    for (const b of mains) bad.add(realCat(b));
+  } else {
+    const byCat = new Map();
+    for (const b of item.bsr) {
+      const c = realCat(b);
+      const r = b && Number(String(b.rank).replace(/[^\d]/g, ''));
+      if (!c || !r) continue;
+      if (!byCat.has(c)) byCat.set(c, new Set());
+      byCat.get(c).add(r);
+    }
+    for (const [c, ranks] of byCat) {
+      if (ranks.size >= 2) { why = { rule: '同类目多个排名', cat: c, ranks: [...ranks] }; bad.add(c); }
+    }
+  }
+  if (!why) return null;
+  item.bsr = [];
+  bsrContaminatedDropped++;
+  /* 连带清理: 若 cat1 本身就是从这组不可信 bsr 推出来的(catSrc 为空 = 没有权威来源),
+   * 一并清掉 —— 否则会留下"婚纱裙挂在 Automotive 大类目下"这种自相矛盾的记录,
+   * 类目筛选按它过滤时用户看到的还是错的。清成"未分类"后会被「补采类目」重新采到真值。 */
+  if (!item.catSrc && item.cat1 && bad.has(String(item.cat1).trim())) {
+    item.cat1 = null; item.cat2 = null; item.catPath = null;
+    catDerivedFromBadBsrCleared++;
+  }
+  return why;
+}
+
 function itemRankEntries(item) {
   if (!item) return [];
   const out = [];
@@ -2144,9 +2213,10 @@ function sanitizeProductFields(item) {
   if (item.bsrCat === undefined) item.bsrCat = null;
   if (item.bsrCatName === undefined) item.bsrCatName = null;
   if (item.rankParentCat === undefined) item.rankParentCat = null;
-  // ④ bsr: 剔除非法项 (rank 非正数)
+  // ④ bsr: 剔除非法项 (rank 非正数) + ★ 跨页串读污染整组丢弃 (见 dropContaminatedBsr 注释)
   if (Array.isArray(item.bsr)) {
     item.bsr = item.bsr.filter((b) => b && Number(String(b.rank).replace(/[^\d]/g, '')) > 0);
+    dropContaminatedBsr(item);
   }
   // ⑤ url 为空 → 按站点补全 (不编造商品信息, 只补商品自身的规范链接)
   if ((!item.url || !/^https?:\/\//.test(String(item.url))) && item.asin && item.site) {
@@ -2180,6 +2250,10 @@ function sanitizeProductFields(item) {
 
 /** 统计: 被判定为"面板把采集当天当上架日期"而丢弃的条数 (排查用, 不参与业务) */
 let listedAtSameAsCollectDropped = 0;
+/** 统计: 被判定为"跨页串读污染"而整组丢弃 bsr 的条数 (排查用, 不参与业务) */
+let bsrContaminatedDropped = 0;
+/** 统计: 因 bsr 被判定污染而连带清空 cat1/cat2/catPath 的条数 (排查用, 不参与业务) */
+let catDerivedFromBadBsrCleared = 0;
 
 /**
  * 上架日期(取最可靠的那个) —— 「上架天数区间」筛选用。
@@ -2198,6 +2272,8 @@ function listedDateOf(item) {
 /** 统一写入父类/子类排名字段 (所有入库入口调用; 幂等, 可重复执行) */
 function applyRankFields(item) {
   if (!item || typeof item !== 'object') return item;
+  // ★ 必须在 itemRankEntries 之前: 否则 rankParent/rankChild 已经按脏 bsr 算完了(见函数注释)
+  dropContaminatedBsr(item);
   const e = itemRankEntries(item);
   const pickMax = (arr) => (arr.length ? arr.reduce((a, b) => (b.rank > a.rank ? b : a)) : null);
   const pickMin = (arr) => (arr.length ? arr.reduce((a, b) => (b.rank < a.rank ? b : a)) : null);
@@ -2465,7 +2541,6 @@ function catMatchText(x) {
    * ⚠️ 必须排除【采集模式名】(Links/FollowShop/ListDirect/Search/Shop…): 它们不是商品类目,
    *   归并只会落到「其他类目」兜底桶 —— 实测不加这个护栏, "排除其他类目" 会从 310 条
    *   暴涨到 6953 条(把 6690 条没类目的商品全牵连进来), 语义就乱了。 */
-  const CAT_MODE_NAMES = /^(Links|FollowShop|ListDirect|ListFiltered|Search|Shop|Category|Brand|Asin|ListPage|List|其他)$/i;
   const extra = (c1 === '(未分类)' && x.category && !CAT_MODE_NAMES.test(String(x.category).trim()))
     ? catCnOf(String(x.category)) : '';
   return [
@@ -10523,7 +10598,9 @@ const server = http.createServer((req, res) => {
       }
 
       // 重建排名字段: 为存量商品按新口径重算 父类排名/子类排名 (不新增商品, 只补字段)
+      // ★ 同时也跑跨页串读污染清理 (dropContaminatedBsr 在 applyRankFields 收口内) → 可修 2026-09-13 遗留脏数据
       if (p === '/api/products/rebuild-rank-fields' && req.method === 'POST') {
+        const c0 = bsrContaminatedDropped, c1 = catDerivedFromBadBsrCleared;
         let done = 0, withParent = 0, withChild = 0;
         products.forEach((x) => {
           applyRankFields(x);
@@ -10532,7 +10609,8 @@ const server = http.createServer((req, res) => {
           if (x.rankChild != null) withChild++;
         });
         save('products.json', products);   // 覆盖前自动备份
-        return send(200, { ok: true, total: done, withParent, withChild, withoutParent: done - withParent });
+        return send(200, { ok: true, total: done, withParent, withChild, withoutParent: done - withParent,
+          bsrContaminatedDropped: bsrContaminatedDropped - c0, catDerivedFromBadBsrCleared: catDerivedFromBadBsrCleared - c1 });
       }
 
       // 保存/取消保存商品 (产品库收藏)
