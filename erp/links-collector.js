@@ -491,16 +491,34 @@ const EXPR_READ_SHOP = `(() => {
     const brandLink = brandEl ? (brandEl.href.startsWith('http') ? brandEl.href : 'https://' + location.hostname + brandEl.href) : null;
 
     // 卡片内插件数据 (文本 + ★ 结构化排名行)
+    /* ★★ 2026-10-02 【卡片↔面板一致性校验】—— 修"类目/排名串到别的商品"的根因。
+     * 症状(用户实测): 库里有商品的 cat1/rankSubCat 与标题完全矛盾 ——
+     *   例 B0D1CG2T6G 标题是 "Women's Scoop Wedding Dresses"(婚纱), 真机面包屑是
+     *   Fashion > … > T-Shirts, 但库里存的是 cat1="Automotive" / rankSubCat="Car Air Mass Sensors"。
+     *   卖家 PSFVHHQI 这类店铺同时卖汽车配件和服装, 品牌页上两类商品混排 →
+     *   卡片与插件面板一旦错位, 面板里的类目/排名/卖家就写到了别的商品上。
+     * 判据: 插件面板文本里【自带 ASIN】(形如 "ASIN：B0FPBX31HQ"), 它才是面板真正描述的商品。
+     *   与卡片自身的 data-asin 不一致 → 这份面板数据不属于这张卡 → 整份丢弃(不写类目/排名/卖家/国旗)。
+     * 为什么要丢而不是"挑一个对的": 卡片内只有一个插件面板容器, 找不到匹配的说明 DOM 已经错位,
+     *   继续用只会把错误数据写进库 —— 宁可这个商品这次少字段, 也不要错字段。
+     * 计数返回在 cards[].panelMismatch 与 out.panelMismatch, 便于观察发生率。 */
     let panelTxt = '';
-    let panelRoot = null, panelLen = 0;
+    let panelRoot = null, panelLen = 0, panelAsin = '', panelMismatch = false;
     el.querySelectorAll('[class*="zying"], [class*="zy-"], [id*="zying"]').forEach((n) => {
       const t = collect(n.shadowRoot || n, 0).replace(/\\s+/g, ' ').trim();
-      if (/ASIN\\s*[:：]/.test(t) && t.length > panelTxt.length) { panelTxt = t; panelRoot = n.shadowRoot || n; panelLen = t.length }
+      if (/ASIN\\s*[:：]/.test(t) && t.length > panelTxt.length) {
+        panelTxt = t; panelRoot = n.shadowRoot || n; panelLen = t.length;
+        panelAsin = (t.match(/ASIN\\s*[:：]\\s*([A-Z0-9]{10})/) || [])[1] || '';
+      }
     });
+    if (panelTxt && panelAsin && panelAsin !== String(asin).toUpperCase()) {
+      panelMismatch = true;
+      panelTxt = ''; panelRoot = null; panelLen = 0; panelAsin = '';
+    }
     const rankInfo = panelRoot ? readRanks(panelRoot) : null;
     // ★ 2026-10-02 卖家国家: 国旗挂在【卖家行】上, 不一定在面板根里 —— 所以先在卡片整体里找,
-    //   找不到再退回面板根找(兼容不同版本的 DOM 结构)。
-    const flagInfo = readSellerFlag(el) || (panelRoot ? readSellerFlag(panelRoot) : null);
+    //   找不到再退回面板根找(兼容不同版本的 DOM 结构)。面板错位时同样不能用(国旗会串卖家)。
+    const flagInfo = panelMismatch ? null : (readSellerFlag(el) || (panelRoot ? readSellerFlag(panelRoot) : null));
 
     const titleEl = el.querySelector('h2 span, h2');
     const priceEl = el.querySelector('.a-price .a-offscreen, .a-price-whole');
@@ -518,6 +536,7 @@ const EXPR_READ_SHOP = `(() => {
       productUrl: 'https://' + location.hostname + '/dp/' + asin,
       brand, brandLink, brandLinkIndex: brandEl ? (String(brandEl.href).match(/index=([^&]+)/) || [])[1] || null : null,
       hasPanel: !!panelTxt,
+      panelMismatch: panelMismatch,          // ★ 面板 ASIN 与卡片不符 → 整份面板已丢弃(供统计/排查)
       __panelTxt: panelTxt,
       __rank: rankInfo,
       __flag: flagInfo,          // ★ 卖家国家国旗(采集结束后由 parsePanelText 消费, 不进商品字段)
@@ -532,6 +551,9 @@ const EXPR_READ_SHOP = `(() => {
       if (!c.sameBrand) out.mixed++;
     }
   }
+  // ★ 2026-10-02 面板错位统计: 有多少张卡的插件面板 ASIN 与卡片不符(已丢弃)。
+  //   这个数长期非 0 就说明页面 DOM 变了 / 插件渲染方式变了, 需要重新对一遍选择器。
+  out.panelMismatch = out.cards.filter(function (c) { return c.panelMismatch; }).length;
   return JSON.stringify(out);
 })()`;
 
@@ -882,13 +904,19 @@ async function waitCardsReady(sess, opts) {
     ${COLLECT_FN}
     const cards = [...document.querySelectorAll('div[data-asin][data-component-type="s-search-result"]')]
       .filter((e) => /^[A-Z0-9]{10}$/.test(e.getAttribute('data-asin') || '') && e.querySelector('a[href*="/dp/"]'));
-    let withPanel = 0, withBrand = 0, withCount = 0, withShopRank = 0, full = 0, notLogged = 0;
+    let withPanel = 0, withBrand = 0, withCount = 0, withShopRank = 0, full = 0, notLogged = 0, mismatched = 0;
     for (const c of cards) {
       let t = '';
       c.querySelectorAll('[class*="zying"], [class*="zy-"], [id*="zying"]').forEach((n) => {
         const s = collect(n.shadowRoot || n, 0).replace(/\\s+/g, ' ').trim();
         if (/ASIN\\s*[:：]/.test(s) && s.length > t.length) t = s;
       });
+      // ★ 2026-10-02 与 EXPR_READ_SHOP 同一口径: 面板里的 ASIN 与卡片不符 → 这份面板不算数,
+      //   否则"错位的面板"会被当成"已经渲染好了", 提前放行 → 读到一堆错数据。
+      if (t) {
+        const pa = (t.match(/ASIN\\s*[:：]\\s*([A-Z0-9]{10})/) || [])[1] || '';
+        if (pa && pa !== String(c.getAttribute('data-asin') || '').toUpperCase()) { t = ''; mismatched++; }
+      }
       if (t) withPanel++;
       if (/品牌\\s*[:：]\\s*\\S/.test(t) && !/正在加载/.test(t)) withBrand++;
       if (/卖家\\s*[:：]\\s*\\d+/.test(t)) withCount++;              // 插件主体分析完成
@@ -897,7 +925,7 @@ async function waitCardsReady(sess, opts) {
       // ★ 「登录壳」: 面板里只有「登录」字样, 既没有品牌、也没有店铺选品排名 —— 这种卡是登录才有的数据, 不是"还没滚到"
       if (/[:：]\\s*登录/.test(t) && !/品牌\\s*[:：]\\s*\\S/.test(t) && !/店铺选品[^#]{0,80}#/.test(t)) notLogged++;
     }
-    return JSON.stringify({ cards: cards.length, withPanel, withBrand, withCount, withShopRank, full, notLogged });
+    return JSON.stringify({ cards: cards.length, withPanel, withBrand, withCount, withShopRank, full, notLogged, mismatched });
   })()`;
 
   let stat = null;
