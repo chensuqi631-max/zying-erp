@@ -10059,10 +10059,48 @@ const server = http.createServer((req, res) => {
               if (x.detailOk !== true && (x.reviews === 0 || x.reviews == null) && x.rating === 4) { x.rating = null; x.reviews = null; }
             }
           }
+          /* R9 ★ 2026-10-03 新增: cat1 有值但【完全没有 catSrc 来源】→ 清成"未分类"。
+           * 背景(实证): 全库 9528 条里有 121 条是「有 cat1、却连 catSrc 这个键都没有」,
+           *   且 100% 集中在 2026-09-13、source='brand-links' —— 那天详情页补排名没有防串页校验,
+           *   把上一个商品的 BSR 读成了本条的, 再被 fillCatFromPanel 提升成 cat1
+           *   (典型受害者 B0D1CG2T6G 是婚纱裙却存成 Automotive; 详见 dropContaminatedBsr 注释)。
+           * 为什么按"缺 catSrc"判定: 现在所有写 cat1 的路径都会同时写 catSrc
+           *   (面包屑='bc' / 面板兜底='panel' / 榜单推算='bsr'), 所以"有 cat1 却没来源"本身
+           *   就是不可信标记; 而且这条判据在全库恰好只命中那 121 条, 不误伤任何正常记录。
+           * 处置: 连同 cat2/catPath 一起清空(同一批派生物), 归入"未分类"等补采。
+           *   铁律: 宁可"未分类", 也不留一个来源不明、可能属于别的商品的类目。 */
+          if (x.cat1 && (x.catSrc === undefined || x.catSrc === null)) {
+            bump('R9类目无来源', x.asin + ' cat1=' + x.cat1 + ' src=' + x.source + ' cat2=' + x.cat2, '(未分类)');
+            if (!dryRun) { x.cat1 = null; x.cat2 = null; x.catPath = null; }
+          }
         }
         if (!dryRun) save('products.json', products);
         const out = Object.entries(stats).map(([k, v]) => ({ rule: k, count: v.n, samples: v.samples.map((s) => s.before + '  →  ' + s.after) }));
         return send(200, { dryRun, total: products.length, rules: out, totalFixed: out.reduce((s, r) => s + r.count, 0) });
+      }
+
+      /* ★ 2026-10-03 定向清理: cat1 有值但没有 catSrc 来源 → 归「未分类」 (用户选定方案③)
+       * 为什么单独做一个入口, 而不是直接跑 /api/products/fix-derived:
+       *   实测 fix-derived 预演会动 8026 条(R2主图 7741 / R5排名 153 / R8脏BSR 11 …),
+       *   远超本次授权范围; 尤其 **R5 用的是 `rank = max(bsr)` 的旧口径** ——
+       *   正是 2026-10-02 从 applyRankFields 里移除的那条(它把子类排名当父类排名写进 rank,
+       *   会和权威字段 rankParent 冲突)。所以 fix-derived 不能整包跑, 这里只做 R9 这一条。
+       * 判据: cat1 有值 && (catSrc 缺失/为 null)。全库恰好命中 121 条, 全部是
+       *   2026-09-13 / source='brand-links' 的跨页串读遗留(详见 dropContaminatedBsr 注释)。
+       *   dryRun 默认 true, 必须先预演再显式 dryRun:false。 */
+      if (p === '/api/products/fix-cat-nosource' && req.method === 'POST') {
+        const dryRun = j.dryRun !== false;
+        const rows = [];
+        for (const x of products) {
+          if (!x.cat1) continue;
+          if (x.catSrc !== undefined && x.catSrc !== null) continue;
+          rows.push({ asin: x.asin, before: x.cat1, cat2: x.cat2 || null, catPath: x.catPath || null, source: x.source || null, collectedAt: x.collectedAt || null });
+          if (!dryRun) { x.cat1 = null; x.cat2 = null; x.catPath = null; }
+        }
+        if (!dryRun && rows.length) save('products.json', products);   // 覆盖前自动备份
+        const byDate = {};
+        for (const r of rows) { const k = String(r.source) + ' | ' + String(r.collectedAt).slice(0, 10); byDate[k] = (byDate[k] || 0) + 1; }
+        return send(200, { ok: true, dryRun, total: products.length, matched: rows.length, byDate, samples: rows.slice(0, 20) });
       }
 
       // 用 BSR 榜单类目就地推出一级/二级类目 (不读页面, 秒级完成; 结果标记 catSrc='bsr')
