@@ -2460,12 +2460,23 @@ function mergeZyApiRecord(it, rec) {
     n++;
   }
 
-  // ⑤ 变体属性 (颜色/尺寸) —— 与已有 variantAttrs 合并, 不覆盖已有键
+  /* ⑤ 变体属性 (颜色/尺寸)
+   * ★ 踩过的坑: 原来直接写 it.variantAttrs = {...}, 但 applyRankFields 里的
+   *   computeVariantKey() 会【无条件重算】variantAttrs:
+   *       item.variantAttrs = Object.keys(attrs).length ? attrs : null;   // attrs 只来自 color/variantSize
+   *   于是我写进去的值紧接着就被清成 null —— 库里 7331 条 API 刷新过的记录 variantAttrs 全是 null,
+   *   只有 1 条幸免。修法: 写它真正读取的来源字段(color / variantSize), 而不是它的产物。
+   *   这样也顺带让变体族分组用上接口给的颜色/尺寸。 */
   if (rec.Variations && typeof rec.Variations === 'object') {
-    const va = (it.variantAttrs && typeof it.variantAttrs === 'object') ? it.variantAttrs : {};
     let add = 0;
-    for (const [k, v] of Object.entries(rec.Variations)) { if (v != null && va[k] == null) { va[k] = String(v); add++; } }
-    if (add) { it.variantAttrs = va; n++; }
+    for (const [k, v] of Object.entries(rec.Variations)) {
+      if (v == null || v === '') continue;
+      const val = String(v).slice(0, 40);
+      const lk = String(k).toLowerCase();
+      if ((lk === 'color' || lk === 'colour') && !it.color) { it.color = val; add++; }
+      else if (lk === 'size' && !it.variantSize) { it.variantSize = val; add++; }
+    }
+    if (add) n++;
   }
 
   // ⑥ 卖点
@@ -9093,7 +9104,14 @@ const server = http.createServer((req, res) => {
       //   不加进来会被守卫自己的 409 拦掉, 表现为"采集忙的时候连「重跑失败」都点不了"。
       //   ★ 路线 B: ingest-push 也在此列 —— 它是「扩展推数据进来」, 不驱动 CDP、瞬间完成,
       //     若让守卫给它注册 running 进度, 它返回 200 后无人清理 → 下一次真实采集被自己的守卫 409 拦掉 (实测)。
-      const GUARD_SKIP = new Set(['/api/collect/stop', '/api/collect/link-job/retry', '/api/collect/link-job/remove', '/api/collect/ingest-push']);
+      /* ★ 2026-10-03: 智赢 API 通道的端点也必须放进放行名单 —— 踩过与"坑 #30"完全同型的坑:
+       *   api-run 自己管理 zyApiJob 与并发守卫, 不驱动 CDP 页面采集;
+       *   若不放行, 守卫会把它当普通采集 beginCollectProgress('collect') 注册 running,
+       *   而它返回 200 后没有任何地方清理该标志 → 【下一次任何采集(包括它自己、包括常规采集)
+       *   全被守卫 409 拦死】, 且 api-stop 自己也被拦(不在名单里) → 连停都停不掉。
+       *   api-status/selftest 是 GET, 放进来是防御性的。 */
+      const GUARD_SKIP = new Set(['/api/collect/stop', '/api/collect/link-job/retry', '/api/collect/link-job/remove', '/api/collect/ingest-push',
+        '/api/collect/api-run', '/api/collect/api-stop', '/api/collect/api-status', '/api/collect/api-selftest']);
       if (req.method === 'POST' && p.startsWith('/api/collect/') && !GUARD_SKIP.has(p)) {
         const busy = !!(collectProgress && collectProgress.running);
         if (busy) {
@@ -11239,17 +11257,30 @@ const server = http.createServer((req, res) => {
         const dryRun = j.dryRun === true;
         const limit = Math.max(0, Number(j.limit) || 0);
         let asins = Array.isArray(j.asins) ? j.asins.map((x) => String(x).trim().toUpperCase()).filter((x) => /^[A-Z0-9]{10}$/.test(x)) : [];
+        let skippedFresh = 0;
         if (mode !== 'given') {
           let pool = products.filter((x) => (x.site || '') === site);
           if (mode === 'missing-country') pool = pool.filter((x) => !x.sellerCountryCode);
           else if (mode === 'missing-rank') pool = pool.filter((x) => x.rankParent == null);
+          /* ★ 断点续跑: 跳过 N 小时内刚用 API 刷过的(默认 24h)。
+           *   长跑必然会中断(限流/CDP 超时), 没有这个就只能从头重跑, 白白再打一遍接口。 */
+          const skipFreshH = j.skipFreshHours == null ? 24 : Math.max(0, Number(j.skipFreshHours));
+          if (skipFreshH > 0) {
+            const cut = Date.now() - skipFreshH * 3600e3;
+            const before = pool.length;
+            pool = pool.filter((x) => {
+              const t = x.apiAt ? Date.parse(String(x.apiAt).replace(' ', 'T')) : NaN;
+              return !(t && t > cut);
+            });
+            skippedFresh = before - pool.length;
+          }
           asins = pool.map((x) => x.asin);
         }
         if (limit) asins = asins.slice(0, limit);
         if (!asins.length) return send(200, { ok: true, total: 0, note: '没有需要处理的商品' });
 
         zyApiJob = {
-          running: true, startedAt: now(), site, mode, dryRun, total: asins.length,
+          running: true, startedAt: now(), site, mode, dryRun, total: asins.length, skippedFresh,
           done: 0, got: 0, merged: 0, fieldHits: {}, failed: 0, rateLimited: 0, ms: 0,
           perItemMs: null, stopped: false, error: null, samples: [],
           asins,
@@ -11257,32 +11288,37 @@ const server = http.createServer((req, res) => {
         const job = zyApiJob;
         (async () => {
           try {
+            /* ★ 增量落盘: 每批返回就立刻合并 + 存盘。
+             *   踩过: 原来等全部批次跑完才合并, 结果 4800/7334 处卡住(CDP 超时) →
+             *   前面十几分钟一个字段都没写进库。长跑必须能随时中断且保住已有成果。 */
+            const byAsin = new Map(products.map((x, i) => [x.asin, i]));
+            const applyBatch = (batchData) => {
+              let changed = 0;
+              for (const [asin, rec] of Object.entries(batchData || {})) {
+                const idx = byAsin.get(asin);
+                if (idx == null) { job.failed++; continue; }
+                const it = products[idx];
+                const before = { bsr: it.bsrShop, cc: it.sellerCountryCode, ft: it.firstAvailable, off: it.followCount, ful: it.fulfill };
+                const ch = dryRun ? zyApiWouldChange(it, rec) : mergeZyApiRecord(it, rec);
+                if (!ch) continue;
+                if (!dryRun) products[idx] = applyRankFields(it);
+                changed++;
+                for (const k of (ch.keys || [])) job.fieldHits[k] = (job.fieldHits[k] || 0) + 1;
+                if (job.samples.length < 8) job.samples.push({ asin, before, after: { cc: rec.SellerCountry || null, ft: rec.FirstTime || null, bsr: rec.BSR ? rec.BSR.length + '条' : null, off: (rec.Offers || []).length, changed: ch.keys } });
+              }
+              job.merged += changed;
+              if (!dryRun && changed) save('products.json', products);   // 覆盖前自动备份
+            };
+
             const { data, stats } = await zyApi.moreAboutAsin(asins, site, {
               batch: Math.min(20, Math.max(1, Number(j.batch) || 20)),
               gapMs: j.gapMs == null ? 900 : Math.max(0, Number(j.gapMs)),
               retries: j.retries == null ? 3 : Number(j.retries),
               log: (m) => { job.lastLog = m; },
+              onBatch: applyBatch,
               onProgress: (pr) => { job.done = pr.done; job.got = pr.got; },
             });
-            if (job.stopped) { job.running = false; return; }
-            let merged = 0;
-            const byAsin = new Map(products.map((x, i) => [x.asin, i]));
-            for (const [asin, rec] of Object.entries(data || {})) {
-              const idx = byAsin.get(asin);
-              if (idx == null) { job.failed++; continue; }
-              const it = products[idx];
-              const before = { bsr: it.bsrShop, cc: it.sellerCountryCode, ft: it.firstAvailable, off: it.followCount, ful: it.fulfill, ms: it.monthlySales };
-              const changed = dryRun ? zyApiWouldChange(it, rec) : mergeZyApiRecord(it, rec);
-              if (changed) {
-                merged++;
-                if (!dryRun) products[idx] = applyRankFields(it);
-                for (const k of (changed.keys || [])) job.fieldHits[k] = (job.fieldHits[k] || 0) + 1;
-                if (job.samples.length < 8) job.samples.push({ asin, before, after: { bsr: rec.BSR ? rec.BSR.length + '条' : null, cc: rec.SellerCountry || null, ft: rec.FirstTime || null, off: (rec.Offers || []).length, sales: rec.Sales == null ? null : rec.Sales, changed: changed.keys } });
-              }
-            }
-            if (!dryRun && merged) save('products.json', products);   // 覆盖前自动备份
-            job.merged = merged;
-            Object.assign(job, { failed: job.failed + (stats.failedBatches || 0), rateLimited: stats.rateLimited || 0, ms: stats.ms, perItemMs: stats.perItemMs, got: stats.got });
+            if (!job.stopped) Object.assign(job, { failed: job.failed + (stats.failedBatches || 0), rateLimited: stats.rateLimited || 0, ms: stats.ms, perItemMs: stats.perItemMs, got: stats.got });
           } catch (e) {
             job.error = String((e && e.message) || e).slice(0, 300);
           } finally {

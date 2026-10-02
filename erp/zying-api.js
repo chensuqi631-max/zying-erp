@@ -38,7 +38,9 @@ function connect(wsUrl) {
       on: (ev, fn) => { (handlers[ev] = handlers[ev] || []).push(fn); },
       send: (method, params = {}) => new Promise((res, rej) => {
         const i = ++id;
-        const timer = setTimeout(() => { pend.delete(i); rej(new Error('CDP ' + method + ' 超时')); }, 60000);
+        /* ★ 30s 而非 60s: 实测长跑时个别批次会卡在 Runtime.evaluate 上,
+         *   超时太长会把整个任务拖死(3 次重试 = 180s/批)。宁可早点失败交给重连重试。 */
+        const timer = setTimeout(() => { pend.delete(i); rej(new Error('CDP ' + method + ' 超时')); }, 30000);
         pend.set(i, (m) => { clearTimeout(timer); m.error ? rej(new Error(JSON.stringify(m.error))) : res(m.result); });
         try { ws.send(JSON.stringify({ id: i, method, params })); } catch (e) { clearTimeout(timer); rej(e); }
       }),
@@ -50,12 +52,54 @@ function connect(wsUrl) {
 
 /** 建立/复用会话: 找到插件隔离世界并钩出 __webpack_require__  (整进程复用一条连接) */
 let _sess = null;
+let _rotateTargetId = null;   // 轮换出的新标签页 (优先使用它)
+
+const PORT = CDP_PORT;
+
+/* 浏览器级 CDP: 用于 Target.createTarget 开一个全新标签页。
+ * ★ 为什么需要"轮换标签页": 实测长跑约 4800 个商品后, 该页面的内容脚本实例会【卡死】——
+ *   Runtime.evaluate 一直不返回(超时), 而且【重载页面没用】(重载后仍卡),
+ *   但【新开一个标签页立刻恢复】(实测 153ms 就返回)。
+ *   ⇒ 于是把"开新页"做成超时后的自愈手段, 长跑才能跑到底。 */
+async function browserCdp() {
+  const ver = await (await fetch(`http://127.0.0.1:${PORT}/json/version`)).json();
+  const ws = new WebSocket(ver.webSocketDebuggerUrl);
+  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('浏览器级 CDP 连接失败')); });
+  let id = 0; const pend = new Map();
+  ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); } };
+  return {
+    send: (me, pa) => new Promise((res, rej) => {
+      const i = ++id;
+      const t = setTimeout(() => { pend.delete(i); rej(new Error('浏览器 CDP ' + me + ' 超时')); }, 20000);
+      pend.set(i, (m) => { clearTimeout(t); m.error ? rej(new Error(JSON.stringify(m.error))) : res(m.result); });
+      ws.send(JSON.stringify({ id: i, method: me, params: pa }));
+    }),
+    close: () => { try { ws.close() } catch (e) {} },
+  };
+}
+
+/** 开一个全新标签页(内容脚本重新注入 → 卡死的请求桥恢复), 并让后续调用都走它 */
+async function rotateToFreshTab(site) {
+  const s = String(site || 'de').toLowerCase();
+  const host = 'https://www.amazon.' + (s === 'uk' ? 'co.uk' : s === 'us' ? 'com' : s) + '/';
+  const b = await browserCdp();
+  try {
+    const r = await b.send('Target.createTarget', { url: host });
+    _rotateTargetId = r && r.targetId ? r.targetId : null;
+  } finally { b.close(); }
+  closeSession();
+  await new Promise((r) => setTimeout(r, 3000));   // 等内容脚本注入
+  return _rotateTargetId;
+}
+
 async function session(opts = {}) {
   if (_sess && _sess.ok) return _sess;
   const tabs = await listTabs();
   const pages = tabs.filter((t) => t.type === 'page' && t.url && !/^chrome-extension:/.test(t.url));
   const amz = pages.filter((t) => /amazon\./.test(t.url));
-  const page = amz[0] || pages[0];
+  // ★ 如果轮换过, 优先用那个新页; 否则用第一个亚马逊页
+  const rotated = _rotateTargetId ? pages.find((t) => t.id === _rotateTargetId) : null;
+  const page = rotated || amz[0] || pages[0];
   if (!page) throw new Error(`Edge(端口 ${CDP_PORT}) 没有可用页面 —— 请确认浏览器以 --remote-debugging-port=${CDP_PORT} 启动并打开一个亚马逊页面`);
 
   const cdp = await connect(page.webSocketDebuggerUrl);
@@ -175,10 +219,23 @@ async function call(path, data, method = 'POST', base = BASE) {
   try {
     return await once();
   } catch (e) {
-    const stale = /Cannot find context|Execution context was destroyed|No context with|Inspected target navigated/i.test(String(e.message));
-    if (!stale) throw e;
-    closeSession();                 // 上下文失效 → 重连并重新定位隔离世界
-    await new Promise((r) => setTimeout(r, 400));
+    const msg = String(e.message);
+    /* ★ 三类需要"自愈后重试"的错误:
+     *   ① 页面导航/刷新 → contextId 失效 (Cannot find context ...) → 重连即可
+     *   ② Runtime.evaluate 超时 → 该页面的内容脚本实例卡死。实测【重载页面无效】,
+     *      必须【开一个全新标签页】(153ms 即恢复) → 所以走 rotateToFreshTab
+     *   ③ 同上但在 PluginVersion 之类轻量调用上出现 → 同样走轮换 */
+    const ctxGone = /Cannot find context|Execution context was destroyed|No context with|Inspected target navigated/i.test(msg);
+    const wedged = /超时|timeout/i.test(msg);
+    if (!ctxGone && !wedged) throw e;
+    closeSession();
+    if (wedged) {
+      const m = /amazon\.zying\.net\/api\/zbig\/[^/]+\/[^/]*\/?([a-z.]{2,6})/i.exec(String(path)) || /\/zbig\/[^/]+\/([a-z.]{2,6})/i.exec(String(path));
+      const site = m ? m[1] : 'de';
+      try { await rotateToFreshTab(site); } catch (x) { await new Promise((r) => setTimeout(r, 1500)); }
+    } else {
+      await new Promise((r) => setTimeout(r, 600));
+    }
     return await once();
   }
 }
@@ -215,7 +272,14 @@ async function moreAboutAsin(asins, site = 'de', opts = {}) {
       try {
         const r = await call(`/zbig/MoreAboutAsin/v2/${site}`, chunk.map((a) => ({ asin: a })));
         stats.apiCalls++;
-        if (r && typeof r === 'object') { Object.assign(data, r); stats.ok++; }
+        if (r && typeof r === 'object') {
+          Object.assign(data, r);
+          stats.ok++;
+          /* ★ 逐批回调 —— 长跑必须能增量落盘。
+           *   踩过: 原来只在全部批次跑完后才合并保存, 结果跑到 4800/7334 时卡住,
+           *   【一个字段都没落盘】, 前面十几分钟全白费。改为每批交出去让调用方即时合并+保存。 */
+          if (opts.onBatch) { try { opts.onBatch(r, stats); } catch (e) { log('[API] onBatch 回调异常: ' + e.message); } }
+        }
         break;
       } catch (e) {
         if (e.rateLimited) stats.rateLimited++;
@@ -241,5 +305,5 @@ async function moreAboutAsin(asins, site = 'de', opts = {}) {
 
 function closeSession() { if (_sess && _sess.cdp) _sess.cdp.close(); _sess = null; }
 
-module.exports = { session, call, apiLimit, pluginVersion, moreAboutAsin, listTabs, closeSession, BASE,
+module.exports = { session, call, rotateToFreshTab, apiLimit, pluginVersion, moreAboutAsin, listTabs, closeSession, BASE,
   get sessionInfo() { return _sess ? { extId: _sess.extId, pageUrl: _sess.pageUrl, reqMod: _sess.reqMod, apiMod: _sess.apiMod, modules: _sess.modules } : null; } };
