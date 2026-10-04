@@ -3623,6 +3623,19 @@ async function cdpSwitchCountry(send, site, wantCc) {
   const m = String((now && now.href) || '').match(/^https?:\/\/(www\.amazon\.[a-z.]+)\//i);
   if (!m) return { ok: false, err: '当前页不是 amazon 站点页(' + ((now && now.href) || '?') + '), 无法切国家' };
   if (m[1] === wantHost) return { ok: true, already: true, cc: (now && now.cc) || null, url: 'https://' + wantHost + '/' };
+  /* ★ 快路(实测): 直接带 ref 跳到目标 marketplace —— 省掉"进国家页读下拉再跳"那一整页(约 10s)。
+   *   ref_=icp_country_from_<来源国> 正是 #icp-dropdown 里那一项的 value 形态(下面慢路读到的就是它),
+   *   所以这一步与页面自己按钮产生的导航完全等价 —— 而且全程没有模拟鼠标, 只是 Page.navigate。 */
+  const fromCc = String((now && now.cc) || '').toLowerCase() || 'de';
+  const fastUrl = 'https://' + wantHost + '/?ref_=icp_country_from_' + fromCc;
+  await send('Page.navigate', { url: fastUrl });
+  let fastReady = await cdpWaitReady(send, 30000);
+  await new Promise((r) => setTimeout(r, 1200));
+  let fastAfter = await cdpReadLocale(send);
+  if (fastAfter && String(fastAfter.cc || '').toUpperCase() === String(wantCc || '').toUpperCase()) {
+    return { ok: fastReady, via: 'direct-url', name: wantHost, url: fastUrl, cc: fastAfter.cc, ready: fastReady };
+  }
+  /* ★ 慢路(兜底): 万一 ref 形态变了, 回到国家页从 #icp-dropdown 里读亚马逊【自己给的】目标 URL。 */
   const pageUrl = 'https://' + m[1] + '/customer-preferences/country?ref_=icp_lop_mop_chg&preferencesReturnUrl=%2F';
   await send('Page.navigate', { url: pageUrl });
   await cdpWaitReady(send, 25000);
@@ -3710,7 +3723,8 @@ async function cdpCheckSiteLocaleRun(send, url, site, opts = {}) {
             rep.warns.push('⚠ 站点不符: 链接是 ' + String(site).toUpperCase() + '(期望 ' + exp.cc + '), 亚马逊当前是 '
               + String(got.cc).toUpperCase() + (got.ctry ? '(' + got.ctry + ')' : '') + ' —— 自动切换失败: ' + (sc.err || '未知') + ', 请手动切换');
           } else {
-            rep.fixes.push('国家/地区已切换 → ' + exp.cc + (sc.name ? '(' + sc.name + ')' : ''));
+            rep.fixes.push('国家/地区已切换 → ' + exp.cc + (sc.name ? '(' + sc.name + ')' : '') + (sc.via === 'direct-url' ? ' [直达]' : ''));
+            rep.country.via = sc.via || 'country-page';
             /* ★ 切国家 = 整页跳到目标 marketplace 首页 → 必须把页面【送回调用方要的目标页】,
              *   否则调用方会在站点首页上继续采集(列表页直采会直接变成 0 个商品 —— 与 glow 改地址那次同型的坑)。 */
             if (url && /^https?:\/\//i.test(String(url))) {
