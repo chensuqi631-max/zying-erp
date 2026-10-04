@@ -3498,7 +3498,7 @@ const LOCALE_READ_JS = `(() => {
   // 邮编: 数字型(10115/10001/2000) 或 英式(SW1A1AA)。
   // ★ 实测格式随界面语言变: 德文界面 "10115‌ Berlin"(Berlin 前有零宽字符 U+200C), 英文界面 "Berlin 10115"
   //   → 绝不能锚定行首/按空格切, 直接在整串里找数字。
-  const zip = zipRaw ? (((zipRaw.match(/(\\d{4,6})/) || [])[1]) || ((zipRaw.match(/([A-Z]{1,2}\\d[A-Z\\d]?\\s*\\d[A-Z]{2})/i) || [])[1]) || null) : null;
+  const zip = zipRaw ? (((zipRaw.match(/(\\d{3}-\\d{4})/) || [])[1]) || ((zipRaw.match(/(\\d{4,6})/) || [])[1]) || ((zipRaw.match(/([A-Z]{1,2}\\d[A-Z\\d]?\\s*\\d[A-Z]{2})/i) || [])[1]) || null) : null;
   const flag = document.querySelector('.icp-nav-flag');
   const cc = flag ? (((String(flag.className || '').match(/icp-nav-flag-([a-z]{2})\\b/) || [])[1]) || null) : null;
   const ctry = T(document.querySelector('#icp-touch-link-country'));
@@ -3804,7 +3804,10 @@ async function cdpCheckSiteLocaleRun(send, url, site, opts = {}) {
 
     // ② 送货地址(放在国家切换之后 —— 换了 marketplace, 配送地址/邮编也可能跟着变)
     if (wantZip && got.zip) {
-      const ok = String(got.zip).toUpperCase() === String(wantZip).toUpperCase();
+      /* 归一化后再比: 忽略连字符/空格 —— 日本 100-0001、英国 SW1A 1AA、德国 10115 都能对上。
+       * (坑: 日本邮编若不加 \d{3}-\d{4} 单独识别, 会被通用 \d{4,6} 切成 "0001" → 误报地址不符。) */
+      const nz = (s) => String(s).toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const ok = nz(got.zip) === nz(wantZip);
       rep.addr = { want: wantZip, got: got.zip, ok: ok };
       // 站点首页显示的常是账号默认地址, 采集前已由 cdpSetGlowAddress 校准 → 不符只提示, 不重复改(避免翻页来回跳)
       if (!ok) rep.warns.push('配送地址 ' + got.zip + ' ≠ 期望 ' + wantZip + '(采集已按站点校准, 若数据异常请检查登录态)');
