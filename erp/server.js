@@ -1392,7 +1392,7 @@ function shellEnsureStop() {
     require('child_process').execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 20000 }, (e, out) => resolve(e ? -1 : parseInt(String(out).trim(), 10) || 0));
   });
 }
-const CDP_SITE_CODE = { 'co.uk': 'uk', com: 'us', de: 'de', fr: 'fr', it: 'it', es: 'es', 'co.jp': 'jp', ca: 'ca', in: 'in', 'com.au': 'au', 'com.mx': 'mx', 'com.br': 'br', nl: 'nl', se: 'se', pl: 'pl' };
+const CDP_SITE_CODE = { 'co.uk': 'uk', com: 'us', de: 'de', fr: 'fr', it: 'it', es: 'es', 'co.jp': 'jp', ca: 'ca', in: 'in', 'com.au': 'au', 'com.mx': 'mx', 'com.br': 'br', nl: 'nl', se: 'se', pl: 'pl', cn: 'cn' };
 // 站点代码 → amazon 域名后缀 (含自定义站点: au/mx/br/nl/se/pl/tr/ae/sa/sg 等)
 function siteToHostSuffix(site) {
   const map = { uk: 'co.uk', us: 'com', jp: 'co.jp', au: 'com.au', mx: 'com.mx', br: 'com.br', sg: 'com.sg', tr: 'com.tr', ae: 'ae', sa: 'sa', nl: 'nl', se: 'se', pl: 'pl', de: 'de', fr: 'fr', it: 'it', es: 'es', ca: 'ca', in: 'in' };
@@ -3423,7 +3423,11 @@ async function cdpEnrichOne(send, host, it, filter) {
 }
 
 // ===== 列表页公共工具: glow 地址设置 + 卡片提取 JS (list-direct / list-filtered 共用) =====
-const SITE_ZIP = { uk: ['GB', 'SW1A1AA'], us: ['US', '10001'], de: ['DE', '10115'], fr: ['FR', '75001'], it: ['IT', '00100'], es: ['ES', '28001'], jp: ['JP', '100-0001'], ca: ['CA', 'M5V2T6'], in: ['IN', '110001'], au: ['AU', '2000'], mx: ['MX', '06600'], br: ['BR', '01310-100'], nl: ['NL', '1011'], se: ['SE', '11157'], pl: ['PL', '00-001'] };
+const SITE_ZIP = { uk: ['GB', 'SW1A1AA'], us: ['US', '10001'], de: ['DE', '10115'], fr: ['FR', '75001'], it: ['IT', '00100'], es: ['ES', '28001'], jp: ['JP', '100-0001'], ca: ['CA', 'M5V2T6'], in: ['IN', '110001'], au: ['AU', '2000'], mx: ['MX', '06600'], br: ['BR', '01310-100'], nl: ['NL', '1011'], se: ['SE', '11157'], pl: ['PL', '00-001'],
+  /* ★ 2026-10-04 中国(CN/CNY)。注意: amazon.cn 网页版已于 2024-01 下线(现在只剩"海外购改版通知"页),
+   *   所以 cn 站点实际采集不到东西 —— 这里补齐映射是为了"链接站点识别/币种/国家码"不缺失:
+   *   缺了它 siteCurrency('cn') 会回落到 EUR, 把站点判成欧洲, 币种检查会去改错方向。 */
+  cn: ['CN', '100000'] };
 // 自动设置目标国家配送地址 (Amazon glow API): 确保 FBA 配送/税费/可配送判断正确
 // 注: 智赢插件的人民币价格不随配送地址变化 (插件有独立币种设置), 设置地址是为采集数据准确性
 async function cdpSetGlowAddress(send, url, site, customZip) {
@@ -3479,7 +3483,7 @@ async function cdpSetGlowAddress(send, url, site, customZip) {
 const SITE_SYMBOL = {
   uk: '£', us: '$', au: '$', ca: '$', sg: '$', mx: '$', br: 'R$',
   de: '€', fr: '€', it: '€', es: '€', nl: '€', be: '€', ie: '€',
-  jp: '¥', in: '₹', tr: '₺', ae: 'AED', sa: 'SAR', se: 'kr', pl: 'zł',
+  jp: '¥', in: '₹', tr: '₺', ae: 'AED', sa: 'SAR', se: 'kr', pl: 'zł', cn: '¥',
 };
 /** 站点期望值 —— 国家代码/邮编复用 SITE_ZIP, 币种复用 SITE_CURRENCY(不再抄第二份表, 避免两处漂移) */
 function siteExpect(site) {
@@ -3690,7 +3694,11 @@ async function cdpSwitchCountry(send, site, wantCc) {
   await new Promise((r) => setTimeout(r, 1500));
   const after = await cdpReadLocale(send);
   const okCc = !!after && String(after.cc || '').toUpperCase() === String(wantCc || '').toUpperCase();
-  return { ok: ready && okCc, name: info.hit, url: info.url, cc: (after && after.cc) || null, ready: ready };
+  /* 失败时必须给出可读原因 —— 否则上层只能显示"未知", 排查不了(踩过: 切中国时只说"未知")。 */
+  const why = okCc ? null
+    : (!ready ? '目标站点页未能就绪(可能该站点已不可用/网络异常)'
+      : '切换后回读不符(期望 ' + wantCc + ', 实际 ' + ((after && after.cc) || '无国旗') + ')');
+  return { ok: ready && okCc, name: info.hit, url: info.url, cc: (after && after.cc) || null, ready: ready, err: why };
 }
 
 /* ★ 并行去重: 整站/店铺并行采集会给 N 个标签页同时做【同一站点】的校验 ——
@@ -3757,6 +3765,21 @@ async function cdpCheckSiteLocaleRun(send, url, site, opts = {}) {
           if (!sc.ok) {
             rep.warns.push('⚠ 站点不符: 链接是 ' + String(site).toUpperCase() + '(期望 ' + exp.cc + '), 亚马逊当前是 '
               + String(got.cc).toUpperCase() + (got.ctry ? '(' + got.ctry + ')' : '') + ' —— 自动切换失败: ' + (sc.err || '未知') + ', 请手动切换');
+            /* ★ 切换失败时页面很可能已经被带到别处(国家页 / 目标 marketplace 首页 / 甚至一个不可用的站点页),
+             *   必须把页面送回调用方给的目标 URL —— 否则调用方会在错误的页面上继续采集。
+             *   (实测: 切中国时 amazon.cn 是"海外购改版通知"页, 切换必然失败, 页面就留在那儿了。)
+             *   注意: 这里【不能】拿 site 去推期望域名 —— 切换失败时 site 正是那个不存在的站点,
+             *   推出来的域名恰好等于当前页, 判断条件永远不成立(踩过)。一律无条件回目标 URL 最稳。 */
+            try {
+              if (url && /^https?:\/\//i.test(String(url))) {
+                await send('Page.navigate', { url: String(url) });
+                await cdpWaitReady(send, 30000);
+                await new Promise((r) => setTimeout(r, 1200));
+                const back = await cdpReadLocale(send);
+                if (back) got = back;
+                rep.country.restored = (back && back.href) ? String(back.href).slice(0, 90) : null;
+              }
+            } catch (e) { /* 恢复页面失败不影响采集继续 */ }
           } else {
             rep.fixes.push('国家/地区已切换 → ' + exp.cc + (sc.name ? '(' + sc.name + ')' : '') + (sc.via === 'direct-url' ? ' [直达]' : ''));
             rep.country.via = sc.via || 'country-page';
@@ -7459,6 +7482,9 @@ const SITE_CURRENCY = {
   uk: 'GBP', us: 'USD', au: 'AUD', ca: 'CAD', jp: 'JPY', in: 'INR', mx: 'MXN', br: 'BRL',
   sg: 'SGD', tr: 'TRY', ae: 'AED', sa: 'SAR', se: 'SEK', pl: 'PLN', nl: 'EUR', de: 'EUR',
   fr: 'EUR', it: 'EUR', es: 'EUR', be: 'EUR', ie: 'EUR',
+  cn: 'CNY',   /* ★ 2026-10-04 补: 中国站点币种。实测 amazon.de 的官方货币下拉里【没有 CNY】
+                *   (只有 EUR/GBP/CHF/PLN/SEK), 但 Network.setCookie 硬设 i18n-prefs=CNY 亚马逊接受,
+                *   页面价格会渲染成 "CNY82.94" 这种"代码形式"(没有 ¥ 符号映射)。 */
 };
 const siteCurrency = (site) => SITE_CURRENCY[site] || 'EUR';
 // 币种符号校验: 只接受与站点币种匹配的符号
