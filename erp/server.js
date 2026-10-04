@@ -3584,6 +3584,41 @@ async function cdpSwitchCurrency(send, wantCur) {
   return { ok: true, txt: info.txt, viaMouse: !!info.vis };
 }
 
+/* ★ 2026-10-04 协议级切货币(首选) —— 直接改 i18n-prefs cookie, 不模拟鼠标、不开下拉。
+ * 为什么这是最优解(真机实测对比):
+ *   · hover 下拉那套要"真鼠标 hover → 等异步填充(约 3.5s) → 点", 而首次 hover 常拿到空壳,
+ *     得靠"重载页面再试一次"兜底(见 cdpSwitchCurrency)。
+ *   · 这条路只需 Network.setCookie + 一次重载, 实测 100% 生效, 且不会留下重复 cookie。
+ * 关键细节:
+ *   ① 必须带 domain(.amazon.de) —— 不带的话会与亚马逊自己那份形成【两条同名 cookie】,
+ *      页面读出来与实际渲染不一致(踩过: 读 GBP 但价格显示 €)。
+ *   ② 先清掉可能存在的 host-only 同名 cookie, 否则它会遮蔽 domain 那条。
+ *   ③ 货币不是"账号设置", 就是这条客户端偏好 cookie; Amazon 服务端下一次请求就按它渲染。 */
+async function cdpSetCurrencyCookie(send, cur, host) {
+  const want = String(cur || '').toUpperCase();
+  if (!/^[A-Z]{3}$/.test(want)) return { ok: false, err: '币种代码不合法: ' + cur };
+  const h = String(host || '').replace(/^www\./, '');
+  if (!/^amazon\./.test(h)) return { ok: false, err: '拿不到 amazon 域名: ' + host };
+  try {
+    try { await send('Network.enable'); } catch (e) { /* 已启用/不支持都不影响后续 */ }
+    // ② 只在"确实有重复"时才清理(避免无谓地删掉亚马逊那份)
+    try {
+      const r = await send('Runtime.evaluate', { returnByValue: true, expression:
+        `String(document.cookie).split('; ').filter(function(s){return s.indexOf('i18n-prefs=')===0}).length` });
+      const n = Number(r && r.result && r.result.value) || 0;
+      if (n > 1) await send('Network.deleteCookies', { name: 'i18n-prefs', url: 'https://' + host + '/' });
+    } catch (e) { /* 清理失败也继续 —— 下面 setCookie 仍能覆盖 domain 那条 */ }
+    const set = await send('Network.setCookie', { name: 'i18n-prefs', value: want, domain: '.' + h, path: '/', secure: true });
+    if (!set || set.success !== true) return { ok: false, err: 'setCookie 未成功: ' + JSON.stringify(set) };
+    await send('Page.reload');
+    const ready = await cdpWaitReady(send, 25000);
+    await new Promise((r) => setTimeout(r, 1200));
+    const got = await cdpReadLocale(send);
+    const ok = !!got && String(got.curCookie || '').toUpperCase() === want;
+    return { ok: ok, via: 'cookie', cookie: (got && got.curCookie) || null, priceTxt: (got && got.priceTxt) || null, ready: ready };
+  } catch (e) { return { ok: false, err: (e && e.message) || 'setCookie 异常' }; }
+}
+
 /** 等页面可用(切换货币会整页刷新; 刷新期间 evaluate 会失败, 属正常) */
 async function cdpWaitReady(send, ms) {
   const end = Date.now() + (ms || 25000);
@@ -3778,7 +3813,15 @@ async function cdpCheckSiteLocaleRun(send, url, site, opts = {}) {
         rep.warns.push('⚠ 货币不符(' + (got.curCookie || got.priceTxt || '?') + ' ≠ ' + exp.cur + '), 但国家/地区仍是 '
           + (rep.country.got || '?') + '(未切换成功) —— 未改货币: 在错误的站点上改币种只会让价格更乱');
       } else {
-      let sw = await cdpSwitchCurrency(send, exp.cur);
+      /* ★ 首选【协议级】改法: 直接改 i18n-prefs cookie(Network.setCookie, 带 domain 覆盖亚马逊那份)。
+       *   实测完全不碰鼠标/下拉/异步填充, 也没有重复 cookie 问题; hover 下拉只作兜底。 */
+      const curHost = (String(got.href || '').match(/^https?:\/\/(www\.amazon\.[a-z.]+)\//i) || [])[1] || null;
+      let sw = curHost ? await cdpSetCurrencyCookie(send, exp.cur, curHost) : { ok: false, err: '拿不到当前 amazon 域名' };
+      if (!sw.ok) {   // 兜底: 真鼠标 hover 下拉(亚马逊若不再认这条 cookie 时还能用)
+        const why = sw.err || '?';
+        sw = await cdpSwitchCurrency(send, exp.cur);
+        if (sw.ok) sw.note = 'cookie 法未成(' + why + ') → 已退回 hover 下拉';
+      }
       if (!sw.ok) {
         /* ★ 实测: 首次 hover 常常拿到"弹出了但还没填充"的空下拉 → 重载页面后再试一次基本都能成
          *   (下拉内容是异步拉的, 重载会重新走一遍加载; 验证脚本里就是靠这一招救回来的)。 */
@@ -3794,7 +3837,7 @@ async function cdpCheckSiteLocaleRun(send, url, site, opts = {}) {
       if (!sw.ok) {
         rep.warns.push('⚠ 货币不符(' + (got.curCookie || got.priceTxt || '?') + ' ≠ ' + exp.cur + '), 自动切换失败: ' + (sw.err || '未知') + ' —— 请手动到国旗处切换货币');
       } else {
-        rep.fixes.push('货币已切换 → ' + exp.cur + (sw.txt ? '(' + sw.txt + ')' : ''));
+        rep.fixes.push('货币已切换 → ' + exp.cur + (sw.via ? '[' + sw.via + ']' : '') + (sw.txt ? '(' + sw.txt + ')' : '') + (sw.note ? ' ' + sw.note : ''));
         const ready = await cdpWaitReady(send, 25000);
         await new Promise((r) => setTimeout(r, 1200));
         const got2 = await cdpReadLocale(send);
