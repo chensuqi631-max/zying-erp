@@ -3606,6 +3606,45 @@ let lastLocaleCheck = null;          // 最近一次校验结果(供 /api/collec
  * @param opts.zip   自定义邮编(用户指定时用它当期望值, 否则用站点默认)
  * @param opts.force 跳过缓存强制校验
  */
+/* ★ 2026-10-04 国家/地区自动切换 —— 用户明确要求"不一致就自动改"。
+ * 真机实测(amazon.de → /customer-preferences/country):
+ *   · 页面标题 "Go to website", 核心控件是 <select id="icp-dropdown">, 【不在 form 里、没有 onchange】;
+ *   · 每个 option 的 value 就是【目标 marketplace 的完整 URL】, 自带 ref_=icp_country_from_<来源国>
+ *     —— 正是亚马逊用来记录"从哪个站点切过来"的参数;
+ *   · 当前站点那一项是 selected(如 amazon.de 对应 option 8)。
+ * 所以"切国家"= 选中目标项并把页面跳到那个 URL —— 与页面自己的按钮行为一致,
+ * 而且不用去猜那个没有文字的主提交按钮(input.a-button-input, 只有 "Cancel" 有可见文字)。
+ * ⚠ 切换会整页跳到目标 marketplace 首页 → 调用方(cdpCheckSiteLocale)必须负责把页面送回目标页。 */
+const countryFixAt = new Map();      // site → 上次尝试切国家的时间: 防"来回横跳"式反复切换
+const COUNTRY_FIX_TTL = 10 * 60 * 1000;
+async function cdpSwitchCountry(send, site, wantCc) {
+  const wantHost = 'www.amazon.' + siteToHostSuffix(site);
+  const now = await cdpReadLocale(send);
+  const m = String((now && now.href) || '').match(/^https?:\/\/(www\.amazon\.[a-z.]+)\//i);
+  if (!m) return { ok: false, err: '当前页不是 amazon 站点页(' + ((now && now.href) || '?') + '), 无法切国家' };
+  if (m[1] === wantHost) return { ok: true, already: true, cc: (now && now.cc) || null, url: 'https://' + wantHost + '/' };
+  const pageUrl = 'https://' + m[1] + '/customer-preferences/country?ref_=icp_lop_mop_chg&preferencesReturnUrl=%2F';
+  await send('Page.navigate', { url: pageUrl });
+  await cdpWaitReady(send, 25000);
+  await new Promise((r) => setTimeout(r, 1500));
+  const rr = await send('Runtime.evaluate', { returnByValue: true, expression:
+    `(()=>{const s=document.querySelector('#icp-dropdown');if(!s)return JSON.stringify({found:false,title:String(document.title||'').slice(0,40)});
+      const hit=[...s.options].find(o=>o.value&&o.value.indexOf('${wantHost}')>=0);
+      if(!hit)return JSON.stringify({found:true,hit:null,n:s.options.length});
+      s.value=hit.value; s.dispatchEvent(new Event('change',{bubbles:true}));   // 让界面与真实选择一致
+      return JSON.stringify({found:true,hit:String(hit.textContent||'').trim(),url:hit.value})})()` });
+  let info = null;
+  try { info = JSON.parse((rr && rr.result && rr.result.value) || 'null'); } catch (e) { /* 忽略 */ }
+  if (!info || !info.found) return { ok: false, err: '国家/地区页没有 #icp-dropdown' + (info && info.title ? '(标题: ' + info.title + ')' : '') };
+  if (!info.hit) return { ok: false, err: '下拉里没有 ' + wantHost + ' 这一项(共 ' + info.n + ' 项)' };
+  await send('Page.navigate', { url: info.url });
+  const ready = await cdpWaitReady(send, 30000);
+  await new Promise((r) => setTimeout(r, 1500));
+  const after = await cdpReadLocale(send);
+  const okCc = !!after && String(after.cc || '').toUpperCase() === String(wantCc || '').toUpperCase();
+  return { ok: ready && okCc, name: info.hit, url: info.url, cc: (after && after.cc) || null, ready: ready };
+}
+
 /* ★ 并行去重: 整站/店铺并行采集会给 N 个标签页同时做【同一站点】的校验 ——
  *   不去重的话 N 个 worker 会同时 hover 国旗、甚至同时点改货币, 互相打断(与 links-collector 的 addrProm 同一套路)。
  *   所以同一站点"进行中的那一次"直接复用, 后来者等它。 */
@@ -3640,7 +3679,7 @@ async function cdpCheckSiteLocaleRun(send, url, site, opts = {}) {
   };
 
   try {
-    const got = await cdpReadLocale(send);
+    let got = await cdpReadLocale(send);
     if (!got || !got.ok) {
       const href = String((got && got.href) || '');
       if (href && !/amazon\./i.test(href)) {
@@ -3654,7 +3693,44 @@ async function cdpCheckSiteLocaleRun(send, url, site, opts = {}) {
       return finish(rep);
     }
 
-    // ① 送货地址
+    // ① 国家/地区 —— 【不一致则自动切换】(2026-10-04 用户明确要求; 原来只告警)
+    if (exp.cc && got.cc) {
+      const ok = String(got.cc).toUpperCase() === String(exp.cc).toUpperCase();
+      rep.country = { want: exp.cc, got: String(got.cc).toUpperCase(), ok: ok, name: got.ctry || null };
+      if (!ok) {
+        const lastFix = countryFixAt.get(site) || 0;
+        if (Date.now() - lastFix < COUNTRY_FIX_TTL) {
+          // 10 分钟内已经试过 → 不再试(否则店铺/翻页循环里会反复跳站点, 互相打断)
+          rep.warns.push('⚠ 站点不符: 链接是 ' + String(site).toUpperCase() + '(期望 ' + exp.cc + '), 亚马逊当前是 '
+            + String(got.cc).toUpperCase() + (got.ctry ? '(' + got.ctry + ')' : '') + ' —— 10 分钟内已尝试自动切换过, 本轮不重复切换');
+        } else {
+          countryFixAt.set(site, Date.now());
+          const sc = await cdpSwitchCountry(send, site, exp.cc);
+          if (!sc.ok) {
+            rep.warns.push('⚠ 站点不符: 链接是 ' + String(site).toUpperCase() + '(期望 ' + exp.cc + '), 亚马逊当前是 '
+              + String(got.cc).toUpperCase() + (got.ctry ? '(' + got.ctry + ')' : '') + ' —— 自动切换失败: ' + (sc.err || '未知') + ', 请手动切换');
+          } else {
+            rep.fixes.push('国家/地区已切换 → ' + exp.cc + (sc.name ? '(' + sc.name + ')' : ''));
+            /* ★ 切国家 = 整页跳到目标 marketplace 首页 → 必须把页面【送回调用方要的目标页】,
+             *   否则调用方会在站点首页上继续采集(列表页直采会直接变成 0 个商品 —— 与 glow 改地址那次同型的坑)。 */
+            if (url && /^https?:\/\//i.test(String(url))) {
+              await send('Page.navigate', { url: String(url) });
+              await cdpWaitReady(send, 30000);
+              await new Promise((r) => setTimeout(r, 1500));
+            }
+            const got2c = await cdpReadLocale(send);
+            if (got2c) {
+              got = got2c;   // 后续地址/货币检查一律用【切换后】的页面数据
+              const ok2 = String(got.cc || '').toUpperCase() === String(exp.cc).toUpperCase();
+              rep.country.after = { cc: got.cc || null, ok: ok2, page: String(got.href || '').slice(0, 90) };
+              if (!ok2) rep.warns.push('⚠ 国家/地区切换后回读仍不符(期望 ' + exp.cc + ', 实际 ' + (got.cc || '?') + ')');
+            }
+          }
+        }
+      }
+    }
+
+    // ② 送货地址(放在国家切换之后 —— 换了 marketplace, 配送地址/邮编也可能跟着变)
     if (wantZip && got.zip) {
       const ok = String(got.zip).toUpperCase() === String(wantZip).toUpperCase();
       rep.addr = { want: wantZip, got: got.zip, ok: ok };
@@ -3662,13 +3738,6 @@ async function cdpCheckSiteLocaleRun(send, url, site, opts = {}) {
       if (!ok) rep.warns.push('配送地址 ' + got.zip + ' ≠ 期望 ' + wantZip + '(采集已按站点校准, 若数据异常请检查登录态)');
     } else if (wantZip) {
       rep.addr = { want: wantZip, got: null, ok: null, raw: got.zipRaw };
-    }
-
-    // ② 国家/地区 —— 只告警不自动改(动的是账号级设置, 可能影响结算与推荐)
-    if (exp.cc && got.cc) {
-      const ok = String(got.cc).toUpperCase() === String(exp.cc).toUpperCase();
-      rep.country = { want: exp.cc, got: String(got.cc).toUpperCase(), ok: ok, name: got.ctry || null };
-      if (!ok) rep.warns.push('⚠ 站点不符: 链接是 ' + String(site).toUpperCase() + '(期望 ' + exp.cc + '), 亚马逊当前是 ' + String(got.cc).toUpperCase() + (got.ctry ? '(' + got.ctry + ')' : '') + ' —— 国家/地区属账号设置, 未自动改, 请手动切换');
     }
 
     // ③ 货币 —— 首选 i18n-prefs cookie(权威 ISO 代码); 没有才用页面价格符号推
@@ -3687,6 +3756,14 @@ async function cdpCheckSiteLocaleRun(send, url, site, opts = {}) {
     if (mc === null) {
       rep.warns.push('货币未校验(既没读到 i18n-prefs cookie, 也没读到页面价格) —— 跳过货币检查');
     } else if (mc.ok === false) {
+      /* ★ 国家/地区还没对上(且没能自动切过来) → 【不要】再改货币:
+       *   在错误的 marketplace 上把币种改成链接站点要的, 只会让采到的价格更乱(de 的页面显示 £)。
+       *   等国家切对了, 货币下次自然就一致 —— 这也是真机验证里发现的(防抖拦下切换后仍改了货币)。 */
+      const countryStillWrong = !!(rep.country && rep.country.ok === false && !(rep.country.after && rep.country.after.ok));
+      if (countryStillWrong) {
+        rep.warns.push('⚠ 货币不符(' + (got.curCookie || got.priceTxt || '?') + ' ≠ ' + exp.cur + '), 但国家/地区仍是 '
+          + (rep.country.got || '?') + '(未切换成功) —— 未改货币: 在错误的站点上改币种只会让价格更乱');
+      } else {
       let sw = await cdpSwitchCurrency(send, exp.cur);
       if (!sw.ok) {
         /* ★ 实测: 首次 hover 常常拿到"弹出了但还没填充"的空下拉 → 重载页面后再试一次基本都能成
@@ -3713,6 +3790,7 @@ async function cdpCheckSiteLocaleRun(send, url, site, opts = {}) {
         rep.cur.after = { cookie: (got2 && got2.curCookie) || null, priceTxt: (got2 && got2.priceTxt) || null, ok: mc2 ? mc2.ok : null };
         if (mc2 && mc2.ok === false) rep.warns.push('⚠ 货币切换后回读仍不符(期望 ' + exp.cur + ', 实际 ' + ((got2 && (got2.curCookie || got2.priceTxt)) || '?') + ')');
         else if (!ready) rep.warns.push('货币已切换但页面 25s 内未就绪, 建议挑一页重采确认');
+      }
       }
     }
   } catch (e) {
