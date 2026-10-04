@@ -210,6 +210,14 @@ function saveCollectReport(rep, mergeWindowMs = 0) {
     }, rep);
     if (!r.fromUtc) r.fromUtc = r.at;
     if (!r.toUtc) r.toUtc = r.at;
+    /* ★ 2026-10-03 采集报告里带上【数据完整度校验】—— 用户要求"采集过程中要验证数据是否获取完整"。
+     *   按报告自己的时间窗算, 所以这条报告以后翻出来看, 当时的完整度就是当时的样子(不会被后续采集影响)。 */
+    if (!r.completeness && r.fromUtc) {
+      try { r.completeness = completenessSince(r.fromUtc); } catch (e) { /* 校验失败不影响报告落盘 */ }
+    }
+    /* ★ 2026-10-04 报告里带上【站点一致性校验】(送货地址/国家地区/货币)。
+     *   每个站点每轮采集只校验一次(见 cdpCheckSiteLocale), 这里只是把结果快照进报告。 */
+    try { if (!r.locale && lastLocaleCheck) r.locale = lastLocaleCheck; } catch (e) { /* TDZ 等异常不影响报告 */ }
     collectReports.unshift(r);
     collectReports = collectReports.slice(0, REPORT_MAX);
     save('collect-reports.json', collectReports);
@@ -1060,15 +1068,136 @@ let collectProgress = null;
 const setCollectProgress = (p) => { collectProgress = p; };
 const bumpCollectProgress = (partial) => { if (collectProgress) Object.assign(collectProgress, partial, { updatedAt: Date.now() }); };
 const clearCollectProgress = () => { collectProgress = null; };
+/* ★ 2026-10-03 完整度校验的运行时状态 —— 必须声明在 beginCollectProgress 之前(它要用),
+ *   放到下面会 TDZ(本文件为 collectProgress / zvRowMap 这类问题踩过好几次)。 */
+let collectRunFrom = null;             // 本轮采集的起始时刻(UTC 字符串) —— 完整度校验的时间窗
+let lastCollectCompleteness = null;    // 最近一次校验结果(供 /api/collect/completeness 查)
+const completenessAt = () => new Date().toISOString().slice(0, 19).replace('T', ' ');
 // 采集接口入口统一注册进度 (mode 对应前端采集方式卡片 data-mode)
 function beginCollectProgress(mode, label, extra = {}) {
   resetCollectStop();
+  /* ★ 2026-10-03 记下本轮采集的起始时刻 —— endCollectProgress() 用它当"完整度校验"的时间窗 */
+  collectRunFrom = completenessAt();
   setCollectProgress({ running: true, mode, label, startedAt: Date.now(), updatedAt: Date.now(), items: 0, added: 0, rounds: 0, round: 0, step: '启动', ...extra });
 }
 // 采集结束一定 flush —— 否则用户切到「商品管理」看到的是攒批前的旧数据
 function endCollectProgress() {
+  /* ★ 2026-10-03 采集结束【自动】做一次数据完整度校验 —— 挂在这一对上而不是逐个采集入口:
+   *   40 个采集入口都在调 begin/endCollectProgress, 所以这里一处就覆盖全部, 不需要用户做任何事。
+   *   详见下面 completenessSince() 的说明。 */
+  try { reportCollectCompleteness(); } catch (e) { console.warn('[完整度校验] 失败:', e && e.message); }
   clearCollectProgress();
   try { flushProducts(); } catch (e) { /* 忽略 */ }
+}
+
+/* ══════════ ★ 2026-10-03 采集「数据完整度」校验 ══════════
+ * 用户要求: 采集过程中需要验证所有数据是否已经获取完整。
+ *
+ * 为什么需要: 2026-09 那次"采集不跳详情页、详情页字段(价格/品牌/评分/评论/A+/类目/BSR/排名)
+ *   全部推给商品管理页「补采」"的做法, 采完根本不知道缺什么 —— 实测库里 6200/9528 条连排名
+ *   都没有, 是人工补采时才发现的。现在加了这道校验, 每次采集结束立刻给出覆盖率。
+ *
+ * 设计要点(都是踩过的坑换来的):
+ *   · 判据用【已落库的成品字段】(applyRankFields 之后的), 不重新猜原始数据;
+ *   · 「未上榜」(rankParentState==='not_listed')算【已获得】—— 面板已确认确实没这个排名, 不是缺;
+ *   · 「本轮没启用的能力」不算缺失: 没跳详情页就不该因为"没有价格"报错; 没开插件面板就不该
+ *     因为"没有月销"报错 —— 否则天天报假缺失, 用户很快就无视这个报告了。
+ *     判据: 该能力组里【至少有一个商品拿到了字段】才算启用(自动识别, 不用每个采集入口上报配置)。
+ *   · 分「必得」和「参考」两档: 评分/评论数/月销这类本来就可能不存在(没有评论的商品),
+ *     计入覆盖率但不影响 ok 判定; 标题/大排名/价格/BSR/类目/主图这些拿不到就是真问题。
+ */
+
+const COMPLETENESS_FIELDS = [
+  { k: 'title',          label: '标题',     grp: 'list',   req: true,  get: (x) => !!x.title },
+  { k: 'brand',          label: '品牌',     grp: 'list',   req: true,  get: (x) => !!x.brand },
+  { k: 'followCount',    label: '跟卖数',   grp: 'list',   req: false, get: (x) => x.followCount != null },
+  { k: 'rankParent',     label: '大排名',   grp: 'detail', req: true,  get: (x) => rankParentOf(x) != null || rankParentStateOf(x) === 'not_listed' },
+  { k: 'bsr',            label: 'BSR明细',  grp: 'detail', req: true,  get: (x) => (Array.isArray(x.bsr) && x.bsr.length > 0) || x.bsrShop != null || x.bsrCat != null },
+  { k: 'price',          label: '价格',     grp: 'detail', req: true,  get: (x) => x.price != null },
+  { k: 'category',       label: '类目层级', grp: 'detail', req: true,  get: (x) => !!(x.cat1 || x.catPath) },
+  { k: 'mainImage',      label: '主图',     grp: 'detail', req: true,  get: (x) => !!x.mainImage },
+  { k: 'fulfill',        label: '配送方式', grp: 'detail', req: false, get: (x) => !!x.fulfill },
+  { k: 'rating',         label: '评分',     grp: 'detail', req: false, get: (x) => x.rating != null },
+  { k: 'reviews',        label: '评论数',   grp: 'detail', req: false, get: (x) => x.reviews != null },
+  { k: 'monthlySales',   label: '月销',     grp: 'panel',  req: false, get: (x) => x.monthlySales != null },
+  { k: 'weight',         label: '重量',     grp: 'panel',  req: false, get: (x) => !!x.weight },
+  { k: 'size',           label: '尺寸',     grp: 'panel',  req: false, get: (x) => !!x.size },
+  { k: 'mainSeller',     label: '主卖家',   grp: 'panel',  req: false, get: (x) => !!x.mainSeller },
+  { k: 'sellerCountry',  label: '卖家国别', grp: 'panel',  req: false, get: (x) => !!x.sellerCountryCode },
+  { k: 'trademarkCount', label: '商标数',   grp: 'panel',  req: false, get: (x) => x.trademarkCount != null },
+];
+const COMPLETENESS_GRP_NAME = { list: '列表页', detail: '详情页', panel: '插件面板' };
+
+/** 对一批商品算覆盖率。caps 可显式指定启用了哪些能力; 不传就按数据自动识别。 */
+function collectCompleteness(items, caps) {
+  const list = (Array.isArray(items) ? items : []).filter(Boolean);
+  const n = list.length;
+  const grpOn = (g) => {
+    if (caps && typeof caps[g] === 'boolean') return caps[g];
+    if (!n) return false;
+    return COMPLETENESS_FIELDS.some((f) => f.grp === g && list.some((x) => f.get(x)));
+  };
+  const on = { list: true, detail: grpOn('detail'), panel: grpOn('panel') };
+  const fields = COMPLETENESS_FIELDS.map((f) => {
+    const applies = on[f.grp];
+    let have = 0; const missing = [];
+    if (applies) {
+      list.forEach((x) => {
+        if (f.get(x)) have++;
+        else if (missing.length < 20) missing.push(String(x.asin || x.id || '?'));
+      });
+    }
+    const miss = applies ? (n - have) : 0;
+    return { k: f.k, label: f.label, grp: f.grp, req: f.req, applies: applies, have: have, miss: miss,
+             rate: (applies && n) ? Math.round((have / n) * 100) : null, missing: missing };
+  });
+  const applicable = fields.filter((f) => f.applies);
+  /* ⚠ 只把【必得字段】的缺失当问题; 参考字段(评分/评论/月销…)缺了只报数不判失败 */
+  const bad = applicable.filter((f) => f.req && f.miss > 0).sort((a, b) => b.miss - a.miss);
+  const soft = applicable.filter((f) => !f.req && f.miss > 0).sort((a, b) => b.miss - a.miss);
+  return {
+    at: completenessAt(), total: n, caps: on,
+    fields: fields,
+    ok: n > 0 && bad.length === 0,
+    bad: bad.map((f) => ({ label: f.label, miss: f.miss, rate: f.rate, missing: f.missing })),
+    soft: soft.map((f) => ({ label: f.label, miss: f.miss, rate: f.rate })),
+    text: !n ? '本轮没有商品入库'
+      : (bad.length
+          ? '缺: ' + bad.slice(0, 8).map((f) => f.label + ' ' + f.miss + '/' + n).join(' · ')
+          : '必得字段全部齐全'),
+  };
+}
+
+/** 按时间窗(采集开始 → 现在)算一次并打进日志; 结果留给 /api/collect/completeness 查 */
+function completenessSince(fromUtc, caps) {
+  const from = String(fromUtc || collectRunFrom || '').slice(0, 19);
+  if (!from) return collectCompleteness([], caps);
+  const items = products.filter((x) => String(x.collectedAt || '') >= from);
+  return collectCompleteness(items, caps);
+}
+
+/** 采集结束时调用: 算一次 + 打日志(把每个字段的覆盖率列出来, 缺的连 ASIN 一起给) */
+function reportCollectCompleteness() {
+  if (!collectRunFrom) return null;
+  const cmp = completenessSince(collectRunFrom);
+  lastCollectCompleteness = cmp;
+  collectRunFrom = null;
+  if (!cmp.total) return cmp;
+  console.log('   ── 数据完整度校验: 本轮 ' + cmp.total + ' 个商品');
+  ['list', 'detail', 'panel'].forEach((g) => {
+    const fs2 = cmp.fields.filter((f) => f.grp === g);
+    if (!fs2.length) return;
+    if (!fs2[0].applies) { console.log('      ' + COMPLETENESS_GRP_NAME[g] + ': 本轮未启用(不作为缺失计)'); return; }
+    console.log('      ' + COMPLETENESS_GRP_NAME[g] + ': ' + fs2.map((f) => f.label + ' ' + f.rate + '%').join(' · '));
+  });
+  if (cmp.bad.length) {
+    console.log('      ⚠ 必得字段有缺失: ' + cmp.text);
+    cmp.bad.slice(0, 4).forEach((f) => console.log('        · ' + f.label + ' 缺 ' + f.miss + ' 个, 例: ' + f.missing.slice(0, 5).join(',')));
+  } else {
+    console.log('      ✅ 必得字段全部齐全');
+  }
+  if (cmp.soft.length) console.log('      (参考字段缺: ' + cmp.soft.slice(0, 6).map((f) => f.label + ' ' + f.miss).join(' · ') + ')');
+  return cmp;
 }
 
 function now() { return new Date().toISOString().slice(0, 19).replace('T', ' '); }
@@ -1419,11 +1548,10 @@ async function cdpShopListCollect(url, opts = {}) {
   const maxPages = Math.min(10, Math.max(1, opts.maxPages || 3));
   const maxItems = Math.min(100, Math.max(1, opts.maxItems || 50));
   const filter = opts.filter || {};
-  // ★ 2026-09 改造(统一不跳转): 默认【不逐个商品跳详情页】。
-  //   旧行为每个商品要 2 次导航 (cdpReadOnePanel 一次 + cdpEnrichOne 一次), 是"进入店铺采集商品"
-  //   这一步最慢的地方。现在字段由店铺卡片 DOM + 卡片插件面板就地给出, 缺的由「补采」按需补。
-  //   需要旧行为时显式传 jumpDetail=1。
-  const jumpDetail = opts.jumpDetail === true || opts.jumpDetail === 1 || opts.jumpDetail === '1';
+  /* ★ 2026-10-03 同 cdpListFilteredCollect: 改为【默认逐个商品跳详情页】。
+   *   2026-09 那次"统一不跳转"把店铺商品的详情页字段推给了商品管理的「补采」;
+   *   用户现在明确要求采集时一次拿齐(否则采完是残的, 必须人工补)。要旧行为传 jumpDetail=0。 */
+  const jumpDetail = !(opts.jumpDetail === false || opts.jumpDetail === 0 || opts.jumpDetail === '0');
   const tabs = await cdpGetTabs();
   const page = tabs.find((t) => t.type === 'page' && /amazon\.(com\.au|co\.uk|com|com\.mx|com\.br|de|fr|it|es|co\.jp|ca|in|nl|se|pl)/.test(t.url))
     || tabs.find((t) => t.type === 'page' && !t.url.includes('3088') && !t.url.startsWith('data:'))
@@ -1440,6 +1568,9 @@ async function cdpShopListCollect(url, opts = {}) {
     await new Promise((r) => setTimeout(r, 8000));
     for (let i = 0; i < 5; i++) { await send('Runtime.evaluate', { expression: `window.scrollTo(0, ${(i + 1) * 4000})` }); await new Promise((r) => setTimeout(r, 1000)); }
     await new Promise((r) => setTimeout(r, 1500));
+    /* ★ 2026-10-04 站点一致性校验: 本函数自己导航、不经过 cdpSetGlowAddress, 所以在这里补做一次
+     *   (与列表直采同一套; 货币不符会自动切换并回读确认, 任何失败只告警、不影响采集) */
+    if (pg === 1) { try { await cdpCheckSiteLocale(send, pgUrl, site); } catch (e) { /* 不影响采集 */ } }
     const r = await send('Runtime.evaluate', {
       expression: `(() => {
         ${linksCollector.READ_RANKS_FN}
@@ -1642,6 +1773,8 @@ async function cdpPanelCollect(url, maxItems = 5) {
     await new Promise((r) => setTimeout(r, 1000));
   }
   await new Promise((r) => setTimeout(r, 1500));
+  /* ★ 2026-10-04 站点一致性校验: 本函数自己导航、不经过 cdpSetGlowAddress, 在这里补做一次 */
+  try { await cdpCheckSiteLocale(send, url, site); } catch (e) { /* 不影响采集 */ }
   const r1 = await send('Runtime.evaluate', {
     expression: `(() => {
       const seen = new Set(); const out = [];
@@ -3234,6 +3367,24 @@ async function cdpEnrichOne(send, host, it, filter) {
       })()`, returnByValue: true,
     });
     const d = JSON.parse(r.result.value);
+    /* ★ 2026-10-03 诊断(实测踩到): 列表页筛选采集连续跳 8 个详情页后, 这 8 条 price/bsr/cat1 全空、
+     *   detailOk=false —— 但选择器本身是好的(真页面实测能取到价 $47.95 / BSR 表格 / 面包屑)。
+     *   问题在"当时那个页面到底是什么"(被 Amazon 拦了? 导航没完成? 不是商品页?)。
+     *   原来这里静默留 null、什么都不记 —— 只能靠猜。现在把关键证据打出来。 */
+    if (!d.detailOk) {
+      let hint = null;
+      try {
+        const rr = await send('Runtime.evaluate', {
+          expression: `JSON.stringify({ url: location.href.slice(0, 130), title: (document.title || '').slice(0, 80),
+            hasProductTitle: !!document.querySelector('#productTitle'),
+            captcha: /Enter the characters you see below|api-services-support@amazon|not a robot|Geben Sie die Zeichen/i.test(document.body.innerText || ''),
+            bodyLen: (document.body.innerText || '').length })`,
+          returnByValue: true,
+        });
+        hint = rr && rr.result ? rr.result.value : null;
+      } catch (e) { hint = '探针失败: ' + e.message; }
+      console.warn('[enrich] 详情页未判定成功 → price/bsr/cat1/主卖家 留空', it.asin, '|', hint);
+    }
     if (d.price != null) it.price = d.price;
     if (d.brand) it.brand = d.brand;
     if (d.rating != null) it.rating = d.rating;
@@ -3276,9 +3427,11 @@ const SITE_ZIP = { uk: ['GB', 'SW1A1AA'], us: ['US', '10001'], de: ['DE', '10115
 // 自动设置目标国家配送地址 (Amazon glow API): 确保 FBA 配送/税费/可配送判断正确
 // 注: 智赢插件的人民币价格不随配送地址变化 (插件有独立币种设置), 设置地址是为采集数据准确性
 async function cdpSetGlowAddress(send, url, site, customZip) {
+  let changed = false;   // 地址是否真的变更(变更时调用方要重新导航回目标页)
   try {
     const z = SITE_ZIP[site];
-    if (!z) return false;
+    // 无默认邮编的站点(z 为空)不校准地址, 但仍要继续做后面的站点一致性校验 → 不提前 return
+    if (z) {
     // customZip: 用户输入邮编 (任意国家/地区), 覆盖站点默认邮编 — 采集"任何邮编的商品网页"
     const zip = String(customZip || '').trim() || z[1];
     const glowRes = await send('Runtime.evaluate', {
@@ -3302,10 +3455,270 @@ async function cdpSetGlowAddress(send, url, site, customZip) {
       const home = 'https://www.amazon.' + siteToHostSuffix(site) + '/';
       await send('Page.navigate', { url: home });
       await new Promise((r) => setTimeout(r, 9000));
-      return true;
+      changed = true;
     }
-    return false;
-  } catch (e) { console.error('[glow]', '设置配送地址失败:', e && e.message); return false; }
+    }
+  } catch (e) { console.error('[glow]', '设置配送地址失败:', e && e.message); }
+  /* ★ 2026-10-04 站点一致性校验(送货地址/国家地区/货币) —— 挂在本函数尾部:
+   *   全部采集入口(list-direct / list-filtered / 店铺 / aod / 多链接)都调 cdpSetGlowAddress,
+   *   所以这里一处就覆盖了所有采集方式, 不用去改 7 个调用点。
+   *   纪律: 校验自身失败只告警、绝不中断采集; 返回值语义仍是"地址是否真的变更", 调用方不受影响。 */
+  try { await cdpCheckSiteLocale(send, url, site, { zip: customZip }); }
+  catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
+  return changed;
+}
+
+// ================= 站点一致性校验 (2026-10-04) =================
+// 需求: 采集开始/过程中, 按【链接站点】核对亚马逊实际设置是否一致, 不一致就改回来。
+// 三项 + 真机实测选择器(勘查见 _dev-tools/站点一致性校验-勘查结果.md):
+//   ① 送货地址  #glow-ingress-line2 = "10115 Berlin"  (Berlin 前有零宽字符 U+200C → 必须用正则取数字, 不能按空格切)
+//   ② 国家/地区  .icp-nav-flag 的 class = "icp-nav-flag-de"  → /icp-nav-flag-([a-z]{2})/ 最稳(另兜 #icp-touch-link-country)
+//   ③ 货币      下拉 #nav-flyout-icp 里【没有】"当前选中"标记 → 改为从页面原生价格反推符号
+// 修正手段: 地址复用已有 cdpSetGlowAddress; 货币 = 真鼠标 hover 国旗 → 点 a[href="#switch-currency=XXX"]
+// 为什么不改国家/地区: 那会动账号级设置(影响结算/推荐), 风险高 → 只告警, 交人工。
+const SITE_SYMBOL = {
+  uk: '£', us: '$', au: '$', ca: '$', sg: '$', mx: '$', br: 'R$',
+  de: '€', fr: '€', it: '€', es: '€', nl: '€', be: '€', ie: '€',
+  jp: '¥', in: '₹', tr: '₺', ae: 'AED', sa: 'SAR', se: 'kr', pl: 'zł',
+};
+/** 站点期望值 —— 国家代码/邮编复用 SITE_ZIP, 币种复用 SITE_CURRENCY(不再抄第二份表, 避免两处漂移) */
+function siteExpect(site) {
+  const z = SITE_ZIP[site] || [];
+  return { cc: z[0] || null, zip: z[1] || null, cur: siteCurrency(site), sym: SITE_SYMBOL[site] || null };
+}
+
+/** 页面读取 JS(纯读, 不改任何东西) —— 在目标页/首页都能跑(国旗与 glow 是全站元素) */
+const LOCALE_READ_JS = `(() => {
+  const T = (e) => e ? String(e.textContent || '').replace(/\\s+/g, ' ').trim() : null;
+  const zipRaw = T(document.querySelector('#glow-ingress-line2'));
+  // 邮编: 数字型(10115/10001/2000) 或 英式(SW1A1AA)。
+  // ★ 实测格式随界面语言变: 德文界面 "10115‌ Berlin"(Berlin 前有零宽字符 U+200C), 英文界面 "Berlin 10115"
+  //   → 绝不能锚定行首/按空格切, 直接在整串里找数字。
+  const zip = zipRaw ? (((zipRaw.match(/(\\d{4,6})/) || [])[1]) || ((zipRaw.match(/([A-Z]{1,2}\\d[A-Z\\d]?\\s*\\d[A-Z]{2})/i) || [])[1]) || null) : null;
+  const flag = document.querySelector('.icp-nav-flag');
+  const cc = flag ? (((String(flag.className || '').match(/icp-nav-flag-([a-z]{2})\\b/) || [])[1]) || null) : null;
+  const ctry = T(document.querySelector('#icp-touch-link-country'));
+  // ★ 货币首选 i18n-prefs cookie —— 真机实测 amazon.de 上 JS 可读(document.cookie),
+  //   里面是精确 ISO 代码(EUR/GBP/...), 全站每页都有, 且【不受智赢插件注入的 CNY 价格影响】。
+  //   货币下拉里没有"当前选中"标记(勘查结论), 所以 cookie 是最可靠的来源。
+  const curCookie = ((String(document.cookie || '').match(/(?:^|;\\s*)i18n-prefs=([A-Za-z]{3})/) || [])[1] || null);
+  // 备用: 页面原生价格符号(列表页/详情页都兜一遍; 插件注入的 CNY 由 matchCurrency 判为"判断不了")
+  let priceTxt = null;
+  const sels = ['#corePrice_feature_div .a-offscreen', '#corePriceDisplay_desktop_feature_div .a-offscreen', '#priceblock_ourprice', '#price_inside_buybox', '[data-asin] .a-price .a-offscreen', '.a-price .a-offscreen'];
+  for (const s of sels) { const t = T(document.querySelector(s)); if (t && /[0-9]/.test(t)) { priceTxt = t; break; } }
+  return JSON.stringify({ ok: !!flag, href: String(location.href).slice(0, 140), zipRaw: zipRaw, zip: zip, cc: cc, ctry: ctry, curCookie: curCookie ? curCookie.toUpperCase() : null, priceTxt: priceTxt ? priceTxt.slice(0, 24) : null });
+})()`;
+
+/** 读当前页面的实际站点设置(纯读) */
+async function cdpReadLocale(send) {
+  try {
+    const r = await send('Runtime.evaluate', { expression: LOCALE_READ_JS, returnByValue: true });
+    const v = r && r.result && r.result.value;
+    return v ? JSON.parse(v) : null;
+  } catch (e) { return null; }
+}
+
+const CURRENCY_CODES = /(USD|EUR|GBP|JPY|CNY|RMB|AUD|CAD|SGD|MXN|BRL|INR|TRY|AED|SAR|SEK|PLN|CHF)/;
+/** 从页面价格文本判断币种是否与站点相符。返回 {ok:true|false} 或 null(判断不了) */
+function matchCurrency(priceTxt, site) {
+  if (!priceTxt) return null;
+  const exp = siteExpect(site);
+  const up = String(priceTxt).toUpperCase();
+  const code = (up.match(CURRENCY_CODES) || [])[1] || null;
+  // ★ 智赢插件会把页面价格换成人民币 → CNY/¥ 一律按"判断不了"处理。
+  //   若据此判定"货币不符"并去切换, 会把本来正常的站点改坏 —— 这条是最重要的防误伤。
+  if (code === 'CNY' || code === 'RMB') return null;
+  if (code) return { ok: code === String(exp.cur || '').toUpperCase(), code: code };
+  const sym = (up.match(/R\$|US\$|CA\$|AU\$|[$£€¥￥₹₺]/) || [])[0] || null;
+  if (!sym) return null;
+  const want = exp.sym;
+  if (!want) return null;
+  // $ 在 us/au/ca/sg/mx 都合法 → 只跟"本站点期望符号"比即可, 足以抓出 de 站点显示 £/$ 这类错配
+  const eq = { '$': ['$', 'US$', 'CA$', 'AU$'], '€': ['€'], '£': ['£'], '¥': ['¥', '￥'], '₹': ['₹'], '₺': ['₺'], 'R$': ['R$'] };
+  const cand = eq[want] || [String(want).toUpperCase()];
+  return { ok: cand.indexOf(sym) >= 0, sym: sym, want: want };
+}
+
+/** hover 国旗 → 点下拉里的目标货币 (下拉必须真鼠标 hover 才弹出, 合成事件无效) */
+async function cdpSwitchCurrency(send, wantCur) {
+  const rr = await send('Runtime.evaluate', { returnByValue: true, expression:
+    `(()=>{const e=document.querySelector('.icp-nav-flag')||document.querySelector('#icp-nav-flyout');if(!e)return '';const r=e.getBoundingClientRect();if(!r.width&&!r.height)return '';return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()` });
+  let pos = null;
+  try { pos = JSON.parse((rr && rr.result && rr.result.value) || 'null'); } catch (e) { /* 忽略 */ }
+  if (!pos || !pos.x) return { ok: false, err: '页面上找不到国旗元素(.icp-nav-flag)' };
+  /* ★ 实测坑: 第一次 hover 时 #nav-flyout-icp 元素【已经存在】, 但里面的货币项是【异步填充】的 ——
+   *   只 hover 一次再查找会得到"下拉没弹出"的假象(其实弹出了、只是空的)。所以:
+   *   边 hover 边轮询目标项(最多 8s), 轮询间隙把鼠标移开再移回, 强制重新触发 mouseenter。
+   *   (只挪 40px —— 仍在下方下拉框范围内, 不会把下拉关掉。) */
+  const hoverFlag = () => send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: pos.x, y: pos.y, button: 'none', clickCount: 0 });
+  const sel = '#nav-flyout-icp a[href="#switch-currency=' + wantCur + '"]';
+  const findItem = async () => {
+    const gr = await send('Runtime.evaluate', { returnByValue: true, expression:
+      `(()=>{const a=document.querySelector('${sel}');if(!a)return JSON.stringify({found:false,flyout:!!document.querySelector('#nav-flyout-icp'),items:[...document.querySelectorAll('#nav-flyout-icp a[href^="#switch-currency="]')].map(x=>String(x.getAttribute('href')).replace('#switch-currency=','')).slice(0,12)});const r=a.getBoundingClientRect();return JSON.stringify({found:true,vis:!!(r.width&&r.height),txt:(a.textContent||'').replace(/\\s+/g,' ').trim().slice(0,40),x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()` });
+    try { return JSON.parse((gr && gr.result && gr.result.value) || 'null'); } catch (e) { return null; }
+  };
+  let info = null, flyoutSeen = false, items = null, rehovered = false;
+  const t0 = Date.now();
+  await hoverFlag();
+  while (Date.now() - t0 < 7000) {
+    await new Promise((r2) => setTimeout(r2, 500));
+    info = await findItem();
+    if (info && info.found) break;
+    if (info) { flyoutSeen = flyoutSeen || !!info.flyout; if (info.items && info.items.length) items = info.items; }
+    // ★ 下拉壳已出现就【绝不再动鼠标】—— 实测内容是异步拉的(约 1.4s 出空壳, 3.5s 才填进货币项),
+    //   hover 期间把鼠标移开(哪怕只挪 40px)会中断这次拉取 → 内容永远不出现(踩过)。
+    //   只有连【壳】都没出现时才补一次 hover。
+    if (!flyoutSeen && !rehovered && Date.now() - t0 > 4000) { rehovered = true; await hoverFlag(); }
+  }
+  if (!info || !info.found) {
+    return { ok: false, err: '下拉里没有 ' + wantCur + ' 项' + (flyoutSeen ? '(下拉已弹出, 可选项: ' + JSON.stringify(items || []) + ')' : '(下拉没弹出)') };
+  }
+  if (info.vis) {
+    // 真鼠标点击: 比 el.click() 更接近人工(部分站点会校验事件可信度)
+    await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: info.x, y: info.y, button: 'left', clickCount: 1 });
+    await new Promise((r2) => setTimeout(r2, 60));
+    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: info.x, y: info.y, button: 'left', clickCount: 1 });
+  } else {
+    await send('Runtime.evaluate', { expression: `(()=>{const a=document.querySelector('${sel}');if(a)a.click()})()` });
+  }
+  return { ok: true, txt: info.txt, viaMouse: !!info.vis };
+}
+
+/** 等页面可用(切换货币会整页刷新; 刷新期间 evaluate 会失败, 属正常) */
+async function cdpWaitReady(send, ms) {
+  const end = Date.now() + (ms || 25000);
+  while (Date.now() < end) {
+    await new Promise((r) => setTimeout(r, 800));
+    try {
+      const r = await send('Runtime.evaluate', { returnByValue: true, expression: `(document.readyState==='complete' && !!document.querySelector('.icp-nav-flag')) ? '1' : ''` });
+      if (r && r.result && r.result.value === '1') return true;
+    } catch (e) { /* 刷新中, 继续等 */ }
+  }
+  return false;
+}
+
+const LOCALE_TTL_MS = 5 * 60 * 1000;
+const localeCheckedAt = new Map();   // site → 上次"校验通过"的时间: 同一次采集内同站点只校验一次, 不每页 hover
+let lastLocaleCheck = null;          // 最近一次校验结果(供 /api/collect/completeness 与采集报告读取)
+
+/**
+ * 站点一致性校验 + 自动修正。永不抛(调用方不受影响)。
+ * @param opts.zip   自定义邮编(用户指定时用它当期望值, 否则用站点默认)
+ * @param opts.force 跳过缓存强制校验
+ */
+/* ★ 并行去重: 整站/店铺并行采集会给 N 个标签页同时做【同一站点】的校验 ——
+ *   不去重的话 N 个 worker 会同时 hover 国旗、甚至同时点改货币, 互相打断(与 links-collector 的 addrProm 同一套路)。
+ *   所以同一站点"进行中的那一次"直接复用, 后来者等它。 */
+const localeInflight = new Map();
+async function cdpCheckSiteLocale(send, url, site, opts = {}) {
+  const key = String(site);
+  if (!opts.force && localeInflight.has(key)) return localeInflight.get(key);
+  const p = cdpCheckSiteLocaleRun(send, url, site, opts);
+  localeInflight.set(key, p);
+  try { return await p; } finally { localeInflight.delete(key); }
+}
+/** 真正的校验逻辑(说明见 cdpCheckSiteLocale) */
+async function cdpCheckSiteLocaleRun(send, url, site, opts = {}) {
+  const cached = lastLocaleCheck && lastLocaleCheck.bySite && lastLocaleCheck.bySite[site];
+  if (!opts.force && (Date.now() - (localeCheckedAt.get(site) || 0)) < LOCALE_TTL_MS && cached) return cached;
+
+  const exp = siteExpect(site);
+  const wantZip = String(opts.zip || '').trim() || exp.zip;
+  const rep = { site: site, want: Object.assign({}, exp, { zip: wantZip }), at: completenessAt(), addr: null, country: null, cur: null, fixes: [], warns: [] };
+  const finish = (r) => {
+    r.ok = !(r.warns || []).some((w) => w.charAt(0) === '⚠');
+    // ★ 只在"全部通过"时才缓存: 失败的下次采集还会重试(否则一次失败会被缓存 5 分钟, 用户看不到它恢复)
+    if (r.ok && !r.skipped) localeCheckedAt.set(site, Date.now());
+    if (!lastLocaleCheck) lastLocaleCheck = { bySite: {}, at: r.at };
+    lastLocaleCheck.bySite[site] = r;
+    lastLocaleCheck.at = r.at;
+    const bad = (r.warns || []).filter((w) => w.charAt(0) === '⚠');
+    if (bad.length) console.warn('[locale] ' + String(site).toUpperCase() + ' 站点不一致: ' + bad.join(' | '));
+    else console.log('[locale] ' + String(site).toUpperCase() + ' 站点一致 (国家 ' + ((r.country && r.country.got) || '?') + ', 货币 ' + ((r.cur && (r.cur.got || r.cur.priceTxt)) || '?') + ')'
+      + (r.fixes.length ? ' [已修正: ' + r.fixes.join('; ') + ']' : ''));
+    return r;
+  };
+
+  try {
+    const got = await cdpReadLocale(send);
+    if (!got || !got.ok) {
+      const href = String((got && got.href) || '');
+      if (href && !/amazon\./i.test(href)) {
+        /* 当前标签页根本不在 amazon 上(品牌批量这类采集是先连上再逐个导航) —— 静默跳过、不告警、不缓存,
+         * 等采集真正导航到 amazon 后再校验。否则会刷一堆"页面未就绪"的假告警。 */
+        rep.skipped = true;
+        rep.note = '当前页不是 amazon(' + href.slice(0, 60) + '), 已跳过';
+        return finish(rep);
+      }
+      rep.warns.push('⚠ 页面未就绪, 站点一致性校验跳过(未登录/CAPTCHA/仍在导航?)');
+      return finish(rep);
+    }
+
+    // ① 送货地址
+    if (wantZip && got.zip) {
+      const ok = String(got.zip).toUpperCase() === String(wantZip).toUpperCase();
+      rep.addr = { want: wantZip, got: got.zip, ok: ok };
+      // 站点首页显示的常是账号默认地址, 采集前已由 cdpSetGlowAddress 校准 → 不符只提示, 不重复改(避免翻页来回跳)
+      if (!ok) rep.warns.push('配送地址 ' + got.zip + ' ≠ 期望 ' + wantZip + '(采集已按站点校准, 若数据异常请检查登录态)');
+    } else if (wantZip) {
+      rep.addr = { want: wantZip, got: null, ok: null, raw: got.zipRaw };
+    }
+
+    // ② 国家/地区 —— 只告警不自动改(动的是账号级设置, 可能影响结算与推荐)
+    if (exp.cc && got.cc) {
+      const ok = String(got.cc).toUpperCase() === String(exp.cc).toUpperCase();
+      rep.country = { want: exp.cc, got: String(got.cc).toUpperCase(), ok: ok, name: got.ctry || null };
+      if (!ok) rep.warns.push('⚠ 站点不符: 链接是 ' + String(site).toUpperCase() + '(期望 ' + exp.cc + '), 亚马逊当前是 ' + String(got.cc).toUpperCase() + (got.ctry ? '(' + got.ctry + ')' : '') + ' —— 国家/地区属账号设置, 未自动改, 请手动切换');
+    }
+
+    // ③ 货币 —— 首选 i18n-prefs cookie(权威 ISO 代码); 没有才用页面价格符号推
+    let mc = null, curSrc = 'none';
+    if (got.curCookie) {
+      curSrc = 'cookie';
+      mc = { ok: got.curCookie === String(exp.cur || '').toUpperCase(), code: got.curCookie };
+      // 交叉核对: cookie 说对、但页面价格符号明显是别的币种(如 de 显示 £) → 只记提示, 不改(以 cookie 为准)
+      const mp = matchCurrency(got.priceTxt, site);
+      if (mc.ok && mp && mp.ok === false) rep.warns.push('提示: 货币 cookie=' + got.curCookie + ' 但页面价格显示 ' + (got.priceTxt || '?') + '(未改动, 以 cookie 为准)');
+    } else {
+      curSrc = 'price';
+      mc = matchCurrency(got.priceTxt, site);
+    }
+    rep.cur = { want: exp.cur, got: (mc && (mc.code || mc.sym)) || null, ok: mc ? mc.ok : null, src: curSrc, cookie: got.curCookie || null, priceTxt: got.priceTxt || null };
+    if (mc === null) {
+      rep.warns.push('货币未校验(既没读到 i18n-prefs cookie, 也没读到页面价格) —— 跳过货币检查');
+    } else if (mc.ok === false) {
+      let sw = await cdpSwitchCurrency(send, exp.cur);
+      if (!sw.ok) {
+        /* ★ 实测: 首次 hover 常常拿到"弹出了但还没填充"的空下拉 → 重载页面后再试一次基本都能成
+         *   (下拉内容是异步拉的, 重载会重新走一遍加载; 验证脚本里就是靠这一招救回来的)。 */
+        try {
+          rep.fixes.push('货币首发切换未成(' + (sw.err || '?') + '), 重载页面后重试');
+          await send('Page.reload');
+          if (await cdpWaitReady(send, 25000)) {
+            await new Promise((r) => setTimeout(r, 1200));
+            sw = await cdpSwitchCurrency(send, exp.cur);
+          }
+        } catch (e) { /* 重试失败就走下面的告警 */ }
+      }
+      if (!sw.ok) {
+        rep.warns.push('⚠ 货币不符(' + (got.curCookie || got.priceTxt || '?') + ' ≠ ' + exp.cur + '), 自动切换失败: ' + (sw.err || '未知') + ' —— 请手动到国旗处切换货币');
+      } else {
+        rep.fixes.push('货币已切换 → ' + exp.cur + (sw.txt ? '(' + sw.txt + ')' : ''));
+        const ready = await cdpWaitReady(send, 25000);
+        await new Promise((r) => setTimeout(r, 1200));
+        const got2 = await cdpReadLocale(send);
+        const mc2 = got2 ? (got2.curCookie
+          ? { ok: got2.curCookie === String(exp.cur || '').toUpperCase(), code: got2.curCookie }
+          : matchCurrency(got2.priceTxt, site)) : null;
+        rep.cur.after = { cookie: (got2 && got2.curCookie) || null, priceTxt: (got2 && got2.priceTxt) || null, ok: mc2 ? mc2.ok : null };
+        if (mc2 && mc2.ok === false) rep.warns.push('⚠ 货币切换后回读仍不符(期望 ' + exp.cur + ', 实际 ' + ((got2 && (got2.curCookie || got2.priceTxt)) || '?') + ')');
+        else if (!ready) rep.warns.push('货币已切换但页面 25s 内未就绪, 建议挑一页重采确认');
+      }
+    }
+  } catch (e) {
+    rep.warns.push('⚠ 校验异常(已忽略): ' + (e && e.message));
+  }
+  return finish(rep);
 }
 
 // 列表卡片提取 JS: 原生字段 (ASIN/标题/图片/评分/链接) + 智赢插件字段 (FBA/卖家数/排名/1688/人民币价)
@@ -3669,12 +4082,13 @@ async function cdpListFilteredCollect(url, opts = {}) {
   // → 详情补全时默认读取插件面板 (panel=false 可关闭, 节省耗时); 设置了商标筛选时强制读取
   const needPanel = opts.panel !== false || !!((filter.tmMin != null) || (filter.tmMax != null) || filter.tmCountries);
   const withAod = opts.aod !== false;                               // 详情后采 aod 跟卖 (默认开)
-  // ★ 2026-09 改造(统一不跳转): 默认【不跳详情页】。
-  //   旧行为: 只对通过前置筛选的商品跳详情页(每个 8~15s) + 需要时再跳一次插件面板 + 再跳一次 aod 页 ——
-  //   一个商品最多 3 次导航, 采集慢的主因。现在列表页能判的字段照旧筛, 详情页专属字段
-  //   (价格/品牌/评分/评论/A+/类目/BSR) 与商标/月销改由商品管理页「补采」按需补齐。
-  //   需要旧行为时显式传 jumpDetail=1。
-  const jumpDetail = opts.jumpDetail === true || opts.jumpDetail === 1 || opts.jumpDetail === '1';
+  /* ★ 2026-10-03 用户要求「排名数据直接在采集过程中直接获取, 不再靠商品管理补采」:
+   *   改为【默认跳详情页】—— 详情页专属字段(价格/品牌/评分/评论/A+/类目/BSR/大排名)在采集时一次拿齐。
+   *   旧行为(2026-09 改造)是"统一不跳转", 把详情页字段全部推给商品管理页的「补采」按需补 ——
+   *   代价是采集完的数据是残的、必须人工补采一遍(实测库里 6200/9528 条连排名都没有)。
+   *   用户已明确不要那个取舍: 完整优先。
+   *   需要旧行为(只按列表页字段筛、不跳详情、最快)时显式传 jumpDetail=0。 */
+  const jumpDetail = !(opts.jumpDetail === false || opts.jumpDetail === 0 || opts.jumpDetail === '0');
   const siteMatch = url.match(/amazon\.(com\.au|co\.uk|com|com\.mx|com\.br|de|fr|it|es|co\.jp|ca|in|nl|se|pl)/);
   const site = siteMatch && CDP_SITE_CODE[siteMatch[1]] ? CDP_SITE_CODE[siteMatch[1]] : 'uk';
   const host = 'www.amazon.' + siteToHostSuffix(site);
@@ -3936,6 +4350,8 @@ async function cdpCategoryCollect(opts) {
     await new Promise((r) => setTimeout(r, 8000));
     for (let i = 0; i < 4; i++) { await send('Runtime.evaluate', { expression: `window.scrollTo(0, ${(i + 1) * 4000})` }); await new Promise((r) => setTimeout(r, 900)); }
     await new Promise((r) => setTimeout(r, 1200));
+    /* ★ 2026-10-04 站点一致性校验: 本函数自己导航、不经过 cdpSetGlowAddress, 在这里补做一次 */
+    if (pg === 1) { try { await cdpCheckSiteLocale(send, pgUrl, site); } catch (e) { /* 不影响采集 */ } }
     const r = await send('Runtime.evaluate', {
       expression: `(() => {
         const out = [];
@@ -4058,6 +4474,9 @@ async function cdpSiteBulkCollect(opts = {}) {
         await new Promise((r) => setTimeout(r, 9000));
         for (let i = 0; i < 4; i++) { await send('Runtime.evaluate', { expression: `window.scrollTo(0, ${(i + 1) * 4000})` }); await new Promise((r) => setTimeout(r, 800)); }
         await new Promise((r) => setTimeout(r, 1000));
+        /* ★ 2026-10-04 站点一致性校验: 本函数自己开标签页/导航, 不经过 cdpSetGlowAddress, 在这里补做一次。
+         *   并行 N 个标签页 → cdpCheckSiteLocale 内部按站点去重, 只有一个真跑, 其余等它。 */
+        if (pg === 1) { try { await cdpCheckSiteLocale(send, pgUrl, site); } catch (e) { /* 不影响采集 */ } }
         const r = await send('Runtime.evaluate', {
           expression: `(() => {
             const out = [];
@@ -4923,6 +5342,9 @@ async function cdpCategoryMenuCollect(opts = {}) {
   await send('Page.navigate', { url: 'https://' + host + '/' });
   await new Promise((r) => setTimeout(r, 9000));
   steps.push('① 进入 ' + host);
+  /* ★ 2026-10-04 站点一致性校验: 本函数自己导航、不经过 cdpSetGlowAddress, 在这里补做一次。
+   *   首页上国旗/送货地址/货币 cookie 都在(货币读的是 i18n-prefs cookie, 不依赖商品价格)。 */
+  try { await cdpCheckSiteLocale(send, 'https://' + host + '/', site); } catch (e) { /* 不影响采集 */ }
   // ② 大类目: 从首页 nav_cs_* 链接中找目标类目 (模糊匹配类目名)
   const catName = (opts.category || '').toLowerCase();
   let mainUrl = null;
@@ -7083,6 +7505,8 @@ async function cdpBrandChain(url, maxBrands = 2, maxPages = 3, withPanel = true,
   await new Promise((r) => setTimeout(r, 9000));
   for (let i = 0; i < 5; i++) { await send('Runtime.evaluate', { expression: `window.scrollTo(0, ${(i + 1) * 4000})` }); await new Promise((r) => setTimeout(r, 1000)); }
   await new Promise((r) => setTimeout(r, 1500));
+  /* ★ 2026-10-04 站点一致性校验: 本函数自己导航、不经过 cdpSetGlowAddress, 在这里补做一次 */
+  try { await cdpCheckSiteLocale(send, url, site); } catch (e) { /* 不影响采集 */ }
   const r1 = await send('Runtime.evaluate', {
     expression: `(() => {
       const out = [];
@@ -7214,6 +7638,9 @@ async function cdpBrandBatch(opts = {}) {
   if (!page) throw new Error('Edge 无可用页面标签, 请确认 Edge 以 --remote-debugging-port=9222 启动');
   const { send } = await cdpConnect(page.webSocketDebuggerUrl);
   await send('Runtime.enable');
+  /* ★ 2026-10-04 站点一致性校验: 本函数不为"站点首页"导航(直接进品牌页), 所以这里就地校验一次。
+   *   当前页若不在 amazon 上会静默跳过(不告警、不缓存), 等真正导航过去后会再校验。 */
+  try { await cdpCheckSiteLocale(send, 'https://' + host + '/', site); } catch (e) { /* 不影响采集 */ }
 
   const known = new Set(products.map((x) => String(x.asin || '').toUpperCase()));   // 库内已有 → 不重复采
   const brands = [];
@@ -9147,6 +9574,25 @@ const server = http.createServer((req, res) => {
       }
       if (p === '/api/collect/progress' && req.method === 'GET') {
         return send(200, collectProgress || { running: false });
+      }
+      /* ★ 2026-10-03 数据完整度校验结果。
+       *   不带参数 = 最近一次采集结束时的自动校验(采集一结束就算好了, 见 endCollectProgress)。
+       *   带 ?from=YYYY-MM-DD HH:mm:ss 或 ?minutes=N = 现场按时间窗重算一遍(用于翻旧账)。 */
+      if (p === '/api/collect/completeness' && req.method === 'GET') {
+        const from = String(url.searchParams.get('from') || '').trim();
+        const minutes = parseInt(url.searchParams.get('minutes') || '0', 10) || 0;
+        if (from) return send(200, { ok: true, live: true, source: 'from=' + from, completeness: completenessSince(from) });
+        if (minutes > 0) {
+          const t = new Date(Date.now() - minutes * 60000).toISOString().slice(0, 19).replace('T', ' ');
+          return send(200, { ok: true, live: true, source: 'last ' + minutes + 'min', completeness: completenessSince(t) });
+        }
+        return send(200, { ok: true, live: false, completeness: lastCollectCompleteness || null, locale: lastLocaleCheck || null });
+      }
+      /* ★ 2026-10-04 站点一致性校验结果(送货地址/国家地区/货币)。
+       *   由 cdpSetGlowAddress 尾部自动触发 —— 每个站点每次采集只校验一次(通过后 TTL 内不重复)。
+       *   ?force=1 现场重算一次(需采集浏览器在跑)。 */
+      if (p === '/api/collect/locale' && req.method === 'GET') {
+        return send(200, { ok: true, locale: lastLocaleCheck || null, ttlMs: LOCALE_TTL_MS });
       }
       // 采集记录 (历史批次): 按商品 collectedAt 聚合 — 相邻入库间隔 < 30 分钟视为同一次采集
       // 返回每次采集的起止时间(UTC, 精确到分钟) + 商品数量, 供采集面板"采集记录"加载历史并可点击跳转商品管理
@@ -11784,7 +12230,11 @@ const server = http.createServer((req, res) => {
         //   逐商品跳详情来源 —— 店铺页/品牌页每个商品都要 12~15 秒, 表面上看起来"采集很慢"却找不到原因。
         //   排名改为由「补采」按需补齐(商品管理页勾选后补采)。需要旧行为时显式传 rankGate=1。
         //   rankGateLimit=0 表示不限(每个都补)。
-        const rankGate = (j.rankGate === 1 || j.rankGate === '1' || j.rankGate === true || j.rankGate === 'true');
+        /* ★ 2026-10-03 用户要求: 排名在采集过程中拿全, 不再用商品管理的「补采排名」。
+         *   所以缺排名的卡片【默认就进详情页补】(rankGate 默认开), 传 0 才关。
+         *   代价必须知道: 每个缺排名的商品 12~15 秒 —— 这正是 2026-09 把它默认关掉的原因。
+         *   现在用户明确选"数据完整优先"; 要限速就用 rankGateLimit 封顶(0=不限)。 */
+        const rankGate = !(j.rankGate === 0 || j.rankGate === '0' || j.rankGate === false || j.rankGate === 'false');
         const rankGateLimit = Math.max(0, Math.min(200, Number(j.rankGateLimit) || 0));
         const rankWaitMs = Math.max(8000, Math.min(60000, Number(j.rankWaitMs) || 20000));
 
