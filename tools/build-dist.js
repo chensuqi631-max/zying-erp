@@ -32,12 +32,37 @@ const NO_LICENSE = hasFlag('no-license');
 const ENFORCE = !NO_LICENSE;
 const CLEAN = hasFlag('clean');   // --clean: 连授权模块/公钥一起剥掉 (免费版, 包里看不到授权机制)
 // 只带运行必需的东西: 源码/工具/数据都不进包 (数据在用户主目录, 授权文件由用户自己放)
-// ⚠ 新增后端模块后必须登记到这里, 否则插件装上了却 "Cannot find module" (实测踩过 glob 之外漏 links-collector.js)
-const ERP_FILES = ['server.js', 'license.js', 'links-collector.js', 'link-jobs.js', 'rank-utils.js', path.join('tools', 'license-pub.pem')];
-const ERP_DIRS = ['public'];
+/* ★ 2026-11-11 修复: 原来是一张写死的 6 个文件名白名单, 而后端早就拆成 16 个模块
+ *   (blueocean/ip-check/market-api/selection-score/selection-cache/product-insight/browser-service/
+ *    site-links/wipo-brand/zying-api/...)。用旧白名单打包, 客户装完必然 "Cannot find module"。
+ *   改成按目录动态收集 *.js, 新增模块不需要再回来改这里。 */
+const ERP_EXTRA = ['license.config.json', path.join('tools', 'license-pub.pem')];
+const ERP_FILES = [
+  ...fs.readdirSync(ERP_SRC).filter((f) => f.endsWith('.js')),
+  ...ERP_EXTRA,
+];
+const ERP_DIRS = ['public', 'vendor'];
 const NEVER = [/license-priv\.pem$/, /license\.key$/, /\.bak/i, /node_modules/, /_dev-tools/];
 
 const log = (s) => console.log(s);
+
+/* ★ 2026-11-11 新增护栏: 打包源(D:\智赢erp\zying-demo)与实际在跑的代码(dsh-plugin\erp)是两份,
+ *   实测两者差了 2 个月、server.js 596KB vs 1098KB —— 直接用默认源打包等于把旧代码发给客户。
+ *   这里比较修改时间, 源更旧就拒绝打包 (除非 --force)。 */
+(() => {
+  const live = path.join(PLUGIN, 'erp', 'server.js');
+  const srcSrv = path.join(ERP_SRC, 'server.js');
+  if (!fs.existsSync(live) || !fs.existsSync(srcSrv)) return;
+  const a = fs.statSync(srcSrv).mtimeMs, b = fs.statSync(live).mtimeMs;
+  if (a < b && !hasFlag('force')) {
+    log('XX 拒绝打包: 打包源比 dsh-plugin/erp 里的实际代码旧');
+    log('   打包源   : ' + srcSrv + '  (' + new Date(a).toLocaleString() + ', ' + Math.round(fs.statSync(srcSrv).size / 1024) + 'KB)');
+    log('   实际代码 : ' + live + '  (' + new Date(b).toLocaleString() + ', ' + Math.round(fs.statSync(live).size / 1024) + 'KB)');
+    log('   直接用 dsh-plugin/erp 出包:  npm pack   (推荐)');
+    log('   或同步一份到打包源后重跑; 确认要用旧源就加 --force');
+    process.exit(3);
+  }
+})();
 function walk(dir, out = []) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, e.name);

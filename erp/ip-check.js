@@ -33,6 +33,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const wipoBrand = require('./wipo-brand.js');
 
 /* ============================ 配置 ============================ */
 
@@ -579,6 +580,67 @@ async function searchEuipoRcd(term, opts = {}) {
   return out;
 }
 
+/* ============================ 数据源 5: WIPO 全球品牌库 ============================ */
+/* ★ 为什么必须有它: 本机 TMview(tmdn.org) 网络不可达, 而 EUIPO 只覆盖欧盟、USPTO 只覆盖美国。
+ *   英国站(GB)/澳洲站(AU)/马德里国际注册(WO) 只有 WIPO 查得到 —— 客户主打的英国站全靠它。
+ *   接口逆向与解密说明见 ./wipo-brand.js 顶部。 */
+
+function mapWipoRow(d) {
+  const p = Array.isArray(d.designation) ? d.designation.map((x) => String(x).toUpperCase()) : [];
+  // 单一国家注册的 designation 就是本国; 马德里国际注册(WO)的 designation 是「指定国清单」——
+  // 这正好是判定「在目标市场是否有效」的依据。
+  const protection = p.length ? p : (d.office ? [String(d.office).toUpperCase()] : []);
+  const id = d.st13 || d.registrationNumber || d.applicationNumber || '';
+  return {
+    source: 'wipo-brand', sourceName: 'WIPO 全球品牌库',
+    kind: 'trademark',
+    id,
+    title: d.brandName || '',
+    type: d.markFeature || d.type || '',
+    office: String(d.office || '').toUpperCase(),
+    officeName: officeName(d.office),
+    protection,
+    status: d.status || '',
+    statusGroup: tmStatusGroup(d.status),
+    owner: d.applicant || '',
+    nice: Array.isArray(d.niceClass) ? d.niceClass.map(Number).filter(Boolean) : [],
+    filed: fmtDate(d.applicationDate),
+    registeredAt: fmtDate(d.registrationDate),
+    expiry: fmtDate(d.expiryDate),
+    images: [],
+    detailUrl: SEARCH_UI + '?brandName=' + encodeURIComponent(d.brandName || ''),
+    mediaUrl: SEARCH_UI + '?brandName=' + encodeURIComponent(d.brandName || ''),
+  };
+}
+
+const SEARCH_UI = 'https://branddb.wipo.int/en/similarname';
+
+async function searchWipoBrand(term, opts = {}) {
+  const limit = Math.max(1, Math.min(100, Number(opts.limit) || 30));
+  // ★ 不按 office 过滤(接口的 office 只能单值), 拉多一些再按「目标市场保护范围」筛:
+  //   上英国站时 GB 记录可能排在几十条之后, 只取 30 条会漏。上限 100 是接口允许的最大页。
+  const rows = Math.max(50, Math.min(100, limit * 3));
+  const strategy = opts.strategy === 'Fuzzy' ? 'Fuzzy' : 'Simple';
+  const key = 'wipo-brand|' + normTerm(term) + '|' + rows + '|' + strategy;
+  const hit = cacheGet(key);
+  if (hit) return { ...hit, cached: true };
+
+  const r = await enqueue('api.branddb.wipo.int', () => withRetry(() => wipoBrand.searchBrand(term, { rows, strategy })));
+  let items = (r.docs || []).map(mapWipoRow);
+
+  if (Array.isArray(opts.nice) && opts.nice.length) {
+    const want = new Set(opts.nice.map(Number));
+    items = items.filter((it) => it.nice.some((n) => want.has(n)));
+  }
+
+  const out = {
+    source: 'wipo-brand', sourceName: 'WIPO 全球品牌库',
+    total: r.numFound || items.length, items, cached: false,
+  };
+  cacheSet(key, out);
+  return out;
+}
+
 /* ============================ 数据源注册表 ============================ */
 
 const PROVIDERS = {
@@ -611,11 +673,11 @@ const PROVIDERS = {
     run: searchEuipoRcd,
   },
   'wipo-brand': {
-    id: 'wipo-brand', name: 'WIPO 全球品牌库', short: 'WIPO 商标', scope: '全球 (马德里体系)',
-    kind: 'trademark', method: 'browser', ready: false,
+    id: 'wipo-brand', name: 'WIPO 全球品牌库', short: 'WIPO 商标', scope: '全球 (各局 + 马德里体系)',
+    kind: 'trademark', method: 'api', ready: true,
     home: 'https://branddb.wipo.int/',
-    note: '⚠️ 有 Altcha 工作量证明验证码，必须走浏览器自动化。功能已被 TMview 覆盖。',
-    run: null,
+    note: '★ 英国/澳洲/国际注册(WO) 唯一可用的商标源；Altcha PoW 握手 + AES 解密已在本地实现，每 2s 一次、约 10 次重建会话。',
+    run: searchWipoBrand,
   },
   'wipo-design': {
     id: 'wipo-design', name: 'WIPO 全球外观设计库', short: 'WIPO 外观', scope: '全球 (海牙体系)',
@@ -634,8 +696,10 @@ const PROVIDERS = {
 };
 
 /* 默认查全部已接入的 API 数据源 —— 不用怕多余:
- * search() 会按目标站点自动裁剪(上英国站会自动跳过欧盟局, 上德国站会自动跳过美国局)。 */
-const DEFAULT_SOURCES = ['tmview', 'uspto', 'euipo-tm', 'euipo-rcd'];
+ * search() 会按目标站点自动裁剪(上英国站会自动跳过欧盟局, 上德国站会自动跳过美国局)。
+ * ★ 2026-10-19: tmview 不再列为默认 —— 本机 tmdn.org 网络不可达(fetch failed), 放进默认会让
+ *   每次查重白等 34s; 且它失败时旧逻辑会误报「无冲突」。WIPO 已能覆盖它的全球范围(含 GB/AU)。 */
+const DEFAULT_SOURCES = ['wipo-brand', 'euipo-tm', 'euipo-rcd', 'uspto'];
 
 function providerList() {
   return Object.values(PROVIDERS).map((p) => ({
@@ -702,7 +766,23 @@ function assess(hits, opt = {}) {
     const t = tight(h.title);
     if (!t || !term) return false;
     if (t === term) return true;
-    if (t.includes(term) || term.includes(t)) return true;
+    /* ★ 子串必须在「词边界」上才算近似。
+     *   不做词边界时 "tanker"/"Grundtanker" 会因为包含 "anker" 被判成近似 ——
+     *   EUIPO 按 CONTAINS 检索会捞出 "…i dine tanker…" 这种整句商标, 于是平白抬到中风险。
+     *   带边界后: "Anker Home" 仍命中, "tanker" 不再命中。 */
+    const nt = normTerm(h.title), nterm = normTerm(opt.term);
+    const bounded = (a, b) => {
+      if (!a || !b) return false;
+      let i = b.indexOf(a);
+      while (i >= 0) {
+        const before = b[i - 1] || ' ';
+        const after = b[i + a.length] || ' ';
+        if (!/[\p{L}\p{N}]/u.test(before) && !/[\p{L}\p{N}]/u.test(after)) return true;
+        i = b.indexOf(a, i + 1);
+      }
+      return false;
+    };
+    if (bounded(nterm, nt) || bounded(nt, nterm)) return true;
     const A = new Set(String(h.title).toLowerCase().split(/[^\p{L}\p{N}\u4e00-\u9fff]+/u).filter(Boolean));
     const B = new Set(String(opt.term).toLowerCase().split(/[^\p{L}\p{N}\u4e00-\u9fff]+/u).filter(Boolean));
     if (!A.size || !B.size) return false;
@@ -855,6 +935,7 @@ function assess(hits, opt = {}) {
  */
 const SOURCE_REGIONS = {
   tmview: null,            // null = 全球聚合, 永远要查
+  'wipo-brand': null,      // 全球(含马德里指定国) → 永远要查
   uspto: 'US',
   'euipo-tm': 'EM',
   'euipo-rcd': 'EM',
@@ -934,6 +1015,29 @@ async function search(term, opt = {}) {
 
   const risk = assess(all, { term: q, nice: opt.nice, locarno: opt.locarno, market });
 
+  /* ★ 数据源健康度 —— 查询失败 ≠ 没有冲突。
+   *   旧逻辑把所有数据源都失败当成 0 条命中 → level='none' → 文案写「✅ 可以上」,
+   *   这是会直接导致侵权上架的假阴性(实测: tmview fetch failed 时德国站 Nike 被判「可以上」)。
+   *   现在的口径: 全部失败 → unknown(无法判定, 明确提示重试); 部分失败 → 保留结论但显式警告「可能有漏网」。 */
+  const srcFailed = results.filter((r) => !r.ok);
+  const srcOk = results.filter((r) => r.ok);
+  if (srcFailed.length) {
+    const detail = srcFailed.map((r) => `${r.sourceName || r.source}: ${r.error || '查询失败'}`).join('; ');
+    if (!srcOk.length) {
+      risk.level = 'unknown';
+      risk.score = 0;
+      risk.advice = `⚠️ 无法判定 —— ${srcFailed.length} 个数据源全部查询失败（${detail}）。这不代表没有商标冲突，请稍后重试或换数据源。`;
+      risk.reasons = [`❌ 数据源全部失败，本次没有任何库返回结果：${detail}`].concat(risk.reasons || []);
+    } else {
+      risk.reasons = [`⚠️ ${detail} 查询失败 —— 本次结论仅基于 ${srcOk.map((r) => r.sourceName || r.source).join('、')}，可能有漏网。`]
+        .concat(risk.reasons || []);
+    }
+    risk.sourceHealth = {
+      used: srcOk.map((r) => r.source),
+      failed: srcFailed.map((r) => ({ source: r.source, error: r.error })),
+    };
+  }
+
   return {
     ok: true, term: q, tookMs: nowMs() - t0,
     market: market ? { sites: market.sites, name: market.name, label: market.label, requires: market.requires, offices: market.offices } : null,
@@ -978,6 +1082,7 @@ module.exports = {
   parseNiceList, tmStatusGroup, designStatusGroup,
   _searchTmview: searchTmview, _searchUspto: searchUspto,
   _searchEuipoTm: searchEuipoTm, _searchEuipoRcd: searchEuipoRcd,
+  _searchWipoBrand: searchWipoBrand,
 };
 
 /* ============================ 自测 ============================ */

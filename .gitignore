@@ -1,0 +1,18 @@
+# 依赖
+node_modules/
+
+# 安装包产物 —— 走 GitHub Release 附件, 不进仓库 (市场只认 Release)
+*.tgz
+
+# 运行时数据 / 授权 (绝不能进仓库)
+erp/data/
+*.log
+license.key
+license-priv.pem
+*.pem.bak
+
+# 备份与临时
+_backup*/
+*.bak
+.tmp*
+dist-*/

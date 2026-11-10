@@ -133,6 +133,10 @@ const linkJobStore = new linkJobs.JobStore(path.join(DATA, 'link-jobs'));
 /* 知识产权查重 (上架风控) —— 直连官方商标/外观设计库, 见 ip-check.js 顶部说明。
  * ★ 打包/分发时文件白名单必须带上 ip-check.js。 */
 const ipCheck = require('./ip-check.js');
+/* ★ 2026-10-18 类目市场分析 (自包含 HTML, 见 market-api.js 顶部说明) */
+const marketApi = require('./market-api.js');
+/* ★ 2026-10-18 单品选品分析: 给 /api/products 每个商品加 insight（类目内相对位置 + 该怎么办） */
+const productInsight = require('./product-insight.js');
 /* ★ 2026-10-03 新增: 智赢插件 API 通道 —— 复用插件自己的签名请求层, 直接拿结构化 JSON,
  *   取代"开页面读 DOM"(8~13s/商品 → 实测 43ms/商品)。详见 _dev-tools\ZYING-API-逆向成果.md */
 const zyApi = require('./zying-api.js');
@@ -150,6 +154,9 @@ function ipBatchSummary() {
     matchedProducts: ipBatch.matched, apply: ipBatch.apply, field: ipBatch.field,
     summary: ipBatch.summary, errors: ipBatch.errors.slice(-20),
     progress: ipBatch.total ? Math.round((ipBatch.done / ipBatch.total) * 100) : 0,
+    /* ★ 2026-10-20: 带上本次批量查重的站点 —— 前端要把「高危 3」这类汇总做成入口,
+     *   点开要能直接跳该 ASIN 的商品页, 拼 URL 需要 amazon 域名。 */
+    sites: Array.isArray(ipBatch.sites) ? ipBatch.sites.slice() : [],
   };
 }
 
@@ -210,14 +217,14 @@ function saveCollectReport(rep, mergeWindowMs = 0) {
     }, rep);
     if (!r.fromUtc) r.fromUtc = r.at;
     if (!r.toUtc) r.toUtc = r.at;
+    /* ★ 2026-10-04: 采集报告带上【站点一致性】快照(按《优化文档.md》§7) —— 报告面板/JSON 都能看到
+     *   每个站点的 送货地址/国家/货币 是否对上、自动修正了什么 */
+    if (!r.locale) { try { r.locale = lastLocaleCheck ? JSON.parse(JSON.stringify(lastLocaleCheck)) : null; } catch (e) { r.locale = null; } }
     /* ★ 2026-10-03 采集报告里带上【数据完整度校验】—— 用户要求"采集过程中要验证数据是否获取完整"。
      *   按报告自己的时间窗算, 所以这条报告以后翻出来看, 当时的完整度就是当时的样子(不会被后续采集影响)。 */
     if (!r.completeness && r.fromUtc) {
       try { r.completeness = completenessSince(r.fromUtc); } catch (e) { /* 校验失败不影响报告落盘 */ }
     }
-    /* ★ 2026-10-04 报告里带上【站点一致性校验】(送货地址/国家地区/货币)。
-     *   每个站点每轮采集只校验一次(见 cdpCheckSiteLocale), 这里只是把结果快照进报告。 */
-    try { if (!r.locale && lastLocaleCheck) r.locale = lastLocaleCheck; } catch (e) { /* TDZ 等异常不影响报告 */ }
     collectReports.unshift(r);
     collectReports = collectReports.slice(0, REPORT_MAX);
     save('collect-reports.json', collectReports);
@@ -564,11 +571,15 @@ function archiveMigrate() {
   }
 })();
 const listingIdOf = (it) => String((it && it.asin) || '').toUpperCase() + '@' + String((it && it.site) || '');
-function normalizeListingItem(raw, fallbackSite) {
+function normalizeListingItem(raw, fallbackSite, fallbackShop) {
   if (!raw || typeof raw !== 'object') return null;
   const asin = String(raw.asin || '').toUpperCase().trim();
   if (!/^[A-Z0-9]{10}$/.test(asin)) return null;
   const site = String(raw.site || fallbackSite || '').toLowerCase() || null;
+  /* ★ 多店铺隔离 (2026-10-06): 店铺名 = ifast 账号名(createUserName), 由插件识别后随请求带上。
+   *   请求里没带就用调用方给的兜底(当前登录店铺); 两个都没有 → null = 「未分类」。
+   *   绝不用 ASIN/站点去反推店铺 —— 宁可为空。 */
+  const shop = shopClean(raw.shop || fallbackShop);
   const num = (v) => { if (v == null || v === '') return null; const n = typeof v === 'number' ? v : parseFloat(String(v).replace(/[^\d.]/g, '')); return isNaN(n) ? null : n; };
   const iv = raw.variant && typeof raw.variant === 'object' ? raw.variant : (raw.variants && typeof raw.variants === 'object' ? raw.variants : null);
   const children = iv && Array.isArray(iv.children) ? iv.children.filter((c) => c && /^[A-Z0-9]{10}$/.test(String(c.asin || '').toUpperCase())).map((c) => ({
@@ -659,7 +670,14 @@ function normalizeListingItem(raw, fallbackSite) {
      *   (采集器 content.js 的 zvErpTag 已经认 status=failed, 并把 note 显示在悬停提示里 —— 上层不用改) */
     uploads: [], uploadsTotal: 0, failCount: 0,
     failReason: null, failAt: null, failFields: [],
-    status: 'pending',        // pending 待上架 / listed 已上架 / failed 上传失败
+    /* ★ 多店铺隔离 (2026-10-06): 每条记录归属一个 ifast 店铺(账号名) + 站点。
+     *   shop 为 null = 未分类(还没在上架器里登录过 / 老数据) —— 界面上单列, 不混进任何店铺。
+     *   shopUserId / sellingId 只作辅助定位, 不做主键(账号名换绑/多跟卖组时能看出差异)。 */
+    shop, shopUserId: num(raw.shopUserId), sellingId: raw.sellingId != null ? String(raw.sellingId).slice(0, 40) : null,
+    /* status: pending 待上架 / listed 已上架 / failed 上传失败 / blocked 被查重拦截(不算上架) */
+    status: 'pending',
+    /* ★ 仅 status=blocked 时有值: 是谁把它拦下来的(哪个店铺/站点/什么时候) */
+    blockedBy: null,
     note: null,
     source: raw.source || 'ext-v2',
     collectedAt: raw.collectedAt || now(),
@@ -677,10 +695,18 @@ function normalizeListingItem(raw, fallbackSite) {
  *   注意 uploadResult 对"填了表但没提交"返回 null —— 那不是上传结果, 只是流水里的一条尝试。
  */
 function uploadResultOf(r) {
-  const last = (r.uploads || [])[0] || null;
-  if (last && last.ok === false) return 'failed';
-  if (last && last.submitted === true) return 'ok';
-  if ((r.status || '') === 'failed') return 'failed';                       // 旧数据兜底
+  /* ★ 2026-10-07 修【自相矛盾的记录】: 旧逻辑只看最新一条流水(uploads[0]) —— 而"提交前就被拦下
+   *   (商品已存在)"这类尝试是 ok:false, 于是它会把【已经上架成功】的记录读成"失败",
+   *   界面上就出现"记录显示失败, 但 ifast 里明明在售"的矛盾(用户报障: 上架记录/上架系统对不上)。
+   *   真相: 没提交过就没有"上传结果" —— 只有【真提交过】(submitted===true)的那次才决定结果。 */
+  const us = r.uploads || [];
+  /* ★ 2026-10-07: alreadyListed 也是"决定性结果" —— 商品在本店铺已上架时, 插件可能因为
+   *   "要写的内容与线上一致"而【不产生写入】(noChange), 那次尝试 submitted=false;
+   *   但它给出的是明确结论【已上架】, 必须算数(否则记录会被读成"还没有结果")。 */
+  const decisive = us.find((u) => u && (u.submitted === true || u.alreadyListed === true)) || null;
+  if (decisive) return decisive.ok === false ? 'failed' : 'ok';
+  /* 老数据(没有 submitted 字段 / 手工标记过状态)的兜底: 仍按 status 判 */
+  if ((r.status || '') === 'failed') return 'failed';
   if ((r.status || '') === 'listed' || (r.fillStatus || '') === 'uploaded') return 'ok';   // 旧数据兜底
   return null;
 }
@@ -730,6 +756,16 @@ function listingStats() {
   /* ★ 状态简化后的口径: 记录只有"上传结果"一种状态数据 —— byResult 就是它 */
   const byResult = { ok: 0, failed: 0, none: 0 };
   listingRecords.forEach((r) => { const k = uploadResultOf(r); byResult[k === null ? 'none' : k] = (byResult[k === null ? 'none' : k] || 0) + 1; });
+  /* ★ 多店铺隔离 (2026-10-06): 分店铺 / 分店铺+站点计数 —— 界面上"这个店铺有多少条"就看它 */
+  const byShop = {}, byShopSite = {}, byShopListed = {}, byShopBlocked = {};
+  listingRecords.forEach((r) => {
+    const sh = shopClean(r.shop) || SHOP_UNKNOWN;
+    const si = String(r.site || '?').toLowerCase();
+    byShop[sh] = (byShop[sh] || 0) + 1;
+    byShopSite[sh + '|' + si] = (byShopSite[sh + '|' + si] || 0) + 1;
+    if ((r.status || '') === 'listed') byShopListed[sh] = (byShopListed[sh] || 0) + 1;
+    if (isBlockedRow(r)) byShopBlocked[sh] = (byShopBlocked[sh] || 0) + 1;
+  });
   return {
     total: listingRecords.length,
     byStatus: by,
@@ -737,6 +773,14 @@ function listingStats() {
     bySite: listingRecords.reduce((m, r) => { const k = r.site || '?'; m[k] = (m[k] || 0) + 1; return m; }, {}),
     lastSavedAt: listingRecords.length ? listingRecords[listingRecords.length - 1].savedAt : null,
     byResult,
+    /* ★ 店铺维度 (2026-10-06) */
+    shops: shopStore.items.map((x) => ({ name: x.name, userId: x.userId == null ? null : x.userId, sites: x.sites || [], at: x.at || null, records: byShop[x.name] || 0, listed: byShopListed[x.name] || 0, blocked: byShopBlocked[x.name] || 0 })),
+    currentShop: currentShopName(),
+    byShop, byShopSite, byShopListed, byShopBlocked,
+    /* blocked 单列: 「不算上架」→ 不进 byResult(那是上传结果), 单独一个数 */
+    blocked: listingRecords.filter((r) => isBlockedRow(r)).length,
+    blockedPrimary: listingRecords.filter((r) => isBlockedRow(r) && (r.status || '') === 'blocked').length,
+    unassigned: listingRecords.filter((r) => !shopClean(r.shop)).length,
     uploads: {
       attempts: ups.length,
       ok: ups.filter((u) => u.ok !== false).length,
@@ -754,6 +798,802 @@ function listingStats() {
   };
 }
 
+/* ═══════════════ ★ 多店铺隔离 (2026-10-06) ═══════════════
+ * 需求原话: 「根据上架器进行分店铺数据管理，店铺数据做好隔离，在系统登陆后通过逆向方式先读取该
+ *   账号名称，后将数据隔离存到数据库」+「上架记录同步到选品归档，同样做好店铺数据隔离分类」
+ *   +「针对商品的站点进行好分类，比如店铺a上架了德国站，但是我上架的店铺b同样的商品是法国站，
+ *     这个不需要拦截」。
+ *
+ * 口径(用户拍板, 详见 _dev-tools/ERP后端-多店铺隔离-实施规格.md §7):
+ *   · 店铺标识 = ifast 账号名(createUserName, 如「王依凡」), 登录时由插件上报; 不额外编号
+ *   · 查重键 = asin + site; 同 asin + 同 site 只要【已经 listed】(不论哪个店铺, 【含本店铺】)
+ *     → 一律拦截, 且「不算上架」; 站点不同 → 不拦
+ *   · 被拦的这次尝试单独一条记录(status=blocked, id 带 #blocked:<店铺>), 单列, 不计入 listed
+ *     —— 关键: 绝不把已经 listed 的那条主记录改成 blocked(那会把"真的上架过"抹掉)
+ *   · 记录默认只返回【当前店铺】; ?shop=* 看全部, ?shop=none 看未分类
+ *   · 归档(选品归档)条目带 shop, 键 = shop|asin@site → 店铺之间天然不互相覆盖
+ * ============================================================================== */
+const SHOP_UNKNOWN = '未分类';
+const SHOP_SEEN_THROTTLE_MS = 5 * 60 * 1000;      // 同一个店铺 5 分钟内重复上报只更新内存, 不写盘
+/** 店铺名清洗: 去空白 + 截断; 空 → null(=未分类)。不用任何东西反推店铺, 宁可为空。 */
+function shopClean(v) { const s = String(v == null ? '' : v).trim(); return s ? s.slice(0, 60) : null }
+function shopEq(a, b) { return String(a == null ? '' : a).trim() === String(b == null ? '' : b).trim() }
+/** 店铺登记表: 插件在上架器里登录 ifast 后上报账号名 → 后端记住"当前店铺", ERP 客户端也能筛 */
+let shopStore = load('shops.json', { current: null, currentUserId: null, currentAt: null, items: [] });
+if (!shopStore || typeof shopStore !== 'object') shopStore = { current: null, currentUserId: null, currentAt: null, items: [] };
+if (!Array.isArray(shopStore.items)) shopStore.items = [];
+/* ══════════════ ★ 2026-10-07 「重复上架拦截」总开关 ══════════════
+ * 需求原话: 「给这个店铺拦截功能加上一个开关，现阶段设置为关闭」。
+ * 背景: 拦截口径(同 asin + 同 site 只要已上架就拦, 含本店铺)是 2026-10-06 用户拍板的;
+ *   但实测遇到一个真实场景 —— 某个品早被同一账号的另一个操作人(xiaotang)在 2026-09-24 上架过,
+ *   用户想重新按自己的价/跟卖组上架, 却被永久拦住(且我们提交时 ifast 只当空操作)。
+ *   所以给出开关: **关掉后不再拦**, 重复上传会照常入队并提交(是否会重复上架由 ifast 决定)。
+ * 保存位置: shops.json 里的 blocking(跟着数据走, 换机器/换浏览器都一致)。
+ * 默认 true(开) —— 只有显式关掉才放行, 避免"忘了这个开关导致重复上架"。 */
+if (!shopStore.blocking || typeof shopStore.blocking !== 'object') {
+  shopStore.blocking = { enabled: true, at: null, note: '默认开启: 同 ASIN + 同站点已上架则拦截' };
+}
+/** 拦截开关是否生效(true=拦, false=放行) */
+function blockingEnabled() { return shopStore.blocking && shopStore.blocking.enabled !== false }
+function setBlocking(enabled, note) {
+  shopStore.blocking = {
+    enabled: enabled === true,
+    at: now(),
+    note: note ? String(note).slice(0, 200) : (enabled === true ? '已开启重复上架拦截' : '已关闭重复上架拦截(重复上传将照常提交)'),
+  };
+  save('shops.json', shopStore, true);
+  return shopStore.blocking;
+}
+function currentShopName() { return shopClean(shopStore.current) }
+function shopFind(name) { const n = shopClean(name); return n ? (shopStore.items.find((x) => x.name === n) || null) : null }
+/**
+ * 登记/更新一个店铺(登录时调用)。返回 { changed, throttled } 供路由决定是否写盘 ——
+ * 上架器在 ifast 页里会周期性刷新登录态, 每次都写盘没必要, 但这个文件极小, 写盘代价可忽略。
+ */
+function shopRegister(name, opts) {
+  const n = shopClean(name);
+  if (!n) return { ok: false, error: 'shop 为空' };
+  const o = opts || {}, t = Date.now();
+  let it = shopStore.items.find((x) => x.name === n);
+  const fresh = !it;
+  if (fresh) { it = { name: n, userId: null, sites: [], groups: [], firstAt: null, at: null, atMs: 0, seen: 0 }; shopStore.items.push(it) }
+  const sites = (Array.isArray(o.sites) && o.sites.length)
+    ? o.sites.map((s) => String(s || '').toLowerCase()).filter(Boolean).slice(0, 30) : null;
+  const groups = (Array.isArray(o.groups) && o.groups.length)
+    ? o.groups.slice(0, 30).map((g) => ({ id: (g && g.id != null) ? String(g.id) : null, name: (g && g.name) || null })) : null;
+  const changed = fresh
+    || (o.userId != null && String(it.userId == null ? '' : it.userId) !== String(o.userId))
+    || (sites ? JSON.stringify(it.sites || []) !== JSON.stringify(sites) : false)
+    || (groups ? JSON.stringify(it.groups || []) !== JSON.stringify(groups) : false)
+    || !shopEq(shopStore.current, n);
+  const throttled = !changed && it.atMs && (t - it.atMs) < SHOP_SEEN_THROTTLE_MS;
+  if (!throttled) {
+    it.at = now(); it.atMs = t; it.seen = (it.seen || 0) + 1;
+    if (fresh) it.firstAt = it.at;
+    if (o.userId != null) it.userId = o.userId;
+    if (sites) it.sites = sites;
+    if (groups) it.groups = groups;
+    shopStore.current = n;
+    shopStore.currentUserId = it.userId == null ? null : it.userId;
+    shopStore.currentAt = it.at;
+  }
+  return { ok: true, name: n, item: it, changed, throttled, fresh };
+}
+function shopDelete(name) {
+  const n = shopClean(name);
+  if (!n) return { ok: false, error: 'shop 为空' };
+  const before = shopStore.items.length;
+  shopStore.items = shopStore.items.filter((x) => x.name !== n);
+  const removed = before - shopStore.items.length;
+  if (shopEq(shopStore.current, n)) { shopStore.current = null; shopStore.currentUserId = null; shopStore.currentAt = null }
+  return { ok: true, removed, current: currentShopName(), items: shopStore.items };
+}
+/** 解析请求里的店铺选择: '*'=全部 / 'none'|'未分类'=未分类 / 名字=那个店铺 / 空=后端记录的当前店铺 */
+function shopParamOf(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (s === '*') return { mode: 'all', shop: null };
+  if (!s) return { mode: 'default', shop: currentShopName() };
+  if (s === 'none' || s === '-' || s === SHOP_UNKNOWN) return { mode: 'none', shop: null };
+  return { mode: 'one', shop: s };
+}
+/** 记录是否落在当前选择里。★ default 模式下当前店铺为空时【不过滤】——
+ *  否则还没在插件里登录过的机器上打开 ERP, 上架记录页会是一片空白(不是"隔离", 是"看起来坏了")。 */
+function shopMatch(r, sel) {
+  if (!sel || sel.mode === 'all') return true;
+  if (sel.mode === 'none') return !shopClean(r && r.shop);
+  if (sel.mode === 'one') return shopEq(r && r.shop, sel.shop);
+  return sel.shop ? shopEq(r && r.shop, sel.shop) : true;
+}
+/** 后端认定的当前店铺是否"真的在过滤"(给前端显示"当前店铺: X"用) */
+function shopFilterActive(sel) { return !!(sel && sel.shop) }
+
+/** 查重命中的原记录 = 同 asin + 同 site 且【已 listed】(blocked 不算上架, 不参与) */
+function listingDedupeHits(asin, site) {
+  const a = String(asin || '').toUpperCase().trim(), s = String(site || '').toLowerCase().trim();
+  if (!a || !s) return [];
+  return listingRecords.filter((r) => String(r.asin || '').toUpperCase() === a
+    && String(r.site || '').toLowerCase() === s && (r.status || '') === 'listed');
+}
+/** 查重判定: 有任何已 listed 的命中 → 一律拦截(同店重复也拦); 命中里有别家店铺 → scope=cross-shop */
+function listingDedupe(asin, site, shop) {
+  const hits = listingDedupeHits(asin, site);
+  const me = shopClean(shop);
+  const where = hits.map((r) => ({
+    id: r.id, shop: shopClean(r.shop), site: r.site || null, status: r.status || null,
+    at: r.listedAt || r.savedAt || null, url: r.url || null, sellingId: r.sellingId || null,
+    title: r.title ? String(r.title).slice(0, 80) : null,
+  })).sort((x, y) => String(y.at || '').localeCompare(String(x.at || '')));
+  const scope = !hits.length ? 'none' : (hits.some((r) => !shopEq(r.shop, me)) ? 'cross-shop' : 'same-shop');
+  return { duplicated: hits.length > 0, scope, where, hits };
+}
+function dedupeMessage(dd, asin, site) {
+  const w = (dd.where || [])[0] || {};
+  const at = w.at ? String(w.at).slice(0, 16) : '之前';
+  if (dd.scope === 'same-shop') return '该商品(' + asin + ' / ' + site + ') 本店铺已于 ' + at + ' 上架过 —— 同店重复同样拦截, 不算上架';
+  return '该商品已在「' + (w.shop || SHOP_UNKNOWN) + '」(' + (w.site || site) + ') 于 ' + at + ' 上架过 —— 跨店铺重复, 已拦截';
+}
+/** 被拦截的那次尝试的落点 id —— ★ 必须与主记录(asin@site)分开, 否则会把"已上架"改成"已拦截" */
+const blockedIdOf = (asin, site, shop) => String(asin || '').toUpperCase() + '@' + String(site || '').toLowerCase()
+  + '#blocked:' + (shopClean(shop) || 'none');
+const isBlockedRow = (r) => !!(r && (r.blocked === true || (r.status || '') === 'blocked' || String(r.id || '').indexOf('#blocked:') >= 0));
+/**
+ * ★ 2026-10-07 启动自检(幂等): 把"状态与流水不一致"的历史记录修回来。
+ *   背景(用户报障): 旧逻辑把"提交前就被拦下(商品已存在)"也记成 ok:false → `uploadResultOf` 只看最新
+ *   一条流水 → **已经上架成功的记录被读成"失败"**, 界面上就出现"记录显示失败、ifast 里却在售"、
+ *   "上架记录有、上架系统对不上"这类自相矛盾。现在判据改成"只认真提交过的那次", 这里顺手把老数据修一致。
+ *   安全边界: ① 拦截记录(未上架)一律不碰; ② status 用 uploadResultOf 反推 —— 手工标记过的状态会被它兜底读回来,
+ *   所以不会把人工"标记为已上架"的记录改掉; ③ 只在真有变化时回写一次。
+ */
+function repairListingResults() {
+  let fixed = 0;
+  for (const r of (listingRecords || [])) {
+    if (!r || isBlockedRow(r)) continue;
+    const res = uploadResultOf(r);
+    const decisive = (r.uploads || []).filter((u) => u && u.submitted === true);
+    const realFails = decisive.filter((u) => u.ok === false).length;
+    const wantStatus = res === 'ok' ? 'listed' : (res === 'failed' ? 'failed' : 'pending');
+    let touched = false;
+    if ((r.status || 'pending') !== wantStatus) { r.status = wantStatus; touched = true }
+    if (res === 'ok' && !r.listedAt && decisive.length) { r.listedAt = decisive[0].at; touched = true }
+    if ((r.failCount || 0) !== realFails) { r.failCount = realFails; touched = true }
+    if (!realFails && (r.failReason || r.failAt || r.failFields)) { r.failReason = null; r.failAt = null; r.failFields = null; touched = true }
+    /* 历史留痕归一化: 老数据把"提交前就被拦下"写成了 ok:false(红"失败"徽章), 与新口径不一致 →
+     *   界面上同一类事件有的显示"被拦下"、有的显示"失败", 看起来就是数据错了。
+     *   只按【原因文案】精确认这两类(商品已存在 / 探活没过), 其它"未提交"("确认没落地, 可安全重传")不动。 */
+    for (const u of (r.uploads || [])) {
+      if (u && u.submitted !== true && u.ok === false && /未提交/.test(String(u.reason || '')) && /已存在|探活/.test(String(u.reason || ''))) {
+        u.ok = null; u.preflight = true; touched = true;
+      }
+    }
+    /* 被拦下的次数单独计数 —— 保留"拦了多少次"这个事实, 但不混进失败次数 */
+    const preflights = (r.uploads || []).filter((u) => u && u.preflight === true).length;
+    if (preflights !== (r.preflightCount || 0)) { r.preflightCount = preflights; touched = true }
+    if (touched) fixed++;
+  }
+  if (fixed) {
+    try { save('listing-records.json', listingRecords); console.log('[listing] 启动自检: 修正 ' + fixed + ' 条"状态与流水不一致"的记录'); }
+    catch (e) { console.error('[listing] 启动自检回写失败: ' + ((e && e.message) || e)); }
+  }
+  return fixed;
+}
+repairListingResults();
+/**
+ * 拦截留痕: 单开(或更新)一条 status=blocked 的记录。
+ * ★ 只借主记录的【展示字段】(标题/图/价/面板), 绝不借用 fill/uploads —— 那是"要填的任务",
+ *   借过来 bridge 会把被拦的商品又填一遍。
+ */
+function listingRecordBlocked(asin, site, shop, dd, extra) {
+  const A = String(asin || '').toUpperCase().trim(), S = String(site || '').toLowerCase().trim();
+  const me = shopClean(shop), at = now();
+  const id = blockedIdOf(A, S, me);
+  const hit = (dd.hits || [])[0] || null;
+  const base = hit || listingRecords.find((x) => x.id === listingIdOf({ asin: A, site: S })) || null;
+  const w = (dd.where || [])[0] || {};
+  const blockedBy = {
+    shop: w.shop || null, site: w.site || S, at: w.at || null, url: w.url || null, id: w.id || null,
+    scope: dd.scope, blockedAt: at,
+  };
+  const clone = (v) => (v == null ? null : JSON.parse(JSON.stringify(v)));
+  let r = listingRecords.find((x) => x.id === id);
+  if (!r) {
+    r = {
+      id, asin: A, site: S, shop: me, shopUserId: (extra && extra.shopUserId) || null, sellingId: null,
+      blocked: true, primary: false, titleBlocked: false,
+      source: (extra && extra.source) || 'blocked-by-dedupe',
+      collectedAt: at, savedAt: at, listedAt: null,
+      status: 'blocked', blockedBy, blockedAt: at, blockCount: 0, blocks: [], note: null,
+      title: (base && base.title) || (extra && extra.title) || null,
+      brand: (base && base.brand) || null, parentAsin: (base && base.parentAsin) || null,
+      price: base ? base.price : null, currency: base ? base.currency : null,
+      mainImage: (base && base.mainImage) || null,
+      url: (base && base.url) || (extra && extra.url) || null,
+      catPath: (base && base.catPath) || null, cat1: (base && base.cat1) || null,
+      cat2: (base && base.cat2) || null, cat3: (base && base.cat3) || null,
+      variant: clone(base && base.variant), panel: clone(base && base.panel),
+      fill: null, fillAt: null, fillResult: null, refillAt: null,
+      uploads: [], uploadsTotal: 0, failCount: 0, failReason: null, failAt: null, failFields: [],
+    };
+    listingRecords.unshift(r);
+  } else {
+    r.status = 'blocked'; r.blockedBy = blockedBy; r.blockedAt = at;
+    if (!r.title && base && base.title) r.title = base.title;
+  }
+  r.blockCount = (r.blockCount || 0) + 1;
+  if (!Array.isArray(r.blocks)) r.blocks = [];
+  r.blocks.unshift({ at, scope: dd.scope, byShop: me, where: (dd.where || []).slice(0, 5) });
+  if (r.blocks.length > 20) r.blocks.length = 20;
+  r.note = dedupeMessage(dd, A, S);
+  return r;
+}
+
+/* ══════════ ★ 2026-10-24 跨店重复上架拦截 · 台账引擎 (PRD-v0.1) ══════════
+ * 口径(用户 2026-10-24 拍板): 「店铺」= ifast 跟卖组 sellingId(如 2411190735976「全天跟卖」);
+ *   ERP 的 shop 字段是 ifast 登录账号名(王依凡/王祖杰), 只用于展示与筛选, 不参与判决。
+ * 判决(PRD §5.2, 取最高严重度):
+ *   本 ASIN + 同站点  → block  (可确认强行上架, 落 override 审计)
+ *   本 ASIN + 跨站点  → warn   (不同市场允许同款, 不打断)
+ *   同族变体(任意站)  → warn
+ *   无命中            → pass
+ * 数据来自 listingRecords 的 fillResult.readBack.selling / .site 全量重建, 不改采集链路。
+ */
+const CLAIM_FILE = 'listing-claims.json';
+const CLAIM_SETTING_FILE = 'claim-settings.json';
+const MACHINE_FILE = 'machine.json';
+let claimSettings = Object.assign({ enabled: true, retainDays: 180, whitelistPairs: [], blockSameStore: true }, load(CLAIM_SETTING_FILE, {}) || {});
+function claimSaveSettings() {
+  try { save(CLAIM_SETTING_FILE, claimSettings, true); }
+  catch (e) { console.warn('[claims] 设置落盘失败: ' + ((e && e.message) || e)); }
+}
+let machineInfo = load(MACHINE_FILE, null);
+if (!machineInfo || !machineInfo.id) {
+  try {
+    const cr = require('crypto');
+    machineInfo = {
+      id: (cr.randomUUID ? cr.randomUUID() : ('M-' + Date.now().toString(36))),
+      name: (process.env.COMPUTERNAME || '电脑A'), at: now(),
+    };
+    save(MACHINE_FILE, machineInfo, true);
+  } catch (e) { machineInfo = { id: 'M-local', name: '电脑A', at: now() }; }
+}
+/** "2411190735976=全天" → { id, name }; bridge 的 how 文案(任务自带/默认/自动…)不算店名 */
+function parseReadBackPair(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!s) return { id: null, name: null };
+  const i = s.indexOf('=');
+  if (i < 0) return { id: s, name: null };
+  const id = s.slice(0, i).trim();
+  let name = s.slice(i + 1).trim();
+  if (!name || /^(任务自带|默认|自动|首选|手动|站点表|实时站点表.*)$/.test(name)) name = null;
+  return { id: id || null, name: name };
+}
+const claimKeyOf = (asin, site, storeId) => String(asin || '').toUpperCase().trim() + '@'
+  + String(site || '').toLowerCase().trim() + '@' + String(storeId || '').trim();
+const claimDays = () => { const n = Number(claimSettings.retainDays); return (isNaN(n) || n <= 0) ? 180 : n; };
+/** 台账里的时间是否还在"参与拦截"的窗口内 (PRD §12 #7: 默认 180 天) */
+function claimFresh(at, days) {
+  const t = Date.parse(String(at == null ? '' : at).replace(' ', 'T') + 'Z');   // 台账时间戳是 UTC
+  if (!t) return true;                                  // 老数据没时间 → 当作有效(宁可提醒)
+  return (Date.now() - t) <= (days || claimDays()) * 86400000;
+}
+let listingClaims = load(CLAIM_FILE, []);
+if (!Array.isArray(listingClaims)) listingClaims = [];
+let claimIdx = { byAsin: new Map(), byFamily: new Map(), byStore: new Map(), parentOf: new Map() };
+function claimIdxRebuild() {
+  claimIdx = { byAsin: new Map(), byFamily: new Map(), byStore: new Map(), parentOf: new Map() };
+  /* ★ 2026-10-24 多设备: 索引里既要有本地凭证, 也要有各 peer 同步来的凭证(带 src 标记) —— 这样别的设备上架过的品, 本机也能拦住 */
+  let __list = listingClaims;
+  try { if (typeof allClaimsWithSrc === 'function') __list = allClaimsWithSrc() } catch (e) { __list = listingClaims }
+  for (const c of __list) {
+    if (!c || !c.asin) continue;
+    if (!claimIdx.byAsin.has(c.asin)) claimIdx.byAsin.set(c.asin, []);
+    claimIdx.byAsin.get(c.asin).push(c);
+    if (c.parentAsin) {
+      if (!claimIdx.byFamily.has(c.parentAsin)) claimIdx.byFamily.set(c.parentAsin, []);
+      claimIdx.byFamily.get(c.parentAsin).push(c);
+      claimIdx.parentOf.set(c.asin, c.parentAsin);
+    }
+    if (c.storeId) {
+      if (!claimIdx.byStore.has(c.storeId)) claimIdx.byStore.set(c.storeId, []);
+      claimIdx.byStore.get(c.storeId).push(c);
+    }
+  }
+}
+function claimSave() {
+  try { save(CLAIM_FILE, listingClaims, true); claimIdxRebuild(); }
+  catch (e) { console.error('[claims] 落盘失败: ' + ((e && e.message) || e)); }
+}
+/** 同 key 合并: 保留最早那次的凭证时间由调用方决定, 这里更新最新状态/机器/店名 */
+function claimUpsert(nc) {
+  if (!nc || !nc.asin || !nc.site) return null;
+  const key = claimKeyOf(nc.asin, nc.site, nc.storeId);
+  nc.key = key;
+  const old = listingClaims.find((c) => c.key === key);
+  if (old) {
+    old.status = nc.status || old.status;
+    old.at = nc.at || old.at;
+    old.machineId = nc.machineId || old.machineId;
+    old.machineName = nc.machineName || old.machineName;
+    old.storeName = nc.storeName || old.storeName;
+    old.shop = nc.shop || old.shop;
+    old.siteId = nc.siteId || old.siteId;
+    old.parentAsin = nc.parentAsin || old.parentAsin;
+    old.title = nc.title || old.title;
+    old.brand = nc.brand || old.brand;
+    old.image = nc.image || old.image;
+    if (!Array.isArray(old.overrides)) old.overrides = [];
+    if (Array.isArray(nc.overrides) && nc.overrides.length) old.overrides = old.overrides.concat(nc.overrides);
+    return old;
+  }
+  if (!Array.isArray(nc.overrides)) nc.overrides = [];
+  listingClaims.push(nc);
+  return nc;
+}
+/** 从 listingRecords 全量重建台账(幂等): 只取真上架过的记录, 拦截留痕不算 */
+function claimsFromListingRecords() {
+  const out = [];
+  for (const r of (listingRecords || [])) {
+    if (!r || !r.asin || isBlockedRow(r)) continue;
+    const st = String(r.status || '');
+    if (st !== 'listed' && st !== 'failed' && st !== 'pending') continue;
+    const rb = (r.fillResult && r.fillResult.readBack) || null;
+    const sell = parseReadBackPair(rb && rb.selling);
+    const sitePair = parseReadBackPair(rb && rb.site);
+    const site = String(r.site || '').toLowerCase().trim();
+    if (!site) continue;
+    out.push({
+      key: claimKeyOf(r.asin, site, sell.id || ('?shop:' + (shopClean(r.shop) || 'none'))),
+      asin: String(r.asin).toUpperCase().trim(),
+      parentAsin: r.parentAsin || (r.variant && r.variant.parentAsin) || null,
+      site: site,
+      siteId: (sitePair && sitePair.id) || null,
+      storeId: sell.id || null,
+      storeName: sell.name || null,
+      shop: shopClean(r.shop) || null,
+      machineId: r.machineId || 'legacy',
+      machineName: r.machineName || null,
+      at: r.listedAt || (r.fillResult && r.fillResult.at) || r.savedAt || null,
+      status: st === 'listed' ? 'listed' : (st === 'failed' ? 'failed' : 'pending'),
+      source: 'import',
+      title: r.title || null,
+      brand: r.brand || null,
+      image: r.mainImage || null,
+      overrides: [],
+    });
+  }
+  return out;
+}
+function claimsRebuild(opts) {
+  const keepOver = new Map();
+  for (const c of listingClaims) { if (c && c.key && Array.isArray(c.overrides) && c.overrides.length) keepOver.set(c.key, c.overrides); }
+  const fresh = claimsFromListingRecords();
+  for (const c of fresh) { const ov = keepOver.get(c.key); if (ov) c.overrides = ov; }
+  const keys = new Set(fresh.map((c) => c.key));
+  const extra = (opts && opts.keepManual === false) ? []
+    : listingClaims.filter((c) => c && c.key && !keys.has(c.key) && (c.source === 'ext' || c.source === 'bridge' || c.source === 'ifast-sync'));
+  listingClaims = fresh.concat(extra);
+  claimSave();
+  return { ok: true, total: listingClaims.length, fromRecords: fresh.length, manual: extra.length, stores: claimIdx.byStore.size };
+}
+function claimSameStoreNote(hit, storeId) {
+  return !!(storeId && hit && String(hit.storeId || '') === String(storeId));
+}
+/**
+ * 判决入口 (PRD §9 /api/claims/check)
+ * @param {{asins?:string[], asin?:string, site?:string, storeId?:string, scope?:'asin'|'family', parentAsin?:string}} opts
+ */
+function claimCheck(opts) {
+  const o = opts || {};
+  const rawList = Array.isArray(o.asins) ? o.asins : (o.asin ? [o.asin] : []);
+  const asins = [];
+  const seen = new Set();
+  for (const x of rawList) {
+    const a = String(x == null ? '' : x).toUpperCase().trim();
+    if (a && !seen.has(a)) { seen.add(a); asins.push(a); }
+  }
+  const site = String(o.site == null ? '' : o.site).toLowerCase().trim();
+  const storeId = String(o.storeId == null ? '' : o.storeId).trim();
+  const scope = o.scope === 'asin' ? 'asin' : 'family';
+  const days = claimDays();
+  const items = [];
+  const warns = [];
+  for (const A of asins) {
+    const hits = (claimIdx.byAsin.get(A) || []).filter((c) => claimFresh(c.at, days));
+    const same = hits.filter((c) => String(c.site || '') === site);
+    const cross = hits.filter((c) => String(c.site || '') !== site);
+    for (const h of same) {
+      const mine = claimSameStoreNote(h, storeId);
+      items.push({
+        asin: A, level: 'block',
+        reason: mine ? 'same_asin_same_site_same_store' : 'same_asin_same_site',
+        note: mine ? '本店已上过' : null,
+        hit: {
+          src: h.src || 'local', srcName: h.srcName || null,
+          asin: h.asin, site: h.site, siteId: h.siteId || null, storeId: h.storeId || null,
+          storeName: h.storeName || null, shop: h.shop || null,
+          machineName: h.machineName || null, at: h.at || null, status: h.status || null,
+          title: h.title ? String(h.title).slice(0, 120) : null, brand: h.brand || null, image: h.image || null,
+        },
+      });
+    }
+    if (cross.length) {
+      const first = cross[0];
+      warns.push({
+        level: 'warn', reason: 'cross_site', asin: A,
+        summary: '该品已在「' + (first.storeName || first.storeId || '其他店铺') + '」'
+          + String(first.site || '').toUpperCase() + ' 站上过'
+          + (cross.length > 1 ? ('（另有 ' + (cross.length - 1) + ' 条）') : ''),
+        hits: cross.slice(0, 5).map((h) => ({ site: h.site || null, storeId: h.storeId || null, storeName: h.storeName || null, at: h.at || null })),
+      });
+    }
+    if (scope === 'family') {
+      const P = claimIdx.parentOf.get(A) || (o.parentAsin ? String(o.parentAsin).toUpperCase().trim() : null);
+      if (P) {
+        const fam = (claimIdx.byFamily.get(P) || []).filter((c) => c.asin !== A && claimFresh(c.at, days));
+        if (fam.length) {
+          const variants = new Set(fam.map((c) => c.asin));
+          const stores = new Set(fam.map((c) => c.storeId || '?'));
+          warns.push({
+            level: 'warn', reason: 'family_other_variant', asin: A,
+            summary: '同族另有 ' + variants.size + ' 个变体在 ' + stores.size + ' 个店铺上过',
+            hits: fam.slice(0, 5).map((h) => ({ asin: h.asin, site: h.site || null, storeName: h.storeName || null, at: h.at || null })),
+          });
+        }
+      }
+    }
+  }
+  const verdict = items.some((x) => x.level === 'block') ? 'block' : (warns.length ? 'warn' : 'pass');
+  return {
+    ok: true, verdict: verdict, site: site || null, storeId: storeId || null, scope: scope,
+    items: items, warns: warns, at: now(), machine: machineInfo, checked: asins.length, indexSize: listingClaims.length,
+  };
+}
+/* ── ifast 实时数据 (「查看其他店铺数据」的数据源) ────────────────────────────
+ * 用采集浏览器开一个 ifast 页, 在页面上下文带 cookie 调 ifast 自己的接口:
+ *   /amazon/selling//user/selling.json    → 本账号下所有跟卖组(=店铺)清单
+ *   /amazon/selling/item/item_list.json   → 某 ASIN 在各店铺/各站点的在架行(含 createUserName/createTime)
+ * 必须在 ifast 已登录的浏览器里跑; 未登录时 ifast 返回 {"code":403,"msg":"登录过期，请重新登录"}。
+ */
+let ifastBusy = 0;
+const IFAST_FETCH_JS = (path) => '(async()=>{' +
+  'try{' +
+  'const r=await fetch(' + JSON.stringify(path) + ',{credentials:"include",headers:{"X-Requested-With":"XMLHttpRequest"}});' +
+  'const t=await r.text();let j=null;try{j=JSON.parse(t)}catch(e){}' +
+  'if(j&&j.code===403)return {ok:false,__login:false,msg:(j.msg||"登录过期")};' +
+  'return {ok:true,status:r.status,data:j,raw:j?null:t.slice(0,300)};' +
+  '}catch(e){return {ok:false,msg:String(e)}}' +
+  '})()';
+async function ifastRun(expr) {
+  if (ifastBusy) throw new Error('ifast 查询正在跑, 稍等一下再点');
+  ifastBusy = 1;
+  let tab = null;
+  try {
+    tab = await cdpCreateTab('https://www.ifast.top/amazon/selling/item/item_list.html');
+    if (!tab || !tab.wsUrl) throw new Error('打不开 ifast 标签页 —— 采集浏览器(9222)没开?');
+    const send = await cdpGet(tab.wsUrl);
+    let last = null;
+    for (let i = 0; i < 6; i++) {
+      await new Promise((r) => setTimeout(r, 900));
+      const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true });
+      const v = r && r.result ? r.result.value : null;
+      last = v;
+      if (v && v.__login === false) throw new Error('ifast 登录已过期 —— 请在采集浏览器里重新登录 ifast 后再试');
+      if (v && v.ok) return v;
+    }
+    return last;
+  } finally {
+    try { if (tab && tab.targetId) await cdpCloseTab(tab.targetId); } catch (e) { }
+    ifastBusy = 0;
+  }
+}
+/** 本账号下的所有跟卖组(=店铺清单) */
+async function ifastSellingGroups() {
+  const r = await ifastRun(IFAST_FETCH_JS('/amazon/selling//user/selling.json'));
+  const j = (r && r.data) || {};
+  const rows = j.data || j.rows || j.list || [];
+  return {
+    ok: !!(r && r.ok),
+    groups: rows.map((x) => ({
+      id: String(x.id == null ? '' : x.id), name: x.name || null,
+      onSale: x.onSaleDesc || null, offSale: x.offSaleDesc || null,
+    })),
+    raw: r && r.raw,
+  };
+}
+/** 某 ASIN 在 ifast 里的在架行(含别的店铺上的) */
+async function ifastListingRows(asin, siteId) {
+  const A = String(asin || '').toUpperCase().trim();
+  const p = '/amazon/selling/item/item_list.json?page=1&limit=50&asin=' + encodeURIComponent(A)
+    + (siteId ? ('&siteId=' + encodeURIComponent(siteId)) : '');
+  const r = await ifastRun(IFAST_FETCH_JS(p));
+  const j = (r && r.data) || {};
+  const rows = j.data || j.rows || j.list || [];
+  return {
+    ok: !!(r && r.ok), asin: A, count: (j.count == null ? rows.length : j.count), raw: r && r.raw,
+    rows: rows.map((x) => ({
+      id: x.id == null ? null : x.id, sku: x.sku || null, asin: x.asin || A,
+      siteId: x.siteId == null ? null : String(x.siteId), country: x.country || null,
+      sellingId: x.sellingId == null ? null : String(x.sellingId),
+      createUserName: x.createUserName || null, createTime: x.createTime || null,
+      status: (x.status == null ? null : x.status), price: (x.price == null ? null : x.price),
+      quantity: (x.quantity == null ? null : x.quantity),
+    })),
+  };
+}
+/* ── ★ 2026-10-24 ifast 店铺商品同步 (同步按钮的后端落点) ─────────────────────
+ * 用户要求: 「上架器插件加一个同步按钮, 登录完 ifast 后通过 api 接口同步店铺内的所有商品数据」。
+ * 数据源(采集浏览器里 ifast 已登录):
+ *   /amazon/selling//user/selling.json                  → 跟卖组(=店铺, 实测有 全天跟卖/午夜/午夜正根/1 …)
+ *   /amazon/site/enable                                 → 站点(含 sellerId)
+ *   /amazon/selling/item/item_list.json?page=N&limit=100 → 商品(实测 count=2218, limit=100 可用, 第 23 页 18 条)
+ * 落库: ifast-items.json(明细, 主键 asin@siteId@storeId) + ifast-sync.json(概要),
+ *   同时写进跨店台账 → 「这个 ASIN 在哪些店铺上过」从此按 ifast 真实在架算, 不再只靠我们记的 214 条。
+ */
+const IF_SITE = { AU: 'au', GB: 'uk', UK: 'uk', DE: 'de', FR: 'fr', IT: 'it', ES: 'es', JP: 'jp', CA: 'ca', IN: 'in', US: 'us', MX: 'mx', BR: 'br', NL: 'nl', SE: 'se', PL: 'pl', SG: 'sg', AE: 'ae', SA: 'sa', TR: 'tr', BE: 'be', EG: 'eg' };
+const ifNum = (v) => { if (v == null || v === '') return null; const n = Number(v); return isNaN(n) ? null : n };
+/* itemStatus 是 ifast 的状态枚举(实测页面上 20 显示「待获取」, 30 是 ASIN 异常红标, 40 是黄标);
+ * ★ 但对「跨店重复上架」来说判据只有一个: **这条在 ifast 的列表里存在 = 这个店铺这个站点有它** ——
+ *   所以 status 一律记 listed(平台有), itemStatus/statusText 只用于展示, 不参与判决。 */
+const IF_ITEM_STATUS_TEXT = { 0: '正常', 20: '待获取', 30: 'ASIN异常', 40: '异常' };
+const ifStatusText = (v) => (v == null || v === '') ? null : (IF_ITEM_STATUS_TEXT[v] || ('状态' + v));
+let ifastItems = load('ifast-items.json', []);
+if (!Array.isArray(ifastItems)) ifastItems = [];
+let ifastSyncMeta = load('ifast-sync.json', null) || null;
+let ifastGroups = (ifastSyncMeta && Array.isArray(ifastSyncMeta.groups)) ? ifastSyncMeta.groups : [];
+let ifastSites = (ifastSyncMeta && Array.isArray(ifastSyncMeta.sites)) ? ifastSyncMeta.sites : [];
+let ifastItemIdx = new Map();
+function ifastItemKeyOf(it) {
+  return String((it && it.asin) || '').toUpperCase() + '@' + String((it && it.siteId) || '') + '@' + String((it && it.storeId) || '');
+}
+function ifastItemIdxRebuild() { ifastItemIdx = new Map(); for (const it of ifastItems) ifastItemIdx.set(it.key || ifastItemKeyOf(it), it) }
+/** 把 ifast 原始行归一化并 upsert 进明细库; 返回 {added, updated, normalized} */
+function ifastItemsSync(rows) {
+  let added = 0, updated = 0;
+  const normalized = [];
+  const gName = new Map((ifastGroups || []).map((g) => [String(g.id), g.name]));
+  for (const raw of rows) {
+    if (!raw || !raw.asin) continue;
+    const asin = String(raw.asin).toUpperCase().trim();
+    const siteId = raw.siteId == null ? '' : String(raw.siteId);
+    const country = String(raw.country || '').toUpperCase();
+    const site = IF_SITE[country] || country.toLowerCase();
+    const storeId = raw.sellingId == null ? '' : String(raw.sellingId);
+    const it = {
+      key: asin + '@' + siteId + '@' + storeId, asin: asin, sku: raw.sku || null,
+      siteId: siteId, site: site, country: country, storeId: storeId,
+      storeName: gName.get(storeId) || null,
+      title: raw.title || null, brand: raw.brand || null, image: raw.image || null,
+      url: raw.url || null, cate: raw.cate || null,
+      price: ifNum(raw.price), initPrice: ifNum(raw.initPrice), lowerPrice: ifNum(raw.lowerPrice),
+      stock: ifNum(raw.stock), fulfillmentLatency: ifNum(raw.fulfillmentLatency),
+      onOff: ifNum(raw.onOff), itemStatus: (raw.itemStatus == null ? null : raw.itemStatus),
+      statusText: ifStatusText(raw.itemStatus),
+      status: 'listed',        // 见上面注释: 在 ifast 列表里 = 这个店铺在这个站点有这条
+      createUserName: raw.createUserName || null, createTime: raw.createTime || null,
+      updateTime: raw.updateTime || null, ifastId: (raw.id == null ? null : raw.id),
+      syncedAt: now(),
+    };
+    const old = ifastItemIdx.get(it.key);
+    if (old) { Object.assign(old, it); updated++; } else { ifastItems.push(it); ifastItemIdx.set(it.key, it); added++ }
+    normalized.push(it);
+  }
+  return { added: added, updated: updated, normalized: normalized };
+}
+/** 同步来的商品同时写进跨店台账(判决引擎立刻就能用真实在架数据判) */
+function claimsFromIfastRows(items, source) {
+  let n = 1;
+  for (const it of (items || [])) {
+    if (!it || !it.asin || !it.site) continue;
+    claimUpsert({
+      asin: it.asin, site: it.site, siteId: it.siteId || null,
+      storeId: it.storeId || null, storeName: it.storeName || null,
+      shop: null, parentAsin: null, status: 'listed',
+      source: source || 'ifast-sync', at: it.createTime || now(),
+      machineId: machineInfo.id, machineName: machineInfo.name,
+      title: it.title || null, brand: it.brand || null, image: it.image || null,
+    });
+    n++;
+  }
+  if (n > 1) claimSave();
+  return n - 1;
+}
+ifastItemIdxRebuild();
+claimIdxRebuild();
+/* ══════════ ★ 2026-10-24 设备间双向同步 (peers) ══════════
+ * 用户要求: 「先做双向; 所有设备的数据都在设备本地, 只有连接端口后才可以同步数据;
+ *   选品归档里『其他店铺的商品管理』只有在链接端口时才能获取。」
+ * 设计:
+ *   · 每台设备的真实数据只在自己的 listing-claims.json / ifast-items.json 里(本地)。
+ *   · 连上另一台设备的共享端口 = 建一个 peer; 同步时【双向】:
+ *       拉: GET  peer/api/sync/export  → 写进本地 peer-data.json[peerId](带来源标记, 不污染本地数据)
+ *       推: POST peer/api/sync/import  ← 把我本地的 claims/items 推给它, 它也存成"来自我"
+ *   · 判决/台账/商品查询时把「本地 + 各 peer」合并展示, 每条带 src('local' 或 设备名)。
+ *   · 删除 peer = 清掉它的缓存数据 → 不再连接就看不到对方数据(满足"只有链接端口才能获取")。
+ */
+const PEERS_FILE = 'peers.json';
+const PEER_DATA_FILE = 'peer-data.json';
+let peers = load(PEERS_FILE, []);
+if (!Array.isArray(peers)) peers = [];
+let peerData = load(PEER_DATA_FILE, {});
+if (!peerData || typeof peerData !== 'object' || Array.isArray(peerData)) peerData = {};
+function peerSave() { try { save(PEERS_FILE, peers, true) } catch (e) { console.error('[peers] 落盘失败: ' + ((e && e.message) || e)) } }
+function peerDataSave() { try { save(PEER_DATA_FILE, peerData, true) } catch (e) { console.error('[peers] 缓存落盘失败: ' + ((e && e.message) || e)) } }
+const peerNormUrl = (raw) => {
+  let u = String(raw == null ? '' : raw).trim();
+  if (!u) return '';
+  if (!/^https?:\/\//i.test(u)) u = 'http://' + u;
+  return u.replace(/\/+$/, '');
+};
+/** 极简 JSON 请求(只给 peer 用, 不走 fetch 免得受代理影响) */
+function peerHttp(urlStr, method, body, timeoutMs) {
+  return new Promise((resolve) => {
+    let u;
+    try { u = new URL(urlStr) } catch (e) { return resolve({ ok: false, error: '地址不合法: ' + urlStr }) }
+    const isHttps = u.protocol === 'https:';
+    const lib = isHttps ? require('https') : http;
+    const data = body ? Buffer.from(JSON.stringify(body)) : null;
+    const req = lib.request({
+      host: u.hostname, port: u.port || (isHttps ? 443 : 80), path: u.pathname + (u.search || ''),
+      method: method || 'GET', timeout: timeoutMs || 12000,
+      headers: Object.assign({ 'Content-Type': 'application/json' }, data ? { 'Content-Length': data.length } : {}),
+    }, (res) => {
+      let b = '';
+      res.on('data', (c) => b += c);
+      res.on('end', () => {
+        let j = null;
+        try { j = b ? JSON.parse(b) : {} } catch (e) { j = { error: String(b).slice(0, 160) } }
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, json: j });
+      });
+    });
+    req.on('error', (e) => resolve({ ok: false, error: (e && e.code) || String((e && e.message) || e) }));
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: '超时' }) });
+    if (data) req.write(data);
+    req.end();
+  });
+}
+/** 精简字段: 只传同步/判决需要的(别把 1MB 的明细整包搬) */
+function peerCompactClaim(c) {
+  return {
+    key: c.key, asin: c.asin, site: c.site, siteId: c.siteId || null,
+    storeId: c.storeId || null, storeName: c.storeName || null, shop: c.shop || null,
+    parentAsin: c.parentAsin || null, status: c.status || 'listed', at: c.at || null,
+    machineId: c.machineId || null, machineName: c.machineName || null,
+    title: c.title ? String(c.title).slice(0, 120) : null, brand: c.brand || null, image: c.image || null,
+    overrides: Array.isArray(c.overrides) ? c.overrides.slice(-5) : [],
+  };
+}
+function peerCompactItem(it) {
+  return {
+    key: it.key, asin: it.asin, sku: it.sku || null, site: it.site || null, siteId: it.siteId || null,
+    country: it.country || null, storeId: it.storeId || null, storeName: it.storeName || null,
+    title: it.title ? String(it.title).slice(0, 140) : null, brand: it.brand || null, image: it.image || null,
+    price: it.price == null ? null : it.price, stock: it.stock == null ? null : it.stock,
+    status: it.status || 'listed', statusText: it.statusText || null,
+    createTime: it.createTime || null, createUserName: it.createUserName || null,
+  };
+}
+/** 导出给 peer 的数据(只导本地, 不导"转手来的") */
+function peerExportPayload() {
+  return {
+    ok: true, at: now(),
+    machine: { id: machineInfo.id, name: machineInfo.name },
+    claims: listingClaims.map(peerCompactClaim),
+    items: ifastItems.map(peerCompactItem),
+  };
+}
+/** 收到 peer 推来的数据 → 存到 peer-data.json[peerId], 不污染本地库 */
+function peerImportPayload(payload) {
+  const m = (payload && payload.machine) || {};
+  const pid = String(m.id || m.name || 'peer-unknown');
+  /* ★ 2026-10-24: 两台机器 hostname 常常一样(都叫 PC-xxx) → 优先用【连接时给它起的名字】, 否则界面分不清谁是谁 */
+  const mine = peers.find((p) => p && String(p.id) === pid);
+  const name = String((mine && mine.name) || m.name || pid);
+  const cur = peerData[pid] || { claims: [], items: [], at: null, name: name };
+  if (!cur.name || cur.name === (m.name || '')) cur.name = name;
+  const cm = new Map((cur.claims || []).map((c) => [c && c.key, c]));
+  let cAdd = 0, cUpd = 0;
+  for (const c of (payload.claims || [])) {
+    if (!c || !c.key) continue;
+    const old = cm.get(c.key);
+    if (!old) { cm.set(c.key, c); cAdd++ }
+    else if (String(c.at || '') >= String(old.at || '')) {
+      /* 同一条 → 取时间较新的; overrides 合并(审计别丢) */
+      const ov = (old.overrides || []).concat(c.overrides || []);
+      cm.set(c.key, Object.assign({}, old, c, { overrides: ov.slice(-10) }));
+      cUpd++;
+    }
+  }
+  const im = new Map((cur.items || []).map((x) => [x && x.key, x]));
+  let iAdd = 0, iUpd = 0;
+  for (const it of (payload.items || [])) {
+    if (!it || !it.key) continue;
+    if (im.has(it.key)) iUpd++; else iAdd++;
+    im.set(it.key, it);
+  }
+  cur.claims = Array.from(cm.values());
+  cur.items = Array.from(im.values());
+  cur.name = name;
+  cur.machine = { id: pid, name: name };
+  cur.at = now();
+  peerData[pid] = cur;
+  peerDataSave();
+  /* ★ 2026-10-24 修: 收完必须重建判决索引 —— 否则"刚同步来的凭证明明在库里, 却拦不住" */
+  try { claimIdxRebuild() } catch (e) {}
+  const rec = peers.find((p) => p && String(p.id) === pid);
+  if (rec) { rec.lastSyncAt = cur.at; rec.claims = cur.claims.length; rec.items = cur.items.length; peerSave() }
+  return { ok: true, peerId: pid, name: name, claimsAdded: cAdd, claimsUpdated: cUpd, itemsAdded: iAdd, itemsUpdated: iUpd, claims: cur.claims.length, items: cur.items.length };
+}
+/** 合并视图: 本地 + 所有 peer(带 src) */
+function allClaimsWithSrc() {
+  const out = listingClaims.map((c) => Object.assign({}, c, { src: 'local', srcName: machineInfo.name || '本机' }));
+  for (const pid of Object.keys(peerData)) {
+    const box = peerData[pid] || {};
+    const nm = box.name || (peers.find((p) => p && p.id === pid) || {}).name || pid;
+    for (const c of (box.claims || [])) out.push(Object.assign({}, c, { src: pid, srcName: nm }));
+  }
+  return out;
+}
+function allItemsWithSrc() {
+  const out = ifastItems.map((it) => Object.assign({}, it, { src: 'local', srcName: machineInfo.name || '本机' }));
+  for (const pid of Object.keys(peerData)) {
+    const box = peerData[pid] || {};
+    const nm = box.name || (peers.find((p) => p && p.id === pid) || {}).name || pid;
+    for (const it of (box.items || [])) out.push(Object.assign({}, it, { src: pid, srcName: nm }));
+  }
+  return out;
+}
+/* ★ 2026-10-24 修: 台账引擎初始化时 peerData 还没加载, 索引里只有本地 → 这里补一次 */
+try { claimIdxRebuild() } catch (e) {}
+
+/** peer 状态: 在线探测(2.5s) + 数据条数 */
+async function peerStatusList() {
+  const out = [];
+  for (const p of peers) {
+    if (!p || !p.url) continue;
+    const probe = await peerHttp(p.url + '/api/machine', 'GET', null, 2500);
+    const box = peerData[p.id] || {};
+    out.push({
+      id: p.id, name: p.name || (box.name || p.id), url: p.url, at: p.at || null,
+      online: !!(probe && probe.ok), lastSyncAt: p.lastSyncAt || box.at || null,
+      claims: (box.claims || []).length, items: (box.items || []).length,
+      error: probe && probe.ok ? null : (probe && (probe.error || (probe.json && probe.json.error))) || null,
+    });
+  }
+  return out;
+}
+
+/** 一次双向同步: 拉对方 → 存缓存; 再把我本地的推给对方 */
+async function peerSyncOne(rec) {
+  if (!rec || !rec.url) return { ok: false, error: '没有地址' };
+  const t0 = Date.now();
+  const pull = await peerHttp(rec.url + '/api/sync/export', 'GET', null, 30000);
+  if (!pull.ok) {
+    return {
+      ok: false, url: rec.url,
+      error: '拉取失败: ' + ((pull && (pull.error || (pull.json && pull.json.error))) || ('HTTP ' + (pull && pull.status))),
+    };
+  }
+  const imp = peerImportPayload(pull.json);
+  try { claimIdxRebuild() } catch (e) {}
+  const push = await peerHttp(rec.url + '/api/sync/import', 'POST', peerExportPayload(), 30000);
+  rec.lastSyncAt = now();
+  peerSave();
+  return {
+    ok: true, ms: Date.now() - t0,
+    pulled: { claims: (pull.json.claims || []).length, items: (pull.json.items || []).length, machine: pull.json.machine || null },
+    imported: imp,
+    pushed: push.ok ? (push.json || {}) : null,
+    pushError: push.ok ? null : ((push.error || (push.json && push.json.error)) || ('HTTP ' + push.status)),
+  };
+}
+
+/* 首次启动(台账为空)时, 从上架记录把历史台账恢复出来(幂等) */
+if (!listingClaims.length) {
+  try {
+    const r0 = claimsRebuild();
+    if (r0.total) console.log('[claims] 台账初始化: 从 ' + r0.fromRecords + ' 条上架记录恢复出 ' + r0.total + ' 条跨店凭证');
+  } catch (e) { console.error('[claims] 台账初始化失败: ' + ((e && e.message) || e)); }
+}
+
 /* ===== ★ 选品归档库 (2026-09-27) =====
  * 需求原话: 「上架器只负责记录和显示信息，导出信息等，加上一个导出当前所有商品信息…存起来，
  *   因为这些都是我们最终选出来的品，具有模板或者借鉴意义，方便后续根据这些品来找相应的品」。
@@ -762,13 +1602,34 @@ function listingStats() {
 const ARCHIVE_LIMIT_HARD = 20000;               // 商品库一次最多归档 2 万条(10 万条全量快照 ≈150MB, 不允许)
 const ARCHIVE_LIMIT_DEFAULT = 3000;
 const archiveKey = (site, asin) => String(asin || '').toUpperCase() + '@' + String(site || '').toLowerCase();
+/* ★ 多店铺隔离 (2026-10-06): 归档条目键带上店铺 → 店铺 A 归档过的品, 店铺 B 再归档不会覆盖它。
+ *   没有店铺(商品库来源 / 老数据)时退回原来的 asin@site 键, 老归档照旧可用、照旧能去重。 */
+const archiveKeyOf = (shop, site, asin) => { const s = shopClean(shop); return s ? (s + '|' + archiveKey(site, asin)) : archiveKey(site, asin) };
+/** 归档条目里"属于哪个店铺" —— 键里带的店铺优先(键是身份的来源), 没有就取条目字段 */
+const archiveShopOf = (it) => {
+  const k = String((it && it.key) || '');
+  const i = k.indexOf('|');
+  if (i > 0) return k.slice(0, i);
+  return shopClean(it && it.shop) || SHOP_UNKNOWN;
+};
+/** 截断批次数量 —— ★ 置顶/常驻批次(live)不许被裁掉(上架自动归档那条一直要在) */
+function archiveTrim() {
+  while (selectionArchive.batches.length > 200) {
+    let i = -1;
+    for (let k = selectionArchive.batches.length - 1; k > 0; k--) { if (!selectionArchive.batches[k].live) { i = k; break } }
+    if (i < 0) break;
+    selectionArchive.batches.splice(i, 1);
+  }
+}
 const aNum = (v) => { if (v == null || v === '') return null; const n = typeof v === 'number' ? v : parseFloat(String(v).replace(/[^\d.\-]/g, '')); return isNaN(n) ? null : n; };
 /** 归档条目统一形状 —— 两个来源(上架记录 / 商品库)都收敛成这一份, 导出表头才不会一半空一半有 */
 function archiveItemFromListing(r) {
   const f = r.fill || {}, p = r.panel || {}, v = r.variant || {};
   const kids = Array.isArray(v.children) ? v.children : [];
   const it = {
-    key: archiveKey(r.site, r.asin), src: 'listing', site: r.site || null, asin: r.asin || null,
+    key: archiveKeyOf(r.shop, r.site, r.asin), src: 'listing', site: r.site || null, asin: r.asin || null,
+    /* ★ 多店铺隔离 (2026-10-06): 归档条目带店铺 —— 界面按 shop → site 二级分组, 导出也带这一列 */
+    shop: shopClean(r.shop), shopUserId: r.shopUserId == null ? null : r.shopUserId,
     parentAsin: r.parentAsin || v.parentAsin || null,
     brand: r.brand || null, title: r.title || null, catPath: r.catPath || null,
     url: r.url || null, mainImage: r.mainImage || null,
@@ -792,6 +1653,7 @@ function archiveItemFromListing(r) {
 function archiveItemFromProduct(x) {
   const it = {
     key: archiveKey(x.site, x.asin), src: 'products', site: x.site || null, asin: String(x.asin || '').toUpperCase() || null,
+    shop: null, shopUserId: null,          // 商品库是"采过的池子", 没有店铺归属 → 归到「未分类」
     /* ★ 商品库里【没有】父 ASIN 字段 —— 别拿 rankParent 顶: 那是"父类目排名"(和 rankChild 一对),
      *   拿它当父ASIN 会往导出表里写一串排名数字(实测字段核对时发现)。宁可为空, 也不编。 */
     parentAsin: null,
@@ -814,6 +1676,86 @@ function archiveItemFromProduct(x) {
   it.marginPct = null;
   return it;
 }
+/* ★ 上架成功 → 自动写一条归档 (2026-10-06: 「上架记录同步到选品归档, 同样做好店铺数据隔离分类」)
+ * 落点 = 一个常驻批次(live=true)「上架归档(自动)」, 每次上架成功追加/更新一个键:
+ *   · 同一个品再次上架不新增条目 —— 更新 lastArchivedAt 并把 times/listCount +1(「保留每次上架」= 次数留痕)
+ *   · 键带店铺(archiveKeyOf) → 店铺之间不会互相覆盖
+ *   · blocked 的不写归档: 拦截 = 没上架 */
+const ARCHIVE_LISTING_BATCH_ID = 'listing-live';
+function archiveAddListing(r) {
+  if (!r || !r.asin || !r.site) return null;
+  if (isBlockedRow(r)) return null;
+  if ((r.status || '') !== 'listed') return null;
+  const it = archiveItemFromListing(r);
+  if (!it || !it.key) return null;
+  const at = now();
+  if (!selectionArchive.items || typeof selectionArchive.items !== 'object') selectionArchive.items = {};
+  const prev = selectionArchive.items[it.key];
+  selectionArchive.items[it.key] = Object.assign({}, it, {
+    firstArchivedAt: (prev && prev.firstArchivedAt) || at,
+    lastArchivedAt: at, times: ((prev && prev.times) || 0) + 1,
+    listedAt: r.listedAt || at,
+    firstListedAt: (prev && prev.firstListedAt) || r.listedAt || at,
+    listCount: ((prev && prev.listCount) || 0) + 1,
+  });
+  let b = selectionArchive.batches.find((x) => x.batchId === ARCHIVE_LISTING_BATCH_ID);
+  if (!b) {
+    b = {
+      batchId: ARCHIVE_LISTING_BATCH_ID, name: '上架归档(自动)', source: 'listing', live: true,
+      note: '每次上架成功自动写一条, 按店铺 + 站点隔离', createdAt: at, count: 0, bySite: {}, dupCount: 0, keys: [],
+    };
+    selectionArchive.batches.unshift(b);
+  }
+  if (!Array.isArray(b.keys)) b.keys = [];
+  if (b.keys.indexOf(it.key) < 0) {
+    b.keys.unshift(it.key);
+    const k = it.site || '?';
+    b.bySite[k] = (b.bySite[k] || 0) + 1;
+  }
+  b.count = b.keys.length;
+  archiveTrim();
+  save('selection-archive.json', selectionArchive, true);
+  return { key: it.key, shop: it.shop, site: it.site, asin: it.asin, at, batchId: b.batchId, first: !prev, times: selectionArchive.items[it.key].times };
+}
+/** 按 shop → site 二级分组(ERP 客户端的归档页就用这个渲染) */
+function archiveGroupByShop(list) {
+  const out = [], map = new Map();
+  for (const it of list) {
+    const sh = archiveShopOf(it);
+    let g = map.get(sh);
+    if (!g) { g = { shop: sh, count: 0, bySite: {}, sites: [] }; map.set(sh, g); out.push(g) }
+    const si = String(it.site || '?').toLowerCase();
+    g.count++; g.bySite[si] = (g.bySite[si] || 0) + 1;
+  }
+  const items = new Map();
+  for (const it of list) {
+    const sh = archiveShopOf(it);
+    const si = String(it.site || '?').toLowerCase();
+    const k = sh + '\u0000' + si;
+    if (!items.has(k)) items.set(k, []);
+    items.get(k).push(it);
+  }
+  out.forEach((g) => {
+    g.sites = Object.keys(g.bySite).sort().map((si) => ({ site: si, count: g.bySite[si], items: items.get(g.shop + '\u0000' + si) || [] }));
+    g.sites.sort((a, b) => b.count - a.count || a.site.localeCompare(b.site));
+  });
+  out.sort((a, b) => b.count - a.count || String(a.shop).localeCompare(String(b.shop)));
+  return out;
+}
+
+/** 只要 shop → site 的计数(轻量版, 给 /api/archive/list 用; 带条目的是 archiveGroupByShop) */
+function archiveShopTree(list) {
+  const m = new Map();
+  for (const it of list) {
+    const sh = archiveShopOf(it), si = String(it.site || '?').toLowerCase();
+    if (!m.has(sh)) m.set(sh, { shop: sh, count: 0, bySite: {} });
+    const g = m.get(sh); g.count++; g.bySite[si] = (g.bySite[si] || 0) + 1;
+  }
+  return [...m.values()].map((g) => Object.assign(g, {
+    sites: Object.keys(g.bySite).sort((a, b) => g.bySite[b] - g.bySite[a]).map((s) => ({ site: s, count: g.bySite[s] })),
+  })).sort((a, b) => b.count - a.count || String(a.shop).localeCompare(String(b.shop)));
+}
+
 /** 反算利润率 —— 口径与插件一致: (承受价 − 本币调整) × 到手比例 × 汇率 ÷ (采购+物流) − 1
  *  输入缺一个就不算(不猜), 返回 null。 */
 function archiveMarginPct(o) {
@@ -846,9 +1788,18 @@ function archiveStats() {
   const all = archiveFlatten(false), uniq = archiveFlatten(true);
   const bySite = {};
   uniq.forEach((it) => { const k = it.site || '?'; bySite[k] = (bySite[k] || 0) + 1; });
+  /* ★ 多店铺隔离 (2026-10-06): 归档也按店铺/店铺+站点计数 */
+  const byShop = {}, byShopSite = {};
+  uniq.forEach((it) => {
+    const sh = archiveShopOf(it), si = String(it.site || '?').toLowerCase();
+    byShop[sh] = (byShop[sh] || 0) + 1;
+    byShopSite[sh + '|' + si] = (byShopSite[sh + '|' + si] || 0) + 1;
+  });
   return {
     batches: selectionArchive.batches.length,
     items: all.length, unique: uniq.length, bySite,
+    byShop, byShopSite,
+    shops: Object.keys(byShop).sort((a, b) => byShop[b] - byShop[a]),
     lastArchivedAt: selectionArchive.batches.length ? selectionArchive.batches[0].createdAt : null,
   };
 }
@@ -868,6 +1819,10 @@ function archiveQuery(params) {
    *   空值一律视为"不限" —— 数字解析不出来也当不限, 不让一个手滑的空格把结果清空。 */
   const cat1 = String(params.cat1 || '').trim().toLowerCase();
   const tag = String(params.tag || '').trim();
+  /* ★ 多店铺隔离 (2026-10-06): shop 筛选 —— 不传 = 全部(归档是"库", 默认看全, 界面按店铺分组);
+   *   '*'=全部 / '未分类'|'none'=没有店铺归属的(商品库来源) / 名字=该店铺 */
+  const shopRaw = String(params.shop == null ? '' : params.shop).trim();
+  const shopSel = shopRaw ? shopParamOf(shopRaw) : { mode: 'all', shop: null };
   const n = (v) => { const x = Number(v); return (v == null || v === '' || isNaN(x)) ? null : x };
   const priceMin = n(params.priceMin), priceMax = n(params.priceMax);
   const marginMin = n(params.marginMin), marginMax = n(params.marginMax);
@@ -876,6 +1831,8 @@ function archiveQuery(params) {
   let list = archiveFlatten(dedup && !batchId);      // 指定批次时不去重(同列表接口)
   if (batchId) list = list.filter((it) => it.batchId === batchId);
   if (site) list = list.filter((it) => String(it.site || '').toLowerCase() === site);
+  if (shopSel.mode === 'none') list = list.filter((it) => archiveShopOf(it) === SHOP_UNKNOWN);
+  else if (shopSel.shop) list = list.filter((it) => archiveShopOf(it) === shopSel.shop);
   if (cat1) list = list.filter((it) => catOf1(it) === cat1);
   if (tag) list = list.filter((it) => (it.tags || []).indexOf(tag) >= 0);
   if (priceMin != null) list = list.filter((it) => it.price != null && Number(it.price) >= priceMin);
@@ -934,7 +1891,7 @@ function archiveAutoRun(opts) {
     createdAt: at, count: items.length, bySite, dupCount, keys: items.map((x) => x.key), auto: true,
   };
   selectionArchive.batches.unshift(batch);
-  while (selectionArchive.batches.length > 200) selectionArchive.batches.pop();
+  archiveTrim();          // ★ 用 archiveTrim: 常驻的「上架归档(自动)」批次不许被裁掉
   a.lastRunAt = at;
   save('selection-archive.json', selectionArchive, true);
   pushNotify('自动归档', '批次「' + batch.name + '」存了 ' + items.length + ' 个品' + (dupCount ? ' (其中 ' + dupCount + ' 个以前归档过)' : ''), '来源: 上架记录');
@@ -1042,7 +1999,9 @@ function archiveDistribution(params) {
 }
 const ARCHIVE_CSV_HEAD = ['站点', 'ASIN', '父ASIN', '品牌', '标题', '类目', '售价', '币种', '月销', '大排名', '小排名', '评分', '评论数',
   '配送', '变体数', '变体明细', '承受价', '反算利润率', '设定利润率', '采购成本', '物流成本', '重量kg', '重量原文', '库存', '备货天数',
-  '上架状态', '上架时间', '商品链接', '主图', '标签', '来源', '归档批次', '归档时间'];
+  '上架状态', '上架时间', '商品链接', '主图', '标签', '来源', '归档批次', '归档时间',
+  /* ★ 2026-10-06 多店铺隔离: 店铺列加在最后(不打乱已有列序) */
+  '店铺', '上架次数'];
 function archiveCsv(items) {
   const q = (v) => { if (v == null) return ''; const s = String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
   const asPct = (v) => (v == null || v === '' ? '' : Math.round(aNum(v) * 1000) / 10 + '%');
@@ -1050,7 +2009,8 @@ function archiveCsv(items) {
     it.sales30d, it.bsrShop, it.bsrCat, it.rating, it.reviews, it.fulfill, it.variantCount, it.variantText,
     it.bearPrice, asPct(it.marginPct), asPct(it.bearMargin),
     it.purchaseCost, it.logisticsCost, it.weightKg, it.weightText, it.stock, it.leadDays,
-    it.status, it.listedAt, it.url, it.mainImage, (it.tags || []).join('|'), it.src, it.batchName, it.archivedAt].map(q).join(','));
+    it.status, it.listedAt, it.url, it.mainImage, (it.tags || []).join('|'), it.src, it.batchName, it.archivedAt,
+    archiveShopOf(it), it.listCount != null ? it.listCount : (it.times != null ? it.times : '')].map(q).join(','));
   return ARCHIVE_CSV_HEAD.join(',') + '\n' + rows.join('\n');
 }
 
@@ -1122,11 +2082,16 @@ const COMPLETENESS_FIELDS = [
   { k: 'monthlySales',   label: '月销',     grp: 'panel',  req: false, get: (x) => x.monthlySales != null },
   { k: 'weight',         label: '重量',     grp: 'panel',  req: false, get: (x) => !!x.weight },
   { k: 'size',           label: '尺寸',     grp: 'panel',  req: false, get: (x) => !!x.size },
-  { k: 'mainSeller',     label: '主卖家',   grp: 'panel',  req: false, get: (x) => !!x.mainSeller },
+  /* ★ 2026-10-26 mainSeller 目前【没有任何采集代码】(links-collector.js 里 0 处引用),
+   *   所以它恒为 0% —— 挂 noCollector 标记, 报告/界面按"未接入"展示, 不要当成数据质量问题刷红。 */
+  { k: 'mainSeller',     label: '主卖家',   grp: 'panel',  req: false, get: (x) => !!x.mainSeller, noCollector: true },
   { k: 'sellerCountry',  label: '卖家国别', grp: 'panel',  req: false, get: (x) => !!x.sellerCountryCode },
   { k: 'trademarkCount', label: '商标数',   grp: 'panel',  req: false, get: (x) => x.trademarkCount != null },
 ];
 const COMPLETENESS_GRP_NAME = { list: '列表页', detail: '详情页', panel: '插件面板' };
+/* ★ 2026-10-26 软闸门阈值: 必得字段缺失率超过这个百分比 → 本轮标 incomplete(显红+可一键补采)。
+ *   原实现只区分"有缺失/没缺失", 一个字段缺 1 条也判失败, 20 万条里缺 3 条同样判失败 —— 噪声太大。 */
+const COMPLETENESS_SOFT_LIMIT = 20;     // %
 
 /** 对一批商品算覆盖率。caps 可显式指定启用了哪些能力; 不传就按数据自动识别。 */
 function collectCompleteness(items, caps) {
@@ -1149,22 +2114,35 @@ function collectCompleteness(items, caps) {
     }
     const miss = applies ? (n - have) : 0;
     return { k: f.k, label: f.label, grp: f.grp, req: f.req, applies: applies, have: have, miss: miss,
+             noCollector: !!f.noCollector,          // ★ 必须透传, 否则 notWired / soft 过滤失效
              rate: (applies && n) ? Math.round((have / n) * 100) : null, missing: missing };
   });
   const applicable = fields.filter((f) => f.applies);
   /* ⚠ 只把【必得字段】的缺失当问题; 参考字段(评分/评论/月销…)缺了只报数不判失败 */
   const bad = applicable.filter((f) => f.req && f.miss > 0).sort((a, b) => b.miss - a.miss);
-  const soft = applicable.filter((f) => !f.req && f.miss > 0).sort((a, b) => b.miss - a.miss);
+  const soft = applicable.filter((f) => !f.req && f.miss > 0 && !f.noCollector).sort((a, b) => b.miss - a.miss);
+  const notWired = applicable.filter((f) => f.noCollector);
+  /* ★ 2026-10-26 软闸门: 必得字段缺失【比例】> COMPLETENESS_SOFT_LIMIT% 才算 incomplete。
+   *   原口径是"有缺失就失败" —— 20 万条里缺 3 条也判失败, 噪声太大、没人会看。
+   *   样本 < 10 条不判(避免"采 3 条缺 1 条 = 33%"这种噪声)。 */
+  const severe = n >= 10 ? bad.filter((f) => (f.miss / n) * 100 > COMPLETENESS_SOFT_LIMIT) : [];
+  const level = (n > 0 && severe.length) ? 'incomplete' : 'ok';
   return {
     at: completenessAt(), total: n, caps: on,
     fields: fields,
-    ok: n > 0 && bad.length === 0,
+    ok: n > 0 && bad.length === 0,          // 严格口径(保留兼容): 任一必得字段有缺即 false
+    level: level,                            // ★ 软口径: ok / incomplete(缺得够多才算问题)
+    softLimitPct: COMPLETENESS_SOFT_LIMIT,
+    severe: severe.map((f) => ({ label: f.label, miss: f.miss, rate: f.rate })),
     bad: bad.map((f) => ({ label: f.label, miss: f.miss, rate: f.rate, missing: f.missing })),
     soft: soft.map((f) => ({ label: f.label, miss: f.miss, rate: f.rate })),
+    notWired: notWired.map((f) => f.label),   // ★ 未接入采集的字段(恒 0%, 不算数据质量问题)
     text: !n ? '本轮没有商品入库'
-      : (bad.length
-          ? '缺: ' + bad.slice(0, 8).map((f) => f.label + ' ' + f.miss + '/' + n).join(' · ')
-          : '必得字段全部齐全'),
+      : (level === 'incomplete'
+          ? '⚠ 缺失偏多: ' + severe.slice(0, 8).map((f) => f.label + ' ' + f.miss + '/' + n + '(' + f.rate + '%)').join(' · ')
+          : (bad.length
+              ? '轻微缺: ' + bad.slice(0, 8).map((f) => f.label + ' ' + f.miss + '/' + n).join(' · ')
+              : '必得字段全部齐全')),
   };
 }
 
@@ -1349,6 +2327,63 @@ async function activeCdpPort() {
   } catch (e) {}
   return CDP_PORT_USER;
 }
+/* ══════════ ★ 2026-10-21 采集前按需自动拉起采集浏览器 ══════════
+ * 背景(用户反复踩): 采集浏览器没开 → 提交采集 → 建立 CDP 会话 connect ECONNREFUSED → 任务 paused
+ *   「链接 17/26 条 → 卖家 0 个」。以前只能靠用户自己记得先开浏览器(或看门狗自动开, 但那个又会莫名弹窗)。
+ * 现在: 任何采集类接口真正开始前先探一下 CDP 端口, 不通就直接把采集浏览器拉起来并等它就绪,
+ *   只有拉不起来时才返回错误(并提示手动运行 启动采集浏览器.bat)。
+ * 与看门狗的分工: 看门狗负责"空闲时保持在线"(用户可关掉), 这里负责"要用的时候一定在"。
+ */
+function collectProfileDir() { return path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Edge', 'User'); }
+function collectExtDir() {
+  const cands = [process.env.ZYING_COLLECT_EXT, path.join(ROOT, 'zying-collector'), 'D:\\智赢erp\\zying-collector'];
+  for (const c of cands) { try { if (c && fs.existsSync(path.join(c, 'manifest.json'))) return c; } catch (e) {} }
+  return null;
+}
+/** 用 PowerShell Start-Process 拉起采集浏览器(独立进程树, 重启 ERP 不影响它; 参数与启动脚本一致) */
+async function startUserCollectBrowser() {
+  const exe = ['C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'].find((p2) => { try { return fs.existsSync(p2) } catch (e) { return false } });
+  if (!exe) return { ok: false, error: '找不到 Edge 可执行文件' };
+  const profile = collectProfileDir();
+  const ext = collectExtDir();
+  const args = ['--remote-debugging-port=' + CDP_PORT_USER, '--user-data-dir=' + profile,
+    '--no-first-run', '--no-default-browser-check', '--disable-features=DisableLoadExtensionCommandLineSwitch'];
+  if (ext) args.push('--load-extension=' + ext);
+  args.push('https://www.amazon.co.uk/');
+  const ps = 'Start-Process -FilePath ' + JSON.stringify(exe) + ' -ArgumentList @(' + args.map((a) => JSON.stringify(a)).join(',') + ')';
+  await new Promise((resolve) => {
+    require('child_process').execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 25000 }, () => resolve());
+  });
+  const t0 = Date.now();
+  while (Date.now() - t0 < 30000) {
+    await new Promise((r) => setTimeout(r, 800));
+    if (await browserSvc.probe(CDP_PORT_USER)) return { ok: true, started: true, port: CDP_PORT_USER, ext: !!ext };
+  }
+  return { ok: false, port: CDP_PORT_USER, error: '采集浏览器启动后 30 秒内 ' + CDP_PORT_USER + ' 仍未就绪(可能被安全软件拦了, 或该 profile 已被另一个没开调试端口的窗口占用)' };
+}
+let collectBootBusy = null, collectBootAt = 0;
+/** 采集前确保 CDP 可用; 返回 { ok, port, started, via?, error? } */
+async function ensureCollectBrowser(reason) {
+  let port = CDP_PORT_USER;
+  try { port = await activeCdpPort(); } catch (e) { port = CDP_PORT_USER; }
+  try { if (await browserSvc.probe(port)) return { ok: true, port, started: false }; } catch (e) {}
+  if (collectBootBusy) { const r = await collectBootBusy; return r && r.ok ? r : { ok: false, port, error: (r && r.error) || '正在启动中' }; }
+  if (Date.now() - collectBootAt < 45000) return { ok: false, port, error: '45 秒内刚尝试过启动, 端口仍不通 —— 请看 _dev-tools\\_keep_browser.log 或手动运行 启动采集浏览器.bat' };
+  collectBootAt = Date.now();
+  try { pushActivity('collect-browser', '采集前发现 CDP ' + port + ' 不通 → 自动拉起采集浏览器 (' + String(reason || '') + ')'); } catch (e) {}
+  collectBootBusy = (async () => {
+    if (port === CDP_PORT_USER) return await startUserCollectBrowser();
+    // 其它端口 → 交给本地浏览器服务(它自己知道该用哪个 profile)
+    try {
+      const r = await browserSvc.start({ port });
+      if (r && r.ok) return { ok: true, port, started: true, via: 'browser-service' };
+      return { ok: false, port, error: (r && r.error) || '本地浏览器服务启动失败' };
+    } catch (e) { return { ok: false, port, error: String((e && e.message) || e) }; }
+  })();
+  try { return await collectBootBusy; } finally { collectBootBusy = null; }
+}
+
 /* ★ 2026-09-28 桌面浏览器壳的启停(给 status?action=shell 复用; /api/browser/shell 那套逻辑不变)
  *   注意必须清掉 ELECTRON_RUN_AS_NODE: DSH 环境里带着它, 不清掉 electron.exe 会被当普通 node 跑,
  *   不报错但窗口永远不出来(实测踩过)。 */
@@ -1392,7 +2427,7 @@ function shellEnsureStop() {
     require('child_process').execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 20000 }, (e, out) => resolve(e ? -1 : parseInt(String(out).trim(), 10) || 0));
   });
 }
-const CDP_SITE_CODE = { 'co.uk': 'uk', com: 'us', de: 'de', fr: 'fr', it: 'it', es: 'es', 'co.jp': 'jp', ca: 'ca', in: 'in', 'com.au': 'au', 'com.mx': 'mx', 'com.br': 'br', nl: 'nl', se: 'se', pl: 'pl', cn: 'cn' };
+const CDP_SITE_CODE = { 'co.uk': 'uk', com: 'us', de: 'de', fr: 'fr', it: 'it', es: 'es', 'co.jp': 'jp', ca: 'ca', in: 'in', 'com.au': 'au', 'com.mx': 'mx', 'com.br': 'br', nl: 'nl', se: 'se', pl: 'pl' };
 // 站点代码 → amazon 域名后缀 (含自定义站点: au/mx/br/nl/se/pl/tr/ae/sa/sg 等)
 function siteToHostSuffix(site) {
   const map = { uk: 'co.uk', us: 'com', jp: 'co.jp', au: 'com.au', mx: 'com.mx', br: 'com.br', sg: 'com.sg', tr: 'com.tr', ae: 'ae', sa: 'sa', nl: 'nl', se: 'se', pl: 'pl', de: 'de', fr: 'fr', it: 'it', es: 'es', ca: 'ca', in: 'in' };
@@ -1424,14 +2459,6 @@ function pageRank(u) {
   if (/^http:\/\/127\.0\.0\.1:5\d{4}/.test(u)) return 4;
   return 2;
 }
-async function browserPages(port) {
-  const p = port || (await activeCdpPort());
-  const all = await browserSvc.listPages(p);
-  return all
-    .filter((x) => x.type === 'page' && !/^(about:blank|devtools:|chrome:|edge:)/.test(x.url || ''))
-    .sort((a, b) => (pageRank(a.url) - pageRank(b.url)) || (String(a.url).length - String(b.url).length));
-}
-
 function cdpGetTabs() {
   return new Promise((resolve, reject) => {
     activeCdpPort().then((port) => {
@@ -1564,13 +2591,13 @@ async function cdpShopListCollect(url, opts = {}) {
   for (let pg = 1; pg <= maxPages && items.length < maxItems * 2; pg++) {
     if (collectStopRequested()) { items.push({ asin: '停止', title: '用户已停止采集' }); break; }
     const pgUrl = pg === 1 ? url : url + (url.includes('?') ? '&' : '?') + 'page=' + pg;
+    /* ★ 站点一致性校验(2026-10-04, 按《优化文档.md》§5.2): 本函数自己 Page.navigate,
+     *   不经过 cdpSetGlowAddress 主挂载点 → 这里补一次(并行采集靠 cdpCheckSiteLocale 内部去重) */
+    try { await cdpCheckSiteLocale(send, pgUrl, site); } catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
     await send('Page.navigate', { url: pgUrl });
     await new Promise((r) => setTimeout(r, 8000));
     for (let i = 0; i < 5; i++) { await send('Runtime.evaluate', { expression: `window.scrollTo(0, ${(i + 1) * 4000})` }); await new Promise((r) => setTimeout(r, 1000)); }
     await new Promise((r) => setTimeout(r, 1500));
-    /* ★ 2026-10-04 站点一致性校验: 本函数自己导航、不经过 cdpSetGlowAddress, 所以在这里补做一次
-     *   (与列表直采同一套; 货币不符会自动切换并回读确认, 任何失败只告警、不影响采集) */
-    if (pg === 1) { try { await cdpCheckSiteLocale(send, pgUrl, site); } catch (e) { /* 不影响采集 */ } }
     const r = await send('Runtime.evaluate', {
       expression: `(() => {
         ${linksCollector.READ_RANKS_FN}
@@ -1766,6 +2793,9 @@ async function cdpPanelCollect(url, maxItems = 5) {
   const domain = site === 'uk' ? 'co.uk' : site === 'us' ? 'com' : site;
 
   // 1. 店铺页提取 ASIN
+    /* ★ 站点一致性校验(2026-10-04, 按《优化文档.md》§5.2): 本函数自己 Page.navigate,
+     *   不经过 cdpSetGlowAddress 主挂载点 → 这里补一次(并行采集靠 cdpCheckSiteLocale 内部去重) */
+    try { await cdpCheckSiteLocale(send, url, site); } catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
   await send('Page.navigate', { url });
   await new Promise((r) => setTimeout(r, 8000));
   for (let i = 0; i < 6; i++) {
@@ -1773,8 +2803,6 @@ async function cdpPanelCollect(url, maxItems = 5) {
     await new Promise((r) => setTimeout(r, 1000));
   }
   await new Promise((r) => setTimeout(r, 1500));
-  /* ★ 2026-10-04 站点一致性校验: 本函数自己导航、不经过 cdpSetGlowAddress, 在这里补做一次 */
-  try { await cdpCheckSiteLocale(send, url, site); } catch (e) { /* 不影响采集 */ }
   const r1 = await send('Runtime.evaluate', {
     expression: `(() => {
       const seen = new Set(); const out = [];
@@ -1932,6 +2960,9 @@ async function cdpDpBrand(url, maxPages = 5) {
   const host = 'www.amazon.' + siteToHostSuffix(site);
 
   // 1. 详情页提取品牌链接
+    /* ★ 站点一致性校验(2026-10-04, 按《优化文档.md》§5.2): 本函数自己 Page.navigate,
+     *   不经过 cdpSetGlowAddress 主挂载点 → 这里补一次(并行采集靠 cdpCheckSiteLocale 内部去重) */
+    try { await cdpCheckSiteLocale(send, url, site); } catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
   await send('Page.navigate', { url });
   await new Promise((r) => setTimeout(r, 10000));
   const r1 = await send('Runtime.evaluate', {
@@ -1986,6 +3017,271 @@ async function cdpDpBrand(url, maxPages = 5) {
   }
   return { brandName: br.brandName, brandLink: listUrl, detailUrl: url, site, products };
 }
+
+/* ===== 知产查重: 链接 → 品牌 + 站点 (独立标签页, 不打断正在跑的采集) ===== */
+
+/** 从 Amazon 商品链接里拆出站点与 ASIN —— 纯字符串解析, 不需要浏览器 */
+const AMZ_HOST_RE = /amazon\.(com\.au|co\.uk|com\.mx|com\.br|co\.jp|com|de|fr|it|es|ca|in|nl|se|pl|ae|sa|sg|tr)(?=[\/?#]|$)/i;
+function parseAmzUrl(raw) {
+  const url = String(raw || '').trim();
+  const m = url.match(AMZ_HOST_RE);
+  const suffix = m ? m[1].toLowerCase() : null;
+  const site = suffix && CDP_SITE_CODE[suffix] ? CDP_SITE_CODE[suffix] : null;
+  const am = url.match(/\/(?:dp|gp\/product|gp\/aw\/d|gp\/offer-listing)\/([A-Za-z0-9]{10})/);
+  return { url, asin: am ? am[1].toUpperCase() : null, site, siteId: site ? 'amazon.' + siteToHostSuffix(site) : null };
+}
+
+/** 开一个临时标签页读详情页的品牌名 → 读完就关, 不碰用户的采集标签页 */
+async function cdpReadBrandSite(url, waitMs = 20000) {
+  const { targetId, wsUrl } = await cdpCreateTab('about:blank');
+  let handler = null;
+  try {
+    handler = await cdpConnect(wsUrl);
+    const send = handler.send;
+    try { await send('Page.enable'); } catch (e) { /* 老版本 CDP 可能不支持, 忽略 */ }
+    await send('Page.navigate', { url });
+    const t0 = Date.now();
+    while (Date.now() - t0 < waitMs) {                       // 等详情页骨架出现
+      await new Promise((r) => setTimeout(r, 800));
+      /* 一次求值同时判三件事 —— 别死等 20s:
+       *   READY 详情页骨架在 → 往下读品牌
+       *   NOTFOUND 页面不存在(ASIN/站点对不上) → 立即返回, 报清楚原因
+       *   BLOCKED 被反爬拦(验证码) → 立即返回, 提示重试 */
+      const chk = await send('Runtime.evaluate', {
+        expression: `(() => {
+          const t = document.title || '';
+          const body = document.body ? document.body.innerText.slice(0, 400) : '';
+          const all = t + ' ' + body;
+          if (/page not found|not a functioning page|looking for something\\?/i.test(all)) return 'NOTFOUND';
+          if (/captcha|robot check|enter the characters you see below|api-services-support@amazon/i.test(all)) return 'BLOCKED';
+          if (document.getElementById('productTitle') || document.getElementById('bylineInfo') || document.getElementById('ASIN')) return 'READY';
+          return 'WAIT';
+        })()`,
+        returnByValue: true,
+      });
+      const st = chk && chk.result && chk.result.value;
+      if (st === 'READY') break;
+      if (st === 'NOTFOUND') return { brand: '', asin: '', title: '', pageError: 'not-found' };
+      if (st === 'BLOCKED') return { brand: '', asin: '', title: '', pageError: 'blocked' };
+    }
+    await new Promise((r) => setTimeout(r, 600));            // 让 byline 渲染完
+    const r = await send('Runtime.evaluate', {
+      expression: `(() => {
+        const txt = (el) => el ? (el.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+        const clean = (s) => String(s || '')
+          .replace(/^(visit\\s+the|besuche\\s+den|brand\\s*:?|marke\\s*:?|marque\\s*:?|marca\\s*:?)\\s*/i, '')
+          .replace(/\\s+(store|shop|markenshop|boutique|tienda)$/i, '')
+          .replace(/\\s+/g, ' ')
+          .trim();
+        let brand = '';
+        const cands = ['#bylineInfo', '#bylineInfo_feature_div a', 'a#bylineInfo',
+          '#bylineInfo_feature_div span.author', 'tr.po-brand td.a-span9 span',
+          '#productOverview_feature_div tr.po-brand span', '#brand'];
+        for (const sel of cands) {
+          const v = clean(txt(document.querySelector(sel)));
+          if (v) { brand = v; break; }
+        }
+        const asinEl = document.querySelector('#ASIN, input#ASIN');
+        return JSON.stringify({
+          brand,
+          asin: asinEl ? String(asinEl.value || '').trim() : '',
+          title: txt(document.querySelector('#productTitle')).slice(0, 200),
+        });
+      })()`,
+      returnByValue: true,
+    });
+    const out = JSON.parse((r && r.result && r.result.value) || '{}');
+    return { brand: out.brand || '', asin: out.asin || '', title: out.title || '' };
+  } finally {
+    try { if (handler && handler.ws) handler.ws.close(); } catch (e) { /* ignore */ }
+    try { await cdpCloseTab(targetId); } catch (e) { /* ignore */ }
+  }
+}
+
+/* ===== 知产查重: 店铺/列表链接 → 采集 站点 + 品牌 (不写商品库, 只为查商标) ===== */
+
+/** 判断一条链接是「列表/店铺页」还是「单个商品详情页」 */
+/** 品牌名清洗: 卡片上的品牌链接文字常混着界面词(如 "XXX 登录"), 不清掉会拿去做无效商标查询 */
+function cleanBrand(s) {
+  let b = String(s || '').replace(/\s+/g, ' ').trim();
+  if (!b) return '';
+  b = b.replace(/^(Brand|Marke|Marque|Marca)\s*[:：]\s*/i, '').trim();
+  b = b.replace(/\s*(登录|登陆|注册|Login|Sign\s*in|Sign\s*up|Anmelden|Anmeldung|Registrieren|Se\s*connecter|Accedi|Iniciar\s*sesi[oó]n)\s*$/i, '').trim();
+  b = b.replace(/\s*(Store|Shop|Markenshop)$/i, '').trim();
+  if (b.length > 60) b = b.slice(0, 60).trim();
+  return b;
+}
+
+function classifyAmzLink(raw) {
+  const url = String(raw || '').trim();
+  if (!url) return null;
+  const p = parseAmzUrl(url);
+  const isList = /[?&]me=|[?&]marketplaceID=|marketplaceID=|\/s\?|\/stores\/|\/shop\/|\/seller\//i.test(url);
+  return { url, ...p, isList: isList && !/\/dp\//i.test(url) };
+}
+
+/**
+ * 打开店铺/商品列表页, 翻页抓「ASIN + 卡片品牌 + 插件面板品牌」。
+ * @param {string} url 店铺列表页地址 (如 https://www.amazon.de/s?me=XXXX&marketplaceID=...)
+ * @param {Object} opts { pages:0=全部, onPage }
+ * @returns {Promise<{site,siteId,host,pages,items:Array,stopped:boolean,note:string}>}
+ */
+async function cdpListBrands(url, opts = {}) {
+  const p0 = parseAmzUrl(url);
+  const site = p0.site || 'de';
+  const siteId = p0.siteId || ('amazon.' + siteToHostSuffix(site));
+  const want = Number(opts.pages);
+  const cap = (isFinite(want) && want > 0) ? Math.min(60, Math.floor(want)) : 60;   // 0/空 = 采集全部(上限 60 页作保险)
+
+  const { targetId, wsUrl } = await cdpCreateTab('about:blank');
+  let handler = null;
+  const items = [];
+  const seen = new Set();
+  let pages = 0;
+  let stopped = false;
+  let note = '';
+  try {
+    handler = await cdpConnect(wsUrl);
+    const send = handler.send;
+    try { await send('Page.enable'); } catch (e) { /* ignore */ }
+
+    /* ★★ 必须先把这个站点的配送国家/邮编设好, 否则 Amazon 会把「卖家搜索页 /s?me=xxx」直接跳回首页
+     *   (实测: Deliver to China 时 DE/UK 的 ?me= 全跳首页; 设成 Berlin 10115 后同一链接立刻出 64 个商品)。
+     *   这是本功能能不能用的分水岭 —— 关键词搜索不受影响, 所以单看关键词会误判成"链接没问题"。 */
+    try { await cdpSetGlowAddress(send, url, site); } catch (e) { console.error('[ip-list] 设置站点配送地址失败(继续):', e && e.message); }
+
+    for (let pg = 1; pg <= cap; pg++) {
+      if (collectStopRequested() || (opts.shouldStop && opts.shouldStop())) { stopped = true; note = '用户已停止'; break; }
+      const pgUrl = pg === 1 ? url
+        : (/[?&]page=\d+/.test(url) ? url.replace(/([?&])page=\d+/, '$1page=' + pg)
+          : url + (url.includes('?') ? '&' : '?') + 'page=' + pg);
+
+      /* ★ 站点一致性(配送国家/货币)必须先修正: 未设目标国时 Amazon 会把 /s?me=<卖家> 这类
+       *   卖家搜索页直接跳回首页(实测: Deliver to China 时 DE/UK 的 ?me= 全跳首页, 关键词搜索正常)。
+       *   与 cdpShopListCollect 同一做法。 */
+      try { await cdpCheckSiteLocale(send, pgUrl, site); } catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
+      await send('Page.navigate', { url: pgUrl });
+      await new Promise((r) => setTimeout(r, 6500));
+      /* Cookie 同意墙: 点「Accept」是表单 POST 到首页, 会把原 URL 丢掉 → 同意完必须再跳一次目标页 */
+      let consentFixed = false;
+      for (let k = 0; k < 2; k++) {
+        const has = await send('Runtime.evaluate', { expression: `!!document.querySelector('#sp-cc-accept')`, returnByValue: true });
+        if (!(has && has.result && has.result.value)) break;
+        await send('Runtime.evaluate', { expression: `document.querySelector('#sp-cc-accept').click()` });
+        await new Promise((r) => setTimeout(r, 3000));
+        consentFixed = true;
+      }
+      if (consentFixed) {
+        await send('Page.navigate', { url: pgUrl });
+        await new Promise((r) => setTimeout(r, 7000));
+      }
+      // 列表页懒加载: 滚几次让卡片全部渲染
+      for (let i = 0; i < 4; i++) {
+        await send('Runtime.evaluate', { expression: `window.scrollTo(0, ${(i + 1) * 3000})` });
+        await new Promise((r) => setTimeout(r, 700));
+      }
+      await new Promise((r) => setTimeout(r, 1200));
+
+      const r = await send('Runtime.evaluate', {
+        expression: `(() => {
+          const out = [];
+          const seen = new Set();
+          document.querySelectorAll('div[data-asin]').forEach((el) => {
+            const asin = el.getAttribute('data-asin');
+            if (!asin || !/^[A-Z0-9]{10}$/.test(asin)) return;
+            if (!el.querySelector('a[href*="/dp/"]')) return;
+            if (seen.has(asin)) return; seen.add(asin);
+            const t = el.querySelector('h2 span, h2');
+            let brand = '';
+            el.querySelectorAll('a[href*="field-keywords="]').forEach((a) => {
+              if (brand) return;
+              const bt = (a.textContent || '').trim();
+              if (bt && bt.length < 60) brand = bt;
+            });
+            // 卡片里偶有 "Marke: X" / "Brand: X" 行
+            if (!brand) {
+              const m = (el.textContent || '').match(/(?:Marke|Brand|Marque|Marca|Marca:)\\s*[:：]\\s*([^|\\n]{2,40})/i);
+              if (m) brand = m[1].trim();
+            }
+            // 智赢插件面板文本(卡片上就有) → 后端 parsePanelText 里也有品牌
+            let panelTxt = '';
+            el.querySelectorAll('[class*="zying"], [class*="zy-"], [id*="zying"]').forEach((n) => {
+              const nt = (n.innerText || n.textContent || '').replace(/\\s+/g, ' ').trim();
+              if (/ASIN\\s*[:：]/.test(nt) && nt.length > panelTxt.length) panelTxt = nt;
+            });
+            out.push({ asin, title: t ? t.textContent.trim().slice(0, 140) : '', brand, panelTxt });
+          });
+          const nx = document.querySelector('.s-pagination-next');
+          const hasNext = !!(nx && !nx.classList.contains('s-pagination-disabled') && nx.getAttribute('aria-disabled') !== 'true');
+          const notFound = /page not found|not a functioning page/i.test(document.title || '');
+          const blocked = /captcha|robot check|enter the characters you see below/i.test((document.title || '') + ' ' + (document.body ? document.body.innerText.slice(0, 300) : ''));
+          return JSON.stringify({ items: out, hasNext, notFound, blocked, pageUrl: location.href });
+        })()`, returnByValue: true,
+      });
+      let pageData = {};
+      try { pageData = JSON.parse((r && r.result && r.result.value) || '{}'); } catch (e) { pageData = {}; }
+
+      if (pageData.notFound) { note = '第 ' + pg + ' 页 404 (链接无效?)'; break; }
+      if (pageData.blocked) { note = '被 Amazon 反爬拦(验证码)'; break; }
+
+      const fresh = (pageData.items || []).filter((x) => !seen.has(x.asin));
+      fresh.forEach((x) => seen.add(x.asin));
+      pages = pg;
+      if (fresh.length) {
+        fresh.forEach((x) => {
+          let brand = x.brand || '';
+          if (!brand && x.panelTxt) {
+            try { const pd = linksCollector.parsePanelText(x.panelTxt); if (pd && pd.brand) brand = pd.brand; } catch (e) { /* ignore */ }
+          }
+          brand = cleanBrand(brand);
+          items.push({ asin: x.asin, title: x.title || '', brand: brand || '', brandFrom: brand ? (x.brand ? '列表卡片' : '插件面板') : '' });
+        });
+      }
+      if (opts.onPage) { try { opts.onPage({ page: pg, added: fresh.length, total: items.length }); } catch (e) { /* ignore */ } }
+      if (!fresh.length) {
+        const onHome = /\/(\?|$)/.test((pageData.pageUrl || '').replace(/^https:\/\/[^/]+/, '') || '/');
+        note = note || (onHome ? '被 Amazon 跳回了首页(卖家搜索链接可能失效, 或站点配送国家没设上)' : ('第 ' + pg + ' 页没有新商品, 停止翻页'));
+        break;
+      }
+      if (pageData.hasNext === false) { note = '已是最后一页'; break; }
+      if (pg >= cap) { note = '到达设定的页数上限'; break; }
+    }
+  } finally {
+    try { if (handler && handler.ws) handler.ws.close(); } catch (e) { /* ignore */ }
+    try { await cdpCloseTab(targetId); } catch (e) { /* ignore */ }
+  }
+  return { site, siteId, pages, items, stopped, note };
+}
+
+/* ===== 知产查重: 列表查重后台任务 (翻页慢 + 每个品牌要串行查官方库, 不能同步等) ===== */
+let ipListJob = null;
+
+/* ★ 2026-10-21 列表查重结果落盘 —— 原来只存在内存, ERP 一重启(升级/重启后端)刚跑完的几百个
+ *   品牌结论就全没了(用户实打实踩到: 241 条"无冲突"重启后消失)。现在每完成一个品牌就写盘,
+ *   进程启动时读回(状态标成已完成), 界面照样能点开看商品。 */
+const IP_LIST_JOB_FILE = path.join(DATA, 'ip-list-job.json');   // ★ server.js 里数据目录叫 DATA(不是 DATA_DIR)
+function ipListJobSave() {
+  try { if (ipListJob) fs.writeFileSync(IP_LIST_JOB_FILE, JSON.stringify(ipListJob), 'utf8'); } catch (e) { /* 落盘失败不影响任务 */ }
+}
+function ipListJobLoad() {
+  try {
+    // ★ 去掉 BOM: 手工/其它工具写出来的 JSON 可能带 BOM, JSON.parse 会直接抛错(实测踩到)
+    const j = JSON.parse(fs.readFileSync(IP_LIST_JOB_FILE, 'utf8').replace(/^\uFEFF/, ''));
+    if (j && Array.isArray(j.results)) { j.running = false; j.stopFlag = false; j.stage = 'done'; return j; }
+  } catch (e) { /* 没有历史任务 */ }
+  return null;
+}
+
+ipListJob = ipListJobLoad();      // ★ 启动时把上次的任务读回来(重启不丢结果)
+const ipListSummary = () => (ipListJob ? {
+  id: ipListJob.id, running: ipListJob.running, startedAt: ipListJob.startedAt, finishedAt: ipListJob.finishedAt,
+  stage: ipListJob.stage, current: ipListJob.current, pages: ipListJob.pages,
+  productCount: ipListJob.productCount, brandCount: ipListJob.brandCount,
+  doneBrands: ipListJob.results.length,
+  progress: ipListJob.brandCount ? Math.round(100 * ipListJob.results.length / ipListJob.brandCount) : 0,
+  summary: ipListJob.summary, errors: ipListJob.errors,
+  lists: ipListJob.lists, results: ipListJob.results,
+} : null);
 
 // 解析商品上架日期 (firstAvailable: "2023年5月12日" / "2023-05-12" / "12 May 2023" / "May 12, 2023" 等)
 function parseFirstAvailable(s) {
@@ -2642,8 +3938,7 @@ function mergeZyApiRecord(it, rec) {
 
 /* API 采集任务状态 (长任务: 全库回填要十几分钟, 同步 HTTP 会超时 —— 与 brand-batch 同一教训) */
 let zyApiJob = null;
-function apiJobPublic() {
-  if (!zyApiJob) return { running: false, total: 0 };
+function apiJobPublic() {  if (!zyApiJob) return { running: false, total: 0 };
   const j = zyApiJob;
   return {
     running: j.running, startedAt: j.startedAt, finishedAt: j.finishedAt || null,
@@ -2652,6 +3947,69 @@ function apiJobPublic() {
     ms: j.ms, perItemMs: j.perItemMs, fieldHits: j.fieldHits, samples: j.samples,
     stopped: j.stopped, error: j.error, lastLog: j.lastLog || null,
   };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * BG 检测（Brand Gating）辅助函数 —— 接口语义见 /api/bg/check 路由处的大段注释
+ * ══════════════════════════════════════════════════════════════════════════ */
+let bgJob = null;
+function bgJobPublic() {
+  if (!bgJob) return { running: false, total: 0 };
+  const j = bgJob;
+  return {
+    running: j.running, startedAt: j.startedAt, finishedAt: j.finishedAt || null,
+    aid: j.aid, abbr: j.abbr || null, accountName: j.accountName || null, mode: j.mode,
+    total: j.total, done: j.done, got: j.got, failed: j.failed,
+    byStatus: j.byStatus || {}, skippedFresh: j.skippedFresh || 0,
+    stopped: j.stopped, error: j.error, lastError: j.lastError || null, samples: j.samples || [],
+  };
+}
+/** 拉授权账号列表（flag=9 = 已被禁用，实测后端会明确回"亚马逊帐户 X 已被禁用！"）
+ *  ★ 2026-11-08 加 60s 缓存: 智赢接口有频率限制，实测连续调用会回「请求过于频繁，请稍后重试」。
+ *    账号列表变化很慢(只有重新授权才变)，缓存 60s 足够；传 force 可强刷。 */
+let _bgAccCache = { at: 0, list: null };
+async function bgAccounts(force) {
+  const nowMs = Date.now();
+  if (!force && _bgAccCache.list && (nowMs - _bgAccCache.at) < 60000) return _bgAccCache.list;
+  const d = await zyApi.call('/CmdHandler?cmd=amazon_acc.sum', { page: 1, pageSize: 100 });
+  const list = (d && d.list && d.list.data) || (d && d.data && d.list && d.data.list.data) || [];
+  const out = list.map((a) => ({
+    id: a.id, abbr: a.abbr || null, name: a.name || a.shop || null, flag: a.flag,
+    usable: a.flag !== 9,
+  }));
+  _bgAccCache = { at: nowMs, list: out };
+  return out;
+}
+function bgRawRestriction(aid, asin) {
+  return zyApi.call('/CmdHandler?cmd=amazon_hub_restriction.get', { aid: aid, asin: asin });
+}
+/** 原始响应 → 五态。判据与插件 content.js 完全一致，解析不到一律 ERROR */
+function bgParseStatus(resp, asin) {
+  const d = (resp && typeof resp === 'object' && resp.data !== undefined) ? resp.data : resp;
+  let arr = [];
+  if (Array.isArray(d)) arr = d;
+  else if (d && Array.isArray(d.result)) arr = d.result;
+  else if (d && d.result) arr = [d.result];
+  let v = '';
+  if (arr.length) {
+    const hit = arr.find((x) => !(x && x.asin) || String(x.asin).toUpperCase() === String(asin).toUpperCase()) || arr[0];
+    v = (hit && hit.result) || '';
+  } else if (typeof d === 'string') v = d;
+  else if (typeof resp === 'string') v = resp;
+  const u = String(v == null ? '' : v).trim().toUpperCase();
+  if (u === 'NOT_ELIGIBLE') return 'NOT_ELIGIBLE';
+  if (u === 'APPROVAL_REQUIRED') return 'APPROVAL_REQUIRED';
+  if (u === 'ASIN_NOT_FOUND') return 'ASIN_NOT_FOUND';
+  if (u === 'ERROR') return 'ERROR';
+  if (u === 'OK' || u === 'ELIGIBLE' || u === 'NORMAL') return 'OK';
+  if (u) return u;
+  if (typeof resp === 'boolean') return resp ? 'NOT_ELIGIBLE' : 'OK';
+  if (d && typeof d === 'object' && d.isRestricted !== undefined) return d.isRestricted ? 'NOT_ELIGIBLE' : 'OK';
+  if (d && typeof d === 'object' && d.restricted !== undefined) return d.restricted ? 'NOT_ELIGIBLE' : 'OK';
+  return 'ERROR';
+}
+async function bgCheckOne(aid, asin) {
+  return bgParseStatus(await bgRawRestriction(aid, asin), asin);
 }
 
 /**
@@ -2704,6 +4062,55 @@ function titleLooksSuspect(item) {
   return false;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★ 2026-10-29 族键增强：品牌内「主导产品线前缀」聚类
+ *
+ * 问题(用户实测): B0HKMWYDW9（DCYBDL 的汽车仪表台盖板）在商品管理里是一大片行。
+ *   查下来这个 listing【没有 twister 变体】(详情页 #twister_feature_div 空、无 swatch/下拉),
+ *   同一品牌在 DE 站有 60 个独立 listing —— 按【车型】各开一个 ASIN:
+ *     "Auto Armaturenbrett Abdeckung für Toyota Yaris Cross 2020-…"
+ *     "Auto Armaturenbrett Abdeckung für Honda Civic 2023…"
+ *   而旧族键 titleCoreOf 取【前 7 个词】→ 车型词落在第 4~7 词 → 60 个 listing 变成 60 个族,
+ *   等于完全没收纳。
+ *
+ * 做法: 按 site|brand 统计"标题前 3 个稳定词"的分布;
+ *   若某个前缀占该品牌有效行 ≥60% 且至少 4 行 → 认定为该品牌的【产品线前缀】;
+ *   命中产品线的商品共用族键 'c2:site|brand|前缀'，未命中的仍回退老的 7 词键。
+ *   注意: 只影响"标题推测族"(variantSrc=title/card)。twister 权威族与人工覆盖优先于它。
+ *   rebuild-variant-groups 会按族内差异词自动判 familyKind:
+ *     差异只在颜色/尺寸等变体词 → 'variant'(真变体)
+ *     差异在车型/型号等词       → 'sibling'(同款多型号铺货)  ← DCYBDL 这类
+ * ══════════════════════════════════════════════════════════════════════════ */
+let _linePrefixCache = null, _linePrefixAt = 0, _linePrefixLen = -1;
+function brandLinePrefixes() {
+  const now = Date.now();
+  if (_linePrefixCache && (now - _linePrefixAt) < 120000 && _linePrefixLen === products.length) return _linePrefixCache;
+  const byBrand = new Map();          // "site|brand" -> Map(prefix3 -> count)
+  let totalRows = 0;
+  for (const x of products) {
+    if (!x || !x.asin || titleLooksSuspect(x)) continue;
+    const core = titleCoreOf(x.title);
+    const toks = core ? core.split(' ') : [];
+    if (toks.length < 3) continue;
+    const k = String(x.site || '').toLowerCase() + '|' + String(x.brand || '').toLowerCase().trim();
+    const p3 = toks.slice(0, 3).join(' ');
+    let m = byBrand.get(k);
+    if (!m) { m = new Map(); byBrand.set(k, m); }
+    m.set(p3, (m.get(p3) || 0) + 1);
+    totalRows++;
+  }
+  const out = new Map();
+  for (const [k, m] of byBrand) {
+    let best = null, bestN = 0, total = 0;
+    for (const [p, n] of m) { total += n; if (n > bestN) { best = p; bestN = n; } }
+    /* 认定门槛: 至少 4 行 且 该前缀占本品牌有效行 ≥60%。
+     * 门槛太松会把一个小品牌的两条不同产品线并成一族；太严又收纳不了。 */
+    if (best && bestN >= 4 && total > 0 && (bestN / total) >= 0.6) out.set(k, best);
+  }
+  _linePrefixCache = out; _linePrefixAt = now; _linePrefixLen = products.length;
+  return out;
+}
+
 /** 该条目自己声明的变体数量(面板"变体：N个" / twister 选项数 / variations) */
 function ownVariantCount(item) {
   const v = item && item.variants;
@@ -2740,6 +4147,15 @@ function computeVariantKey(item) {
   const brand = String(item.brand || '').toLowerCase().trim();
   const core = titleCoreOf(item.title);
   if (!core) { item.variantKey = null; item.variantSrc = 'none'; return item; }
+  /* ★ 2026-10-29 优先按「品牌主导产品线前缀」归族(见 brandLinePrefixes 上方说明):
+   *   解决"同款按车型/型号各开一个 listing"时前 7 词键把每个都算成独立族的问题。 */
+  const p3 = core.split(' ').slice(0, 3).join(' ');
+  const lineP = brandLinePrefixes().get(site + '|' + brand);
+  if (lineP && p3 === lineP) {
+    item.variantKey = 'c2:' + site + '|' + brand + '|' + lineP;
+    item.variantSrc = item.ownVariants > 0 ? 'card' : 'title';
+    return item;
+  }
   item.variantKey = 'c:' + site + '|' + brand + '|' + core;
   item.variantSrc = item.ownVariants > 0 ? 'card' : 'title';
   return item;
@@ -3423,19 +4839,13 @@ async function cdpEnrichOne(send, host, it, filter) {
 }
 
 // ===== 列表页公共工具: glow 地址设置 + 卡片提取 JS (list-direct / list-filtered 共用) =====
-const SITE_ZIP = { uk: ['GB', 'SW1A1AA'], us: ['US', '10001'], de: ['DE', '10115'], fr: ['FR', '75001'], it: ['IT', '00100'], es: ['ES', '28001'], jp: ['JP', '100-0001'], ca: ['CA', 'M5V2T6'], in: ['IN', '110001'], au: ['AU', '2000'], mx: ['MX', '06600'], br: ['BR', '01310-100'], nl: ['NL', '1011'], se: ['SE', '11157'], pl: ['PL', '00-001'],
-  /* ★ 2026-10-04 中国(CN/CNY)。注意: amazon.cn 网页版已于 2024-01 下线(现在只剩"海外购改版通知"页),
-   *   所以 cn 站点实际采集不到东西 —— 这里补齐映射是为了"链接站点识别/币种/国家码"不缺失:
-   *   缺了它 siteCurrency('cn') 会回落到 EUR, 把站点判成欧洲, 币种检查会去改错方向。 */
-  cn: ['CN', '100000'] };
+const SITE_ZIP = { uk: ['GB', 'SW1A1AA'], us: ['US', '10001'], de: ['DE', '10115'], fr: ['FR', '75001'], it: ['IT', '00100'], es: ['ES', '28001'], jp: ['JP', '100-0001'], ca: ['CA', 'M5V2T6'], in: ['IN', '110001'], au: ['AU', '2000'], mx: ['MX', '06600'], br: ['BR', '01310-100'], nl: ['NL', '1011'], se: ['SE', '11157'], pl: ['PL', '00-001'], cn: ['CN', '100000'] };
 // 自动设置目标国家配送地址 (Amazon glow API): 确保 FBA 配送/税费/可配送判断正确
 // 注: 智赢插件的人民币价格不随配送地址变化 (插件有独立币种设置), 设置地址是为采集数据准确性
 async function cdpSetGlowAddress(send, url, site, customZip) {
-  let changed = false;   // 地址是否真的变更(变更时调用方要重新导航回目标页)
   try {
     const z = SITE_ZIP[site];
-    // 无默认邮编的站点(z 为空)不校准地址, 但仍要继续做后面的站点一致性校验 → 不提前 return
-    if (z) {
+    if (!z) return false;
     // customZip: 用户输入邮编 (任意国家/地区), 覆盖站点默认邮编 — 采集"任何邮编的商品网页"
     const zip = String(customZip || '').trim() || z[1];
     const glowRes = await send('Runtime.evaluate', {
@@ -3459,428 +4869,300 @@ async function cdpSetGlowAddress(send, url, site, customZip) {
       const home = 'https://www.amazon.' + siteToHostSuffix(site) + '/';
       await send('Page.navigate', { url: home });
       await new Promise((r) => setTimeout(r, 9000));
-      changed = true;
+      /* ★ 站点一致性校验(2026-10-04, 按《优化文档.md》§5.1): 所有采集入口都会走这里 → 一处覆盖全局。
+       *   返回值语义不变(仍是"地址是否真的变更"), 调用方不受影响; 校验失败只告警, 绝不中断。 */
+      try { await cdpCheckSiteLocale(send, url, site, { zip: customZip }); } catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
+      return true;
     }
-    }
-  } catch (e) { console.error('[glow]', '设置配送地址失败:', e && e.message); }
-  /* ★ 2026-10-04 站点一致性校验(送货地址/国家地区/货币) —— 挂在本函数尾部:
-   *   全部采集入口(list-direct / list-filtered / 店铺 / aod / 多链接)都调 cdpSetGlowAddress,
-   *   所以这里一处就覆盖了所有采集方式, 不用去改 7 个调用点。
-   *   纪律: 校验自身失败只告警、绝不中断采集; 返回值语义仍是"地址是否真的变更", 调用方不受影响。 */
-  try { await cdpCheckSiteLocale(send, url, site, { zip: customZip }); }
-  catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
-  return changed;
+      /* ★ 站点一致性校验(2026-10-04, 按《优化文档.md》§5.1): 所有采集入口都会走这里 → 一处覆盖全局。
+       *   返回值语义不变(仍是"地址是否真的变更"), 调用方不受影响; 校验失败只告警, 绝不中断。 */
+      try { await cdpCheckSiteLocale(send, url, site, { zip: customZip }); } catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
+    return false;
+  } catch (e) { console.error('[glow]', '设置配送地址失败:', e && e.message); return false; }
 }
 
-// ================= 站点一致性校验 (2026-10-04) =================
-// 需求: 采集开始/过程中, 按【链接站点】核对亚马逊实际设置是否一致, 不一致就改回来。
-// 三项 + 真机实测选择器(勘查见 _dev-tools/站点一致性校验-勘查结果.md):
-//   ① 送货地址  #glow-ingress-line2 = "10115 Berlin"  (Berlin 前有零宽字符 U+200C → 必须用正则取数字, 不能按空格切)
-//   ② 国家/地区  .icp-nav-flag 的 class = "icp-nav-flag-de"  → /icp-nav-flag-([a-z]{2})/ 最稳(另兜 #icp-touch-link-country)
-//   ③ 货币      下拉 #nav-flyout-icp 里【没有】"当前选中"标记 → 改为从页面原生价格反推符号
-// 修正手段: 地址复用已有 cdpSetGlowAddress; 货币 = 真鼠标 hover 国旗 → 点 a[href="#switch-currency=XXX"]
-// 为什么不改国家/地区: 那会动账号级设置(影响结算/推荐), 风险高 → 只告警, 交人工。
+/* ══════════════════════════════════════════════════════════════════════════
+ * 站点一致性校验 (2026-10-04 · 按《优化文档.md》实现)
+ *
+ * 一句话: 采集前(以及采集过程中), 按「链接所属站点」核对亚马逊的实际设置 ——
+ *   送货地址 / 国家地区 / 货币 —— 不一致就自动修正; 修正失败只告警, 绝不中断采集。
+ *
+ * 三项的读取方式(文档 §2, 全部真机实测):
+ *   · 送货地址 → #glow-ingress-line2 文本。格式随界面语言变(德文 "10115‌ Berlin" 含零宽字符,
+ *     英文 "Berlin 10115") ⇒ 不能锚行首、不能按空格切; 且必须先匹配日本型 100-0001,
+ *     否则 /(\d{4,6})/ 会从 "100-0001" 里切出 "0001" → 日本站被误判"地址不符"。
+ *   · 国家/地区 → .icp-nav-flag 的 class(.icp-nav-flag-de) ⇒ 最稳; 兜底 #icp-touch-link-country 文本。
+ *   · 货币     → i18n-prefs cookie(精确 ISO 代码, 每页都有, 不受智赢插件注入的 CNY 价干扰)。
+ *     兜底读页面价格符号, 但【出现 CNY/RMB 一律判"判断不了"返回 null】—— 智赢插件会把页面价格
+ *     换成人民币, 据此判断会把本来正常的站点改坏。
+ *
+ * 三项的修正手段(文档 §3):
+ *   · 送货地址 → 复用已有的 cdpSetGlowAddress()(glow API), 这里只回读核对。
+ *   · 国家/地区 → 直达 https://<目标站点>/?ref_=icp_country_from_<来源国>(省掉国家页约 10s);
+ *     慢路兜底: 进 /customer-preferences/country 读 #icp-dropdown, 每个 option 的 value 就是
+ *     目标 marketplace 的完整 URL。
+ *   · 货币 → 协议级 Network.setCookie 改 i18n-prefs(必须带 domain, 否则会和亚马逊自己那条
+ *     形成两条同名 cookie, 出现"读 GBP 但价格显示 €")。
+ *
+ * 纪律(文档 §6): 每站点每轮只校验一次(TTL 5min, 失败不缓存) · 非 amazon 页面静默跳过 ·
+ *   并行去重(同一站点只跑一次) · 切国家 10 分钟防抖 · 失败绝不中断采集 · 页面一定还原到目标 URL ·
+ *   国家没切成功时不改货币。
+ * ══════════════════════════════════════════════════════════════════════════ */
 const SITE_SYMBOL = {
-  uk: '£', us: '$', au: '$', ca: '$', sg: '$', mx: '$', br: 'R$',
-  de: '€', fr: '€', it: '€', es: '€', nl: '€', be: '€', ie: '€',
-  jp: '¥', in: '₹', tr: '₺', ae: 'AED', sa: 'SAR', se: 'kr', pl: 'zł', cn: '¥',
+  uk: '£', us: '$', au: 'A$', ca: 'C$', jp: '¥', in: '₹', mx: 'MX$', br: 'R$', sg: 'S$',
+  tr: '₺', ae: 'AED', sa: 'SAR', se: 'kr', pl: 'zł', nl: '€', de: '€', fr: '€', it: '€',
+  es: '€', be: '€', ie: '€', cn: 'CNY',
 };
-/** 站点期望值 —— 国家代码/邮编复用 SITE_ZIP, 币种复用 SITE_CURRENCY(不再抄第二份表, 避免两处漂移) */
+/** 站点期望值 —— 不新建表, 复用 SITE_ZIP / SITE_CURRENCY, 避免两处漂移(文档 §2.4) */
 function siteExpect(site) {
   const z = SITE_ZIP[site] || [];
-  return { cc: z[0] || null, zip: z[1] || null, cur: siteCurrency(site), sym: SITE_SYMBOL[site] || null };
+  return { cc: z[0] || null, zip: z[1] || null, cur: SITE_CURRENCY[site] || null, sym: SITE_SYMBOL[site] || null };
 }
-
-/** 页面读取 JS(纯读, 不改任何东西) —— 在目标页/首页都能跑(国旗与 glow 是全站元素) */
+/** 页面内读取脚本(纯读, 不改任何东西) */
 const LOCALE_READ_JS = `(() => {
-  const T = (e) => e ? String(e.textContent || '').replace(/\\s+/g, ' ').trim() : null;
-  const zipRaw = T(document.querySelector('#glow-ingress-line2'));
-  // 邮编: 数字型(10115/10001/2000) 或 英式(SW1A1AA)。
-  // ★ 实测格式随界面语言变: 德文界面 "10115‌ Berlin"(Berlin 前有零宽字符 U+200C), 英文界面 "Berlin 10115"
-  //   → 绝不能锚定行首/按空格切, 直接在整串里找数字。
-  const zip = zipRaw ? (((zipRaw.match(/(\\d{3}-\\d{4})/) || [])[1]) || ((zipRaw.match(/(\\d{4,6})/) || [])[1]) || ((zipRaw.match(/([A-Z]{1,2}\\d[A-Z\\d]?\\s*\\d[A-Z]{2})/i) || [])[1]) || null) : null;
-  const flag = document.querySelector('.icp-nav-flag');
-  const cc = flag ? (((String(flag.className || '').match(/icp-nav-flag-([a-z]{2})\\b/) || [])[1]) || null) : null;
-  const ctry = T(document.querySelector('#icp-touch-link-country'));
-  // ★ 货币首选 i18n-prefs cookie —— 真机实测 amazon.de 上 JS 可读(document.cookie),
-  //   里面是精确 ISO 代码(EUR/GBP/...), 全站每页都有, 且【不受智赢插件注入的 CNY 价格影响】。
-  //   货币下拉里没有"当前选中"标记(勘查结论), 所以 cookie 是最可靠的来源。
-  const curCookie = ((String(document.cookie || '').match(/(?:^|;\\s*)i18n-prefs=([A-Za-z]{3})/) || [])[1] || null);
-  // 备用: 页面原生价格符号(列表页/详情页都兜一遍; 插件注入的 CNY 由 matchCurrency 判为"判断不了")
-  let priceTxt = null;
-  const sels = ['#corePrice_feature_div .a-offscreen', '#corePriceDisplay_desktop_feature_div .a-offscreen', '#priceblock_ourprice', '#price_inside_buybox', '[data-asin] .a-price .a-offscreen', '.a-price .a-offscreen'];
-  for (const s of sels) { const t = T(document.querySelector(s)); if (t && /[0-9]/.test(t)) { priceTxt = t; break; } }
-  return JSON.stringify({ ok: !!flag, href: String(location.href).slice(0, 140), zipRaw: zipRaw, zip: zip, cc: cc, ctry: ctry, curCookie: curCookie ? curCookie.toUpperCase() : null, priceTxt: priceTxt ? priceTxt.slice(0, 24) : null });
+  const out = { ok: true, href: location.href, zipRaw: null, zip: null, cc: null, ctry: null, curCookie: null, priceTxt: null };
+  try {
+    const l2 = document.querySelector('#glow-ingress-line2');
+    out.zipRaw = l2 ? String(l2.textContent || '').trim() : null;
+    const s = String(out.zipRaw || '').replace(/[\\u200b-\\u200f\\u2060\\ufeff]/g, ' ').trim();
+    let m = s.match(/(\\d{3}-\\d{4})/);                                   // ① 日本型 100-0001(必须先匹配)
+    if (!m) m = s.match(/(\\d{4,6})/);                                    // ② 数字型 10115 / 10001 / 2000
+    if (!m) m = s.match(/([A-Z]{1,2}\\d[A-Z\\d]?\\s*\\d[A-Z]{2})/i);       // ③ 英式 SW1A 1AA
+    out.zip = m ? m[1] : null;
+    const f = document.querySelector('.icp-nav-flag');
+    if (f) {
+      const cm = String(f.className || '').match(/icp-nav-flag-([a-z]{2})\\b/);
+      if (cm) out.cc = cm[1].toUpperCase();
+    }
+    const ct = document.querySelector('#icp-touch-link-country');
+    out.ctry = ct ? String(ct.textContent || '').trim().slice(0, 40) : null;
+    const cm2 = String(document.cookie || '').match(/(?:^|;\\s*)i18n-prefs=([^;]+)/);
+    out.curCookie = cm2 ? decodeURIComponent(cm2[1]).trim().toUpperCase() : null;
+    const PRICE_SEL = ['#corePrice_feature_div .a-offscreen', '#corePriceDisplay_desktop_feature_div .a-offscreen',
+      '#priceblock_ourprice', '#price_inside_buybox', '[data-asin] .a-price .a-offscreen', '.a-price .a-offscreen'];
+    for (const sel of PRICE_SEL) {
+      const e = document.querySelector(sel);
+      const t = e ? String(e.textContent || '').trim() : '';
+      if (t) { out.priceTxt = t; break; }
+    }
+  } catch (e) { out.ok = false; out.err = String((e && e.message) || e); }
+  return JSON.stringify(out);
 })()`;
-
-/** 读当前页面的实际站点设置(纯读) */
+/** 执行读取 */
 async function cdpReadLocale(send) {
-  try {
-    const r = await send('Runtime.evaluate', { expression: LOCALE_READ_JS, returnByValue: true });
-    const v = r && r.result && r.result.value;
-    return v ? JSON.parse(v) : null;
-  } catch (e) { return null; }
+  const r = await send('Runtime.evaluate', { expression: LOCALE_READ_JS, returnByValue: true, awaitPromise: true });
+  const v = r && r.result && r.result.value;
+  try { return JSON.parse(v); } catch (e) { return { ok: false, err: '读取失败' }; }
 }
-
-const CURRENCY_CODES = /(USD|EUR|GBP|JPY|CNY|RMB|AUD|CAD|SGD|MXN|BRL|INR|TRY|AED|SAR|SEK|PLN|CHF)/;
-/** 从页面价格文本判断币种是否与站点相符。返回 {ok:true|false} 或 null(判断不了) */
+/** 价格文本 → 币种; ★ 出现 CNY/RMB 一律返回 null(防误伤铁律, 文档 §2.3) */
 function matchCurrency(priceTxt, site) {
-  if (!priceTxt) return null;
-  const exp = siteExpect(site);
-  const up = String(priceTxt).toUpperCase();
-  const code = (up.match(CURRENCY_CODES) || [])[1] || null;
-  // ★ 智赢插件会把页面价格换成人民币 → CNY/¥ 一律按"判断不了"处理。
-  //   若据此判定"货币不符"并去切换, 会把本来正常的站点改坏 —— 这条是最重要的防误伤。
-  if (code === 'CNY' || code === 'RMB') return null;
-  if (code) return { ok: code === String(exp.cur || '').toUpperCase(), code: code };
-  const sym = (up.match(/R\$|US\$|CA\$|AU\$|[$£€¥￥₹₺]/) || [])[0] || null;
-  if (!sym) return null;
-  const want = exp.sym;
-  if (!want) return null;
-  // $ 在 us/au/ca/sg/mx 都合法 → 只跟"本站点期望符号"比即可, 足以抓出 de 站点显示 £/$ 这类错配
-  const eq = { '$': ['$', 'US$', 'CA$', 'AU$'], '€': ['€'], '£': ['£'], '¥': ['¥', '￥'], '₹': ['₹'], '₺': ['₺'], 'R$': ['R$'] };
-  const cand = eq[want] || [String(want).toUpperCase()];
-  return { ok: cand.indexOf(sym) >= 0, sym: sym, want: want };
+  const t = String(priceTxt || '');
+  if (!t) return null;
+  if (/CNY|RMB|人民币/i.test(t)) return null;
+  const want = siteExpect(site).cur;
+  const sym = SITE_SYMBOL[site];
+  if (want && sym && t.indexOf(sym) >= 0) return want;
+  const codes = [['A$', 'AUD'], ['C$', 'CAD'], ['S$', 'SGD'], ['R$', 'BRL'], ['MX$', 'MXN'], ['AED', 'AED'], ['SAR', 'SAR'],
+    ['€', 'EUR'], ['£', 'GBP'], ['¥', 'JPY'], ['₹', 'INR'], ['zł', 'PLN'], ['kr', 'SEK'], ['₺', 'TRY'], ['$', 'USD']];
+  for (const [k, c] of codes) if (t.indexOf(k) >= 0) return c;
+  const iso = t.match(/([A-Z]{3})/);                     // 非默认币种亚马逊显示成 GBP9.34(不带符号; ★ 不能用 \b: P 与 9 之间没有词边界, 实测匹配不到)
+  return iso ? iso[1] : null;
 }
-
-/** hover 国旗 → 点下拉里的目标货币 (下拉必须真鼠标 hover 才弹出, 合成事件无效) */
-async function cdpSwitchCurrency(send, wantCur) {
-  const rr = await send('Runtime.evaluate', { returnByValue: true, expression:
-    `(()=>{const e=document.querySelector('.icp-nav-flag')||document.querySelector('#icp-nav-flyout');if(!e)return '';const r=e.getBoundingClientRect();if(!r.width&&!r.height)return '';return JSON.stringify({x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()` });
-  let pos = null;
-  try { pos = JSON.parse((rr && rr.result && rr.result.value) || 'null'); } catch (e) { /* 忽略 */ }
-  if (!pos || !pos.x) return { ok: false, err: '页面上找不到国旗元素(.icp-nav-flag)' };
-  /* ★ 实测坑: 第一次 hover 时 #nav-flyout-icp 元素【已经存在】, 但里面的货币项是【异步填充】的 ——
-   *   只 hover 一次再查找会得到"下拉没弹出"的假象(其实弹出了、只是空的)。所以:
-   *   边 hover 边轮询目标项(最多 8s), 轮询间隙把鼠标移开再移回, 强制重新触发 mouseenter。
-   *   (只挪 40px —— 仍在下方下拉框范围内, 不会把下拉关掉。) */
-  const hoverFlag = () => send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: pos.x, y: pos.y, button: 'none', clickCount: 0 });
-  const sel = '#nav-flyout-icp a[href="#switch-currency=' + wantCur + '"]';
-  const findItem = async () => {
-    const gr = await send('Runtime.evaluate', { returnByValue: true, expression:
-      `(()=>{const a=document.querySelector('${sel}');if(!a)return JSON.stringify({found:false,flyout:!!document.querySelector('#nav-flyout-icp'),items:[...document.querySelectorAll('#nav-flyout-icp a[href^="#switch-currency="]')].map(x=>String(x.getAttribute('href')).replace('#switch-currency=','')).slice(0,12)});const r=a.getBoundingClientRect();return JSON.stringify({found:true,vis:!!(r.width&&r.height),txt:(a.textContent||'').replace(/\\s+/g,' ').trim().slice(0,40),x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)})})()` });
-    try { return JSON.parse((gr && gr.result && gr.result.value) || 'null'); } catch (e) { return null; }
-  };
-  let info = null, flyoutSeen = false, items = null, rehovered = false;
-  const t0 = Date.now();
-  await hoverFlag();
-  while (Date.now() - t0 < 7000) {
-    await new Promise((r2) => setTimeout(r2, 500));
-    info = await findItem();
-    if (info && info.found) break;
-    if (info) { flyoutSeen = flyoutSeen || !!info.flyout; if (info.items && info.items.length) items = info.items; }
-    // ★ 下拉壳已出现就【绝不再动鼠标】—— 实测内容是异步拉的(约 1.4s 出空壳, 3.5s 才填进货币项),
-    //   hover 期间把鼠标移开(哪怕只挪 40px)会中断这次拉取 → 内容永远不出现(踩过)。
-    //   只有连【壳】都没出现时才补一次 hover。
-    if (!flyoutSeen && !rehovered && Date.now() - t0 > 4000) { rehovered = true; await hoverFlag(); }
-  }
-  if (!info || !info.found) {
-    return { ok: false, err: '下拉里没有 ' + wantCur + ' 项' + (flyoutSeen ? '(下拉已弹出, 可选项: ' + JSON.stringify(items || []) + ')' : '(下拉没弹出)') };
-  }
-  if (info.vis) {
-    // 真鼠标点击: 比 el.click() 更接近人工(部分站点会校验事件可信度)
-    await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: info.x, y: info.y, button: 'left', clickCount: 1 });
-    await new Promise((r2) => setTimeout(r2, 60));
-    await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: info.x, y: info.y, button: 'left', clickCount: 1 });
-  } else {
-    await send('Runtime.evaluate', { expression: `(()=>{const a=document.querySelector('${sel}');if(a)a.click()})()` });
-  }
-  return { ok: true, txt: info.txt, viaMouse: !!info.vis };
-}
-
-/* ★ 2026-10-04 协议级切货币(首选) —— 直接改 i18n-prefs cookie, 不模拟鼠标、不开下拉。
- * 为什么这是最优解(真机实测对比):
- *   · hover 下拉那套要"真鼠标 hover → 等异步填充(约 3.5s) → 点", 而首次 hover 常拿到空壳,
- *     得靠"重载页面再试一次"兜底(见 cdpSwitchCurrency)。
- *   · 这条路只需 Network.setCookie + 一次重载, 实测 100% 生效, 且不会留下重复 cookie。
- * 关键细节:
- *   ① 必须带 domain(.amazon.de) —— 不带的话会与亚马逊自己那份形成【两条同名 cookie】,
- *      页面读出来与实际渲染不一致(踩过: 读 GBP 但价格显示 €)。
- *   ② 先清掉可能存在的 host-only 同名 cookie, 否则它会遮蔽 domain 那条。
- *   ③ 货币不是"账号设置", 就是这条客户端偏好 cookie; Amazon 服务端下一次请求就按它渲染。 */
+/** 协议级切货币(首选): Network.setCookie i18n-prefs, 必须带 domain */
 async function cdpSetCurrencyCookie(send, cur, host) {
-  const want = String(cur || '').toUpperCase();
-  if (!/^[A-Z]{3}$/.test(want)) return { ok: false, err: '币种代码不合法: ' + cur };
-  const h = String(host || '').replace(/^www\./, '');
-  if (!/^amazon\./.test(h)) return { ok: false, err: '拿不到 amazon 域名: ' + host };
+  const domain = '.' + String(host || '').replace(/^www\./, '');
+  try { await send('Network.enable'); } catch (e) {}
   try {
-    try { await send('Network.enable'); } catch (e) { /* 已启用/不支持都不影响后续 */ }
-    // ② 只在"确实有重复"时才清理(避免无谓地删掉亚马逊那份)
+    /* 只在"确实有重复"时才清理 host-only 那条(它会被优先读到, 遮蔽 domain 那条) */
     try {
-      const r = await send('Runtime.evaluate', { returnByValue: true, expression:
-        `String(document.cookie).split('; ').filter(function(s){return s.indexOf('i18n-prefs=')===0}).length` });
-      const n = Number(r && r.result && r.result.value) || 0;
-      if (n > 1) await send('Network.deleteCookies', { name: 'i18n-prefs', url: 'https://' + host + '/' });
-    } catch (e) { /* 清理失败也继续 —— 下面 setCookie 仍能覆盖 domain 那条 */ }
-    const set = await send('Network.setCookie', { name: 'i18n-prefs', value: want, domain: '.' + h, path: '/', secure: true });
-    if (!set || set.success !== true) return { ok: false, err: 'setCookie 未成功: ' + JSON.stringify(set) };
-    await send('Page.reload');
-    const ready = await cdpWaitReady(send, 25000);
-    await new Promise((r) => setTimeout(r, 1200));
-    const got = await cdpReadLocale(send);
-    const ok = !!got && String(got.curCookie || '').toUpperCase() === want;
-    return { ok: ok, via: 'cookie', cookie: (got && got.curCookie) || null, priceTxt: (got && got.priceTxt) || null, ready: ready };
-  } catch (e) { return { ok: false, err: (e && e.message) || 'setCookie 异常' }; }
+      const all = await send('Network.getCookies', { urls: ['https://' + host + '/'] });
+      const list = (all && all.cookies) || [];           // ★ server.js 的 send 返回的是【内层 result】, 所以是 all.cookies(不是 all.result.cookies)
+      if (list.filter((c) => c.name === 'i18n-prefs').length > 1) {
+        await send('Network.deleteCookies', { name: 'i18n-prefs', url: 'https://' + host + '/' });
+      }
+    } catch (e) {}
+    const r = await send('Network.setCookie', { name: 'i18n-prefs', value: String(cur), domain, path: '/', secure: true });
+    return !(r && r.error);
+  } catch (e) { console.error('[locale]', 'setCookie 失败:', e && e.message); return false; }
 }
-
-/** 等页面可用(切换货币会整页刷新; 刷新期间 evaluate 会失败, 属正常) */
-async function cdpWaitReady(send, ms) {
-  const end = Date.now() + (ms || 25000);
-  while (Date.now() < end) {
-    await new Promise((r) => setTimeout(r, 800));
+/** 兜底: hover 国旗 → 下拉里点 a[href="#switch-currency=XXX"](下拉是异步拉的, 首轮常是空壳) */
+async function cdpSwitchCurrency(send, wantCur) {
+  try {
+    const r = await send('Runtime.evaluate', {
+      expression: `(async () => {
+        const flag = document.querySelector('#icp-nav-flyout, .icp-nav-link-inner, #nav-tools a[href*="customer-preferences"]');
+        if (!flag) return 'no-flag';
+        const ev = (t) => new MouseEvent(t, { bubbles: true, cancelable: true, view: window });
+        flag.dispatchEvent(ev('mouseover')); flag.dispatchEvent(ev('mouseenter'));
+        await new Promise((r) => setTimeout(r, 3500));
+        const a = document.querySelector('a[href="#switch-currency=${wantCur}"]');
+        if (!a) return 'no-option';
+        a.click();
+        return 'clicked';
+      })()`, returnByValue: true, awaitPromise: true,
+    });
+    return r && r.result && r.result.value === 'clicked';
+  } catch (e) { return false; }
+}
+/** 切国家/地区: 快路直达(带 ref_=icp_country_from_<来源国>) + 慢路兜底(读 #icp-dropdown 的 option URL) */
+async function cdpSwitchCountry(send, site, wantCc) {
+  const fromSuffix = siteToHostSuffix(site);
+  const targetSite = Object.keys(SITE_ZIP).find((s) => SITE_ZIP[s][0] === wantCc);
+  if (!targetSite) return { ok: false, err: '没有 ' + wantCc + ' 对应的站点映射', via: null };
+  const targetHost = 'www.amazon.' + siteToHostSuffix(targetSite);
+  /* 快路: 直接跳到目标 marketplace 首页(省掉国家页那一整页, 约 10 秒) */
+  try {
+    await send('Page.navigate', { url: 'https://' + targetHost + '/?ref_=icp_country_from_' + fromSuffix });
+    await cdpWaitReady(send, 30000);
+    const p = await cdpReadLocale(send);
+    if (p && String(p.cc || '').toUpperCase() === wantCc) return { ok: true, via: 'direct-url', host: targetHost, name: p.ctry };
+  } catch (e) { console.error('[locale]', '切国家快路失败:', e && e.message); }
+  /* 慢路: 进国家页, 用亚马逊自己给的 option URL(万一 ref 形态变了还能成) */
+  try {
+    await send('Page.navigate', { url: 'https://www.amazon.' + fromSuffix + '/customer-preferences/country' });
+    await cdpWaitReady(send, 30000);
+    const r = await send('Runtime.evaluate', {
+      expression: `(() => { const s = document.querySelector('#icp-dropdown'); if (!s) return null;
+        const hit = [...s.options].find((o) => /amazon\\.${siteToHostSuffix(targetSite).replace(/\./g, '\\.')}\\//.test(o.value || ''));
+        return hit ? hit.value : null; })()`, returnByValue: true,
+    });
+    const u = r && r.result && r.result.value;
+    if (u) {
+      await send('Page.navigate', { url: u });
+      await cdpWaitReady(send, 30000);
+      const p = await cdpReadLocale(send);
+      if (p && String(p.cc || '').toUpperCase() === wantCc) return { ok: true, via: 'country-page', host: targetHost, name: p.ctry };
+    }
+    return { ok: false, err: '国家页里没找到目标站点选项', via: 'country-page' };
+  } catch (e) { return { ok: false, err: String((e && e.message) || e), via: 'country-page' }; }
+}
+/** 等页面可用(切货币/切国家都会整页刷新) */
+async function cdpWaitReady(send, ms = 30000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
     try {
-      const r = await send('Runtime.evaluate', { returnByValue: true, expression: `(document.readyState==='complete' && !!document.querySelector('.icp-nav-flag')) ? '1' : ''` });
-      if (r && r.result && r.result.value === '1') return true;
-    } catch (e) { /* 刷新中, 继续等 */ }
+      const r = await send('Runtime.evaluate', { expression: 'document.readyState', returnByValue: true });
+      if (r && r.result && r.result.value === 'complete') { await new Promise((res) => setTimeout(res, 1300)); return true; }
+    } catch (e) {}
+    await new Promise((res) => setTimeout(res, 700));
   }
   return false;
 }
-
+const localeInflight = new Map();          // 并行采集: 同一站点共用一次校验
+const localeCheckedAt = new Map();         // 通过后的 TTL(失败不缓存)
+const countryFixAt = new Map();            // 切国家的 10 分钟防抖
 const LOCALE_TTL_MS = 5 * 60 * 1000;
-const localeCheckedAt = new Map();   // site → 上次"校验通过"的时间: 同一次采集内同站点只校验一次, 不每页 hover
-let lastLocaleCheck = null;          // 最近一次校验结果(供 /api/collect/completeness 与采集报告读取)
-
-/**
- * 站点一致性校验 + 自动修正。永不抛(调用方不受影响)。
- * @param opts.zip   自定义邮编(用户指定时用它当期望值, 否则用站点默认)
- * @param opts.force 跳过缓存强制校验
- */
-/* ★ 2026-10-04 国家/地区自动切换 —— 用户明确要求"不一致就自动改"。
- * 真机实测(amazon.de → /customer-preferences/country):
- *   · 页面标题 "Go to website", 核心控件是 <select id="icp-dropdown">, 【不在 form 里、没有 onchange】;
- *   · 每个 option 的 value 就是【目标 marketplace 的完整 URL】, 自带 ref_=icp_country_from_<来源国>
- *     —— 正是亚马逊用来记录"从哪个站点切过来"的参数;
- *   · 当前站点那一项是 selected(如 amazon.de 对应 option 8)。
- * 所以"切国家"= 选中目标项并把页面跳到那个 URL —— 与页面自己的按钮行为一致,
- * 而且不用去猜那个没有文字的主提交按钮(input.a-button-input, 只有 "Cancel" 有可见文字)。
- * ⚠ 切换会整页跳到目标 marketplace 首页 → 调用方(cdpCheckSiteLocale)必须负责把页面送回目标页。 */
-const countryFixAt = new Map();      // site → 上次尝试切国家的时间: 防"来回横跳"式反复切换
 const COUNTRY_FIX_TTL = 10 * 60 * 1000;
-async function cdpSwitchCountry(send, site, wantCc) {
-  const wantHost = 'www.amazon.' + siteToHostSuffix(site);
-  const now = await cdpReadLocale(send);
-  const m = String((now && now.href) || '').match(/^https?:\/\/(www\.amazon\.[a-z.]+)\//i);
-  if (!m) return { ok: false, err: '当前页不是 amazon 站点页(' + ((now && now.href) || '?') + '), 无法切国家' };
-  if (m[1] === wantHost) return { ok: true, already: true, cc: (now && now.cc) || null, url: 'https://' + wantHost + '/' };
-  /* ★ 快路(实测): 直接带 ref 跳到目标 marketplace —— 省掉"进国家页读下拉再跳"那一整页(约 10s)。
-   *   ref_=icp_country_from_<来源国> 正是 #icp-dropdown 里那一项的 value 形态(下面慢路读到的就是它),
-   *   所以这一步与页面自己按钮产生的导航完全等价 —— 而且全程没有模拟鼠标, 只是 Page.navigate。 */
-  const fromCc = String((now && now.cc) || '').toLowerCase() || 'de';
-  const fastUrl = 'https://' + wantHost + '/?ref_=icp_country_from_' + fromCc;
-  await send('Page.navigate', { url: fastUrl });
-  let fastReady = await cdpWaitReady(send, 30000);
-  await new Promise((r) => setTimeout(r, 1200));
-  let fastAfter = await cdpReadLocale(send);
-  if (fastAfter && String(fastAfter.cc || '').toUpperCase() === String(wantCc || '').toUpperCase()) {
-    return { ok: fastReady, via: 'direct-url', name: wantHost, url: fastUrl, cc: fastAfter.cc, ready: fastReady };
-  }
-  /* ★ 慢路(兜底): 万一 ref 形态变了, 回到国家页从 #icp-dropdown 里读亚马逊【自己给的】目标 URL。 */
-  const pageUrl = 'https://' + m[1] + '/customer-preferences/country?ref_=icp_lop_mop_chg&preferencesReturnUrl=%2F';
-  await send('Page.navigate', { url: pageUrl });
-  await cdpWaitReady(send, 25000);
-  await new Promise((r) => setTimeout(r, 1500));
-  const rr = await send('Runtime.evaluate', { returnByValue: true, expression:
-    `(()=>{const s=document.querySelector('#icp-dropdown');if(!s)return JSON.stringify({found:false,title:String(document.title||'').slice(0,40)});
-      const hit=[...s.options].find(o=>o.value&&o.value.indexOf('${wantHost}')>=0);
-      if(!hit)return JSON.stringify({found:true,hit:null,n:s.options.length});
-      s.value=hit.value; s.dispatchEvent(new Event('change',{bubbles:true}));   // 让界面与真实选择一致
-      return JSON.stringify({found:true,hit:String(hit.textContent||'').trim(),url:hit.value})})()` });
-  let info = null;
-  try { info = JSON.parse((rr && rr.result && rr.result.value) || 'null'); } catch (e) { /* 忽略 */ }
-  if (!info || !info.found) return { ok: false, err: '国家/地区页没有 #icp-dropdown' + (info && info.title ? '(标题: ' + info.title + ')' : '') };
-  if (!info.hit) return { ok: false, err: '下拉里没有 ' + wantHost + ' 这一项(共 ' + info.n + ' 项)' };
-  await send('Page.navigate', { url: info.url });
-  const ready = await cdpWaitReady(send, 30000);
-  await new Promise((r) => setTimeout(r, 1500));
-  const after = await cdpReadLocale(send);
-  const okCc = !!after && String(after.cc || '').toUpperCase() === String(wantCc || '').toUpperCase();
-  /* 失败时必须给出可读原因 —— 否则上层只能显示"未知", 排查不了(踩过: 切中国时只说"未知")。 */
-  const why = okCc ? null
-    : (!ready ? '目标站点页未能就绪(可能该站点已不可用/网络异常)'
-      : '切换后回读不符(期望 ' + wantCc + ', 实际 ' + ((after && after.cc) || '无国旗') + ')');
-  return { ok: ready && okCc, name: info.hit, url: info.url, cc: (after && after.cc) || null, ready: ready, err: why };
+let lastLocaleCheck = { bySite: {}, at: null };
+/** 按站点→国家码反查是否一致(GB↔uk 用 SITE_ZIP 复用, 不另抄一份) */
+function cdpCheckSiteLocale(send, url, site, opts = {}) {
+  const s = String(site || '').toLowerCase();
+  if (!s) return Promise.resolve(null);
+  let host = null;
+  try { host = new URL(String(url || '')).hostname; } catch (e) { host = null; }
+  if (!host || !/amazon\./i.test(host)) return Promise.resolve(null);       // 非 amazon 页面静默跳过(不告警不缓存)
+  if (localeInflight.has(s)) return localeInflight.get(s);                  // ★ 并行去重
+  const p = cdpCheckSiteLocaleRun(send, url, s, opts)
+    .catch((e) => { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); return null; })
+    .then((r) => { localeInflight.delete(s); return r; });
+  localeInflight.set(s, p);
+  return p;
 }
-
-/* ★ 并行去重: 整站/店铺并行采集会给 N 个标签页同时做【同一站点】的校验 ——
- *   不去重的话 N 个 worker 会同时 hover 国旗、甚至同时点改货币, 互相打断(与 links-collector 的 addrProm 同一套路)。
- *   所以同一站点"进行中的那一次"直接复用, 后来者等它。 */
-const localeInflight = new Map();
-async function cdpCheckSiteLocale(send, url, site, opts = {}) {
-  const key = String(site);
-  if (!opts.force && localeInflight.has(key)) return localeInflight.get(key);
-  const p = cdpCheckSiteLocaleRun(send, url, site, opts);
-  localeInflight.set(key, p);
-  try { return await p; } finally { localeInflight.delete(key); }
-}
-/** 真正的校验逻辑(说明见 cdpCheckSiteLocale) */
+/** 真正的 校验 → 修正 → 回读; 顺序: 国家/地区 → 送货地址 → 货币(换 marketplace 后另两项都可能跟着变) */
 async function cdpCheckSiteLocaleRun(send, url, site, opts = {}) {
-  const cached = lastLocaleCheck && lastLocaleCheck.bySite && lastLocaleCheck.bySite[site];
-  if (!opts.force && (Date.now() - (localeCheckedAt.get(site) || 0)) < LOCALE_TTL_MS && cached) return cached;
+  const now = Date.now();
+  const cached = localeCheckedAt.get(site);
+  if (cached && now - cached < LOCALE_TTL_MS) return (lastLocaleCheck.bySite || {})[site] || null;
+  const want = siteExpect(site);
+  if (!want.cc || !want.cur) return null;                                   // 期望表里没有 → 跳过
+  const res = { site, want, at: utcNow(), addr: null, country: null, cur: null, fixes: [], warns: [] };
+  let page = await cdpReadLocale(send);
+  if (!page || !page.ok) { res.warns.push('⚠ 页面读取失败'); }
 
-  const exp = siteExpect(site);
-  const wantZip = String(opts.zip || '').trim() || exp.zip;
-  const rep = { site: site, want: Object.assign({}, exp, { zip: wantZip }), at: completenessAt(), addr: null, country: null, cur: null, fixes: [], warns: [] };
-  const finish = (r) => {
-    r.ok = !(r.warns || []).some((w) => w.charAt(0) === '⚠');
-    // ★ 只在"全部通过"时才缓存: 失败的下次采集还会重试(否则一次失败会被缓存 5 分钟, 用户看不到它恢复)
-    if (r.ok && !r.skipped) localeCheckedAt.set(site, Date.now());
-    if (!lastLocaleCheck) lastLocaleCheck = { bySite: {}, at: r.at };
-    lastLocaleCheck.bySite[site] = r;
-    lastLocaleCheck.at = r.at;
-    const bad = (r.warns || []).filter((w) => w.charAt(0) === '⚠');
-    if (bad.length) console.warn('[locale] ' + String(site).toUpperCase() + ' 站点不一致: ' + bad.join(' | '));
-    else console.log('[locale] ' + String(site).toUpperCase() + ' 站点一致 (国家 ' + ((r.country && r.country.got) || '?') + ', 货币 ' + ((r.cur && (r.cur.got || r.cur.priceTxt)) || '?') + ')'
-      + (r.fixes.length ? ' [已修正: ' + r.fixes.join('; ') + ']' : ''));
-    return r;
-  };
-
-  try {
-    let got = await cdpReadLocale(send);
-    if (!got || !got.ok) {
-      const href = String((got && got.href) || '');
-      if (href && !/amazon\./i.test(href)) {
-        /* 当前标签页根本不在 amazon 上(品牌批量这类采集是先连上再逐个导航) —— 静默跳过、不告警、不缓存,
-         * 等采集真正导航到 amazon 后再校验。否则会刷一堆"页面未就绪"的假告警。 */
-        rep.skipped = true;
-        rep.note = '当前页不是 amazon(' + href.slice(0, 60) + '), 已跳过';
-        return finish(rep);
+  /* ── ① 国家/地区 ── */
+  const gotCc0 = page && page.cc ? String(page.cc).toUpperCase() : null;
+  res.country = { want: want.cc, got: gotCc0, ok: gotCc0 === want.cc, name: (page && page.ctry) || null, via: null };
+  if (!res.country.ok) {
+    const last = countryFixAt.get(site) || 0;
+    if (Date.now() - last < COUNTRY_FIX_TTL) {
+      res.warns.push('⚠ 国家/地区不符(' + (gotCc0 || '?') + ' ≠ ' + want.cc + '), 但 10 分钟内已尝试过切换, 本轮不再动');
+    } else {
+      countryFixAt.set(site, Date.now());
+      const sw = await cdpSwitchCountry(send, site, want.cc);
+      res.country.via = sw.via;
+      if (sw.ok) {
+        res.fixes.push('国家/地区已切换 → ' + want.cc + '(' + (sw.host || '') + ') [' + (sw.via === 'direct-url' ? '直达' : '国家页') + ']');
+        res.country.ok = true;
+        page = await cdpReadLocale(send);
+      } else {
+        res.warns.push('⚠ 国家/地区切换失败(' + (gotCc0 || '?') + ' → ' + want.cc + '): ' + (sw.err || '未知'));
       }
-      rep.warns.push('⚠ 页面未就绪, 站点一致性校验跳过(未登录/CAPTCHA/仍在导航?)');
-      return finish(rep);
     }
+  }
+  /* ★ 切完国家【一定】把页面送回调用方给的目标 URL(成功/失败都送) —— 否则调用方会在站点首页上继续采集,
+   *   列表页直采会直接变成 0 个商品(文档 §3.1 最大的坑) */
+  const landed = page && page.href ? String(page.href) : '';
+  if (url && String(url).slice(0, 60) !== landed.slice(0, 60)) {
+    try {
+      await send('Page.navigate', { url });
+      await cdpWaitReady(send, 30000);
+      page = await cdpReadLocale(send);
+    } catch (e) { res.warns.push('⚠ 页面未能送回目标 URL'); }
+  }
 
-    // ① 国家/地区 —— 【不一致则自动切换】(2026-10-04 用户明确要求; 原来只告警)
-    if (exp.cc && got.cc) {
-      const ok = String(got.cc).toUpperCase() === String(exp.cc).toUpperCase();
-      rep.country = { want: exp.cc, got: String(got.cc).toUpperCase(), ok: ok, name: got.ctry || null };
-      if (!ok) {
-        const lastFix = countryFixAt.get(site) || 0;
-        if (Date.now() - lastFix < COUNTRY_FIX_TTL) {
-          // 10 分钟内已经试过 → 不再试(否则店铺/翻页循环里会反复跳站点, 互相打断)
-          rep.warns.push('⚠ 站点不符: 链接是 ' + String(site).toUpperCase() + '(期望 ' + exp.cc + '), 亚马逊当前是 '
-            + String(got.cc).toUpperCase() + (got.ctry ? '(' + got.ctry + ')' : '') + ' —— 10 分钟内已尝试自动切换过, 本轮不重复切换');
-        } else {
-          countryFixAt.set(site, Date.now());
-          const sc = await cdpSwitchCountry(send, site, exp.cc);
-          if (!sc.ok) {
-            rep.warns.push('⚠ 站点不符: 链接是 ' + String(site).toUpperCase() + '(期望 ' + exp.cc + '), 亚马逊当前是 '
-              + String(got.cc).toUpperCase() + (got.ctry ? '(' + got.ctry + ')' : '') + ' —— 自动切换失败: ' + (sc.err || '未知') + ', 请手动切换');
-            /* ★ 切换失败时页面很可能已经被带到别处(国家页 / 目标 marketplace 首页 / 甚至一个不可用的站点页),
-             *   必须把页面送回调用方给的目标 URL —— 否则调用方会在错误的页面上继续采集。
-             *   (实测: 切中国时 amazon.cn 是"海外购改版通知"页, 切换必然失败, 页面就留在那儿了。)
-             *   注意: 这里【不能】拿 site 去推期望域名 —— 切换失败时 site 正是那个不存在的站点,
-             *   推出来的域名恰好等于当前页, 判断条件永远不成立(踩过)。一律无条件回目标 URL 最稳。 */
-            try {
-              if (url && /^https?:\/\//i.test(String(url))) {
-                await send('Page.navigate', { url: String(url) });
-                await cdpWaitReady(send, 30000);
-                await new Promise((r) => setTimeout(r, 1200));
-                const back = await cdpReadLocale(send);
-                if (back) got = back;
-                rep.country.restored = (back && back.href) ? String(back.href).slice(0, 90) : null;
-              }
-            } catch (e) { /* 恢复页面失败不影响采集继续 */ }
-          } else {
-            rep.fixes.push('国家/地区已切换 → ' + exp.cc + (sc.name ? '(' + sc.name + ')' : '') + (sc.via === 'direct-url' ? ' [直达]' : ''));
-            rep.country.via = sc.via || 'country-page';
-            /* ★ 切国家 = 整页跳到目标 marketplace 首页 → 必须把页面【送回调用方要的目标页】,
-             *   否则调用方会在站点首页上继续采集(列表页直采会直接变成 0 个商品 —— 与 glow 改地址那次同型的坑)。 */
-            if (url && /^https?:\/\//i.test(String(url))) {
-              await send('Page.navigate', { url: String(url) });
-              await cdpWaitReady(send, 30000);
-              await new Promise((r) => setTimeout(r, 1500));
-            }
-            const got2c = await cdpReadLocale(send);
-            if (got2c) {
-              got = got2c;   // 后续地址/货币检查一律用【切换后】的页面数据
-              const ok2 = String(got.cc || '').toUpperCase() === String(exp.cc).toUpperCase();
-              rep.country.after = { cc: got.cc || null, ok: ok2, page: String(got.href || '').slice(0, 90) };
-              if (!ok2) rep.warns.push('⚠ 国家/地区切换后回读仍不符(期望 ' + exp.cc + ', 实际 ' + (got.cc || '?') + ')');
-            }
-          }
+  /* ── ② 送货地址(只核对, 修正由 cdpSetGlowAddress 负责) ── */
+  const nz = (x) => String(x == null ? '' : x).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const wantZip = String(opts.zip || want.zip || '');
+  const gotZip = (page && page.zip) || null;
+  res.addr = { want: wantZip, got: gotZip, ok: !!gotZip && nz(gotZip) === nz(wantZip) };
+  if (!res.addr.ok) res.warns.push('⚠ 送货地址邮编不符(' + (gotZip || '?') + ' ≠ ' + wantZip + ')');
+
+  /* ── ③ 货币 ── */
+  const gotCur = (page && page.curCookie) || matchCurrency(page && page.priceTxt, site);
+  const src = (page && page.curCookie) ? 'cookie' : (gotCur ? 'price' : 'none');
+  res.cur = { want: want.cur, got: gotCur, ok: gotCur === want.cur, src, cookie: (page && page.curCookie) || null };
+  if (!res.cur.ok) {
+    if (!res.country.ok) {
+      /* ★ 在错误的 marketplace 上改币种只会让价格更乱(de 页面显示 £) —— 国家没切成功就不动货币 */
+      res.warns.push('⚠ 货币不符(' + (gotCur || '?') + ' ≠ ' + want.cur + '), 但国家/地区还没对上, 本轮不改货币');
+    } else {
+      const host = (() => { try { return new URL(String(url)).hostname; } catch (e) { return 'www.amazon.' + siteToHostSuffix(site); } })();
+      let done = false;
+      if (await cdpSetCurrencyCookie(send, want.cur, host)) {
+        try { await send('Page.reload', {}); } catch (e) {}
+        await cdpWaitReady(send, 30000);
+        const after = await cdpReadLocale(send);
+        const afterCur = (after && after.curCookie) || matchCurrency(after && after.priceTxt, site);
+        res.cur.after = { cookie: (after && after.curCookie) || null, priceTxt: (after && after.priceTxt) || null, ok: afterCur === want.cur };
+        if (afterCur === want.cur) { done = true; res.fixes.push('货币已切换 → ' + want.cur + '[cookie]'); page = after; }
+      }
+      if (!done) {
+        if (await cdpSwitchCurrency(send, want.cur)) {
+          await cdpWaitReady(send, 30000);
+          const after2 = await cdpReadLocale(send);
+          const afterCur2 = (after2 && after2.curCookie) || matchCurrency(after2 && after2.priceTxt, site);
+          res.cur.after = { cookie: (after2 && after2.curCookie) || null, priceTxt: (after2 && after2.priceTxt) || null, ok: afterCur2 === want.cur };
+          if (afterCur2 === want.cur) { done = true; res.fixes.push('货币已切换 → ' + want.cur + '[下拉]'); }
         }
       }
+      if (!done) res.warns.push('⚠ 货币切换失败(' + (gotCur || '?') + ' → ' + want.cur + ')');
     }
-
-    // ② 送货地址(放在国家切换之后 —— 换了 marketplace, 配送地址/邮编也可能跟着变)
-    if (wantZip && got.zip) {
-      /* 归一化后再比: 忽略连字符/空格 —— 日本 100-0001、英国 SW1A 1AA、德国 10115 都能对上。
-       * (坑: 日本邮编若不加 \d{3}-\d{4} 单独识别, 会被通用 \d{4,6} 切成 "0001" → 误报地址不符。) */
-      const nz = (s) => String(s).toUpperCase().replace(/[^A-Z0-9]/g, '');
-      const ok = nz(got.zip) === nz(wantZip);
-      rep.addr = { want: wantZip, got: got.zip, ok: ok };
-      // 站点首页显示的常是账号默认地址, 采集前已由 cdpSetGlowAddress 校准 → 不符只提示, 不重复改(避免翻页来回跳)
-      if (!ok) rep.warns.push('配送地址 ' + got.zip + ' ≠ 期望 ' + wantZip + '(采集已按站点校准, 若数据异常请检查登录态)');
-    } else if (wantZip) {
-      rep.addr = { want: wantZip, got: null, ok: null, raw: got.zipRaw };
-    }
-
-    // ③ 货币 —— 首选 i18n-prefs cookie(权威 ISO 代码); 没有才用页面价格符号推
-    let mc = null, curSrc = 'none';
-    if (got.curCookie) {
-      curSrc = 'cookie';
-      mc = { ok: got.curCookie === String(exp.cur || '').toUpperCase(), code: got.curCookie };
-      // 交叉核对: cookie 说对、但页面价格符号明显是别的币种(如 de 显示 £) → 只记提示, 不改(以 cookie 为准)
-      const mp = matchCurrency(got.priceTxt, site);
-      if (mc.ok && mp && mp.ok === false) rep.warns.push('提示: 货币 cookie=' + got.curCookie + ' 但页面价格显示 ' + (got.priceTxt || '?') + '(未改动, 以 cookie 为准)');
-    } else {
-      curSrc = 'price';
-      mc = matchCurrency(got.priceTxt, site);
-    }
-    rep.cur = { want: exp.cur, got: (mc && (mc.code || mc.sym)) || null, ok: mc ? mc.ok : null, src: curSrc, cookie: got.curCookie || null, priceTxt: got.priceTxt || null };
-    if (mc === null) {
-      rep.warns.push('货币未校验(既没读到 i18n-prefs cookie, 也没读到页面价格) —— 跳过货币检查');
-    } else if (mc.ok === false) {
-      /* ★ 国家/地区还没对上(且没能自动切过来) → 【不要】再改货币:
-       *   在错误的 marketplace 上把币种改成链接站点要的, 只会让采到的价格更乱(de 的页面显示 £)。
-       *   等国家切对了, 货币下次自然就一致 —— 这也是真机验证里发现的(防抖拦下切换后仍改了货币)。 */
-      const countryStillWrong = !!(rep.country && rep.country.ok === false && !(rep.country.after && rep.country.after.ok));
-      if (countryStillWrong) {
-        rep.warns.push('⚠ 货币不符(' + (got.curCookie || got.priceTxt || '?') + ' ≠ ' + exp.cur + '), 但国家/地区仍是 '
-          + (rep.country.got || '?') + '(未切换成功) —— 未改货币: 在错误的站点上改币种只会让价格更乱');
-      } else {
-      /* ★ 首选【协议级】改法: 直接改 i18n-prefs cookie(Network.setCookie, 带 domain 覆盖亚马逊那份)。
-       *   实测完全不碰鼠标/下拉/异步填充, 也没有重复 cookie 问题; hover 下拉只作兜底。 */
-      const curHost = (String(got.href || '').match(/^https?:\/\/(www\.amazon\.[a-z.]+)\//i) || [])[1] || null;
-      let sw = curHost ? await cdpSetCurrencyCookie(send, exp.cur, curHost) : { ok: false, err: '拿不到当前 amazon 域名' };
-      if (!sw.ok) {   // 兜底: 真鼠标 hover 下拉(亚马逊若不再认这条 cookie 时还能用)
-        const why = sw.err || '?';
-        sw = await cdpSwitchCurrency(send, exp.cur);
-        if (sw.ok) sw.note = 'cookie 法未成(' + why + ') → 已退回 hover 下拉';
-      }
-      if (!sw.ok) {
-        /* ★ 实测: 首次 hover 常常拿到"弹出了但还没填充"的空下拉 → 重载页面后再试一次基本都能成
-         *   (下拉内容是异步拉的, 重载会重新走一遍加载; 验证脚本里就是靠这一招救回来的)。 */
-        try {
-          rep.fixes.push('货币首发切换未成(' + (sw.err || '?') + '), 重载页面后重试');
-          await send('Page.reload');
-          if (await cdpWaitReady(send, 25000)) {
-            await new Promise((r) => setTimeout(r, 1200));
-            sw = await cdpSwitchCurrency(send, exp.cur);
-          }
-        } catch (e) { /* 重试失败就走下面的告警 */ }
-      }
-      if (!sw.ok) {
-        rep.warns.push('⚠ 货币不符(' + (got.curCookie || got.priceTxt || '?') + ' ≠ ' + exp.cur + '), 自动切换失败: ' + (sw.err || '未知') + ' —— 请手动到国旗处切换货币');
-      } else {
-        rep.fixes.push('货币已切换 → ' + exp.cur + (sw.via ? '[' + sw.via + ']' : '') + (sw.txt ? '(' + sw.txt + ')' : '') + (sw.note ? ' ' + sw.note : ''));
-        const ready = await cdpWaitReady(send, 25000);
-        await new Promise((r) => setTimeout(r, 1200));
-        const got2 = await cdpReadLocale(send);
-        const mc2 = got2 ? (got2.curCookie
-          ? { ok: got2.curCookie === String(exp.cur || '').toUpperCase(), code: got2.curCookie }
-          : matchCurrency(got2.priceTxt, site)) : null;
-        rep.cur.after = { cookie: (got2 && got2.curCookie) || null, priceTxt: (got2 && got2.priceTxt) || null, ok: mc2 ? mc2.ok : null };
-        if (mc2 && mc2.ok === false) rep.warns.push('⚠ 货币切换后回读仍不符(期望 ' + exp.cur + ', 实际 ' + ((got2 && (got2.curCookie || got2.priceTxt)) || '?') + ')');
-        else if (!ready) rep.warns.push('货币已切换但页面 25s 内未就绪, 建议挑一页重采确认');
-      }
-      }
-    }
-  } catch (e) {
-    rep.warns.push('⚠ 校验异常(已忽略): ' + (e && e.message));
   }
-  return finish(rep);
+  res.ok = !res.warns.some((w) => String(w).indexOf('⚠') === 0);
+  /* 结果落地: 通过 → 记 TTL; 不通过 → 不缓存(下次采集会重试, 用户能看到它恢复) */
+  if (res.ok) localeCheckedAt.set(site, Date.now());
+  lastLocaleCheck = { bySite: Object.assign({}, lastLocaleCheck.bySite, { [site]: res }), at: utcNow() };
+  const pick = res.ok ? '站点一致' : '站点不一致';
+  /* 日志反映【修正后】的最终状态: 货币那条修正成功后 res.cur.ok 仍是修正前的 false(与文档 §7 的报告结构一致),
+   *   直接打 res.cur.ok 会打出"站点一致 …货币 CNY→false"这种自相矛盾的行 */
+  const curFinal = res.cur.ok ? res.cur.got : ((res.cur.after && res.cur.after.ok) ? res.cur.want : (res.cur.got || '?'));
+  const curFixed = !res.cur.ok && res.cur.after && res.cur.after.ok;
+  console.log('[locale]', site.toUpperCase() + ' ' + pick +
+    ' (国家 ' + (res.country.ok ? res.country.want : (res.country.got || '?')) + (res.country.ok ? '✓' : '✗') + ', 货币 ' + (res.cur.got || '?') + '→' + curFinal + (curFixed ? '(已修正)' : '') + ')' +
+    (res.fixes.length ? ' 修正: ' + res.fixes.join(' / ') : '') + (res.warns.length ? ' ' + res.warns.join(' / ') : ''));
+  return res;
 }
+
 
 // 列表卡片提取 JS: 原生字段 (ASIN/标题/图片/评分/链接) + 智赢插件字段 (FBA/卖家数/排名/1688/人民币价)
 // 模板字符串常量 (内部无反引号), 供列表页直采/筛选采集在浏览器上下文执行
@@ -3900,10 +5182,13 @@ const LIST_CARD_EXPR = `(() => {
       return /\\/dp\\/[A-Z0-9]{10}/.test(h) && !/aax-|sspa|sparkle/.test(h);
     });
     if (!lk) return;
-    // 标题: h2 优先, 变体卡片等特殊结构用 .a-color-base.a-text-normal, 再兜底 /dp/ 链接文本
+    // 标题: 榜单页用 p13n 截断文本节点; 搜索页 h2 优先; 再兜底图片 alt / 链接文本
+    /* ★ 2026-11-10 修复: 榜单页(#gridItemRoot) 标题不在 h2, 而在 ._cDEzb_p13n-sc-css-line-clamp-3_* 里,
+     *   且 /dp/ 图片链接既无 title 属性也无文本 → 原来榜单页标题全是空串。 */
     let title = '';
-    const t = el.querySelector('h2 span, h2, .a-color-base.a-text-normal');
-    if (t) title = t.textContent.trim();
+    const t = el.querySelector('._cDEzb_p13n-sc-css-line-clamp-3_g3dy1, ._cDEzb_p13n-sc-css-line-clamp-2_g3dy1, ._cDEzb_p13n-sc-css-line-clamp-1_1VO-g, .p13n-sc-truncate-desktop-type2, h2 span, h2, .a-color-base.a-text-normal');
+    if (t) title = (t.textContent || '').trim();
+    if (!title) { const im = el.querySelector('img[alt]'); if (im) title = (im.getAttribute('alt') || '').trim(); }
     if (!title) title = (lk.getAttribute('title') || lk.textContent || '').trim();
     const img = el.querySelector('.s-image, img');
     const ratingEl = el.querySelector('.a-icon-alt');
@@ -3915,6 +5200,13 @@ const LIST_CARD_EXPR = `(() => {
     // ★ 2026-09-25 结构化排名行: 每行 = ranktag(数字) + a[href*=bestsellers](类目, 带层级) + span(标签)
     //   大排名只认【根类目】行 —— 旧写法按 .ranktag 抓数字取最大, 会把子类目的 #1 当大排名
     const rankInfo = readRanks(el);
+    /* ★ 2026-11-10 新增: 榜单页的排名徽章 (#1 / #2…) 在 .zg-bdg-text 里, 既不是 .ranktag 也没有结构化行
+     *   → 原来榜单页的 rank 恒为 null, 选品的"低竞争上榜/热销低评分"全部判不出来。 */
+    let listRank = null;
+    (function () {
+      const b = el.querySelector('.zg-bdg-text, .zg-bdg-ctr .zg-bdg-text, .a-badge-text');
+      if (b) { const m = (b.textContent || '').match(/#?\s*([\d,]+)/); if (m) listRank = parseInt(m[1].replace(/,/g, ''), 10); }
+    })();
     // 插件: 排名标签 (#5397 #38)
     const rankList = [...el.querySelectorAll('.ranktag')]
       .map(x => (x.textContent || '').trim())
@@ -3969,19 +5261,61 @@ const LIST_CARD_EXPR = `(() => {
         if (mNum) { const n = parseFloat(mNum[1].replace(/,/g, '')); if (!isNaN(n) && n > 0) price = n; }
       }
     }
+    /* ★ 2026-11-10 修复: 榜单页(Best Sellers)没有 .a-offscreen —— 价格被拆成「£11」+「75」两个节点,
+     *   原选择器只认 .a-offscreen → 榜单页 price 全 null, 选品没有价格可用。
+     *   这里兜底读 .a-price 整段文本(含被拆的小数), 以及 p13n 榜单专用价格节点。
+     *   仍然是"读不到就是 null", 不猜价。 */
+    if (price == null && priceCny == null) {
+      const altP = el.querySelector('._cDEzb_p13n-sc-price_3mJ9Z, .a-price, .a-text-price');
+      if (altP) {
+        const pt = (altP.textContent || '').replace(/\\s+/g, ' ').trim();
+        const mRmb = pt.match(/(?:人民币|CNY|¥)\\s*([\\d.,]+)/);
+        if (mRmb) priceCny = parseFloat(mRmb[1].replace(/,/g, ''));
+        else {
+          // 「£11 75」这种被拆开的小数: 主数字后紧跟 1-2 位小数
+          const mSplit = pt.match(/(?:£|€|\\$|¥|A\\$|C\\$)\\s*([\\d,]+)\\s+(\\d{1,2})\\b/);
+          const mNum2 = mSplit ? null : pt.match(/([\\d][\\d,]*\\.?\\d{0,2})/);
+          const v = mSplit ? parseFloat(mSplit[1].replace(/,/g, '') + '.' + mSplit[2]) : (mNum2 ? parseFloat(mNum2[1].replace(/,/g, '')) : NaN);
+          if (!isNaN(v) && v > 0) price = v;
+        }
+      }
+    }
+    /* ★ 2026-11-10 新增: 评论数。列表页每个商品都有 (原生) —— 原实现只取评分, 评论数在选品评分里是
+     *   "竞争烈度/新品能不能挤进来"的核心指标, 之前只能靠详情页补采 (每件 7 秒) 才拿得到。
+     *   三个来源按可靠度取: aria-label("4.3 out of 5 stars, 4,941 ratings") > 评价链接文本 > 评分旁的小号数字。 */
+    let reviews = null;
+    (function () {
+      const revA = el.querySelector('a[aria-label*="out of 5 stars"], a[href*="product-reviews"], a[data-hook="review-count"]');
+      if (revA) {
+        const al = (revA.getAttribute('aria-label') || '');
+        const tx = (revA.textContent || '').replace(/\\s+/g, ' ').trim();
+        let m = al.match(/([\\d,]+)\\s+ratings?/i);
+        if (!m) m = tx.match(/out of 5 stars\\s*([\\d,]+)/);
+        if (!m) m = tx.match(/([\\d][\\d,]{2,})/);
+        if (m) { const v = parseInt(String(m[1]).replace(/,/g, ''), 10); if (!isNaN(v) && v >= 0) reviews = v; }
+      }
+      if (reviews == null) {
+        const sm = el.querySelector('.a-size-small.s-underline-text, .s-underline-text');
+        if (sm) { const m = (sm.textContent || '').match(/([\\d][\\d,]{2,})/); if (m) { const v = parseInt(m[1].replace(/,/g, ''), 10); if (!isNaN(v)) reviews = v; } }
+      }
+    })();
     // ★ 修复(2026-09-24): 卡片插件面板原文 —— 【类目名】和【品牌】只在这里。
     //   .ranktag 里只有数字(#4,856), 类目名在旁边的文本里; 面板排版:
     //   「... 品牌：LIFEBEA 登录 卖家： LIFEBEA FBA 店铺选品 #4,856 Home 榜单选品 #37 Sofa Slipcovers 榜单选品 ...」
     let panelTxt = '';
     (function () {
-      const host = el.querySelector('[data-zying-main-append]') || el.querySelector('.zying-shadow-root');
+      /* ★ 2026-11-10 修复: 榜单页(#gridItemRoot) 的插件面板挂在卡片内层 div[data-asin] 之外,
+       *   原来只在 el 内部找 → 榜单页面板恒为空(品牌/重量/商品类型全丢)。
+       *   现在按 ASIN 全局找, 再退回卡片内部找。 */
+      const host = document.querySelector('[data-zying-asin="' + asin + '"]')
+        || el.querySelector('[data-zying-main-append]') || el.querySelector('.zying-shadow-root');
       if (!host) return;
       // ★ 性能: innerText 会强制重排, 绝不能对每个节点调用 (曾因此让 60 张卡的提取超时 40s+)。
       //   先用轻量遍历只收集 shadowRoot, 读文本时只碰「宿主 + 各 shadowRoot」, 每张卡 ≤8 次。
       const roots = [];
       let budget = 400;
       const scan = function (n, d) {
-        if (!n || d > 4 || budget <= 0 || roots.length > 6) return;
+        if (!n || d > 6 || budget <= 0 || roots.length > 8) return;   // ★ 深度 4→6: 面板里嵌套更深
         budget--;
         let sr = null;
         try { sr = n.shadowRoot; } catch (e) {}
@@ -3994,6 +5328,29 @@ const LIST_CARD_EXPR = `(() => {
       try { if (host.innerText) parts.push(host.innerText); } catch (e) {}
       for (let i = 0; i < roots.length; i++) { try { if (roots[i].innerText) parts.push(roots[i].innerText); } catch (e) {} }
       panelTxt = parts.join(' ').replace(/\\s+/g, ' ').trim();
+    })();
+    /* ★ 2026-11-10 新增: 品牌兜底 —— 面板没填数据时(未登录/插件未分析), Amazon 自己的品牌链接还在:
+     *   ① ast_bln/bl_ast_dp 品牌旗舰店链接文本 "by X"  ② /stores/X/page  ③ field-lbr_brands_browse-bin=X
+     *   面板优先, 链接兜底; 都没有就是 null, 不猜。 */
+    let linkBrand = '';
+    (function () {
+      const as = [...el.querySelectorAll('a')];
+      for (const a of as) {
+        const h = a.getAttribute('href') || '';
+        if (h.includes('ast_bln') || h.includes('bl_ast_dp')) { linkBrand = (a.textContent || '').trim().replace(/^by\\s+/i, ''); break; }
+      }
+      if (!linkBrand) for (const a of as) {
+        const h = a.getAttribute('href') || '';
+        if (h.includes('field-lbr_brands_browse-bin')) {
+          const m = h.match(/brands_browse-bin=([^&]+)/);
+          linkBrand = (a.textContent || '').trim() || (m ? decodeURIComponent(m[1]) : '');
+          if (linkBrand) break;
+        }
+      }
+      if (!linkBrand) for (const a of as) {
+        const m = (a.getAttribute('href') || '').match(/\\/stores\\/([^\\/?]+)/);
+        if (m) { linkBrand = decodeURIComponent(m[1]); break; }
+      }
     })();
     let mShop = panelTxt.match(/店铺选品\\s*#\\s*([\\d,]+)\\s+(.+?)\\s*(?:榜单选品|店铺选品|$)/);
     // ★ 兜底: 部分卡片面板没有「店铺选品」标签, 排版是「卖家:4 #8,714 Home 榜单选品 #59 Sofa Slipcovers」
@@ -4038,26 +5395,79 @@ const LIST_CARD_EXPR = `(() => {
     const panelSales30d = (mSales && !new RegExp('^(' + PH + ')').test(mSales[1])) ? parseInt(mSales[1].replace(/[.,]/g, ''), 10) : null;
     const mUp = panelTxt.match(/上架[:：]\\s*(\\d{4}-\\d{2}-\\d{2})/);
     const panelListedAt = mUp ? mUp[1] : null;
+    /* ★ 2026-11-10 新增: 面板里的重量/尺寸/变体/A+ —— 原本只解析了品牌/卖家/月销/上架,
+     *   这四项在面板里明明有(重量：227 grams / 尺寸：13.7x26.4x31.5 / 变体：2个 / A+), 却被丢掉了。
+     *   选品的「轻小件 / FBA 头程成本」全靠重量, 之前只能跳详情页补采才能拿到。 */
+    const mWt = panelTxt.match(/重量[:：]\\s*([\\d.,]+)\\s*(kg|kilograms?|g|grams?|gr|oz|ounces?|lb|lbs?|pounds?)/i);
+    let panelWeightG = null;
+    if (mWt) {
+      const nW = parseFloat(mWt[1].replace(/,/g, ''));
+      if (isFinite(nW) && nW > 0) {
+        const uW = mWt[2].toLowerCase();
+        panelWeightG = uW.startsWith('k') ? Math.round(nW * 1000)
+          : (uW.startsWith('lb') || uW.startsWith('pound')) ? Math.round(nW * 453.592)
+            : (uW.startsWith('oz') || uW.startsWith('ounce')) ? Math.round(nW * 28.3495)
+              : Math.round(nW);
+      }
+    }
+    const panelWeightRaw = mWt ? String(mWt[0]).replace(/^重量[:：]\\s*/, '').trim().slice(0, 40) : null;
+    const mSz = panelTxt.match(/尺寸[:：]\\s*([\\d.,]+(?:\\s*[x×*]\\s*[\\d.,]+){0,2}\\s*(?:centimetres?|cm|inches?|in|mm)?)/i);
+    const panelSize = mSz ? String(mSz[1]).trim().slice(0, 50) : null;
+    const mVr = panelTxt.match(/变体[:：]\\s*(\\d+)/);
+    const panelVariants = mVr ? parseInt(mVr[1], 10) : null;
+    const panelAplus = /(^|[\\s|])A\\+([\\s|]|$)/.test(panelTxt);
     out.push({
       asin, title: title.slice(0, 250),
       link: lk.href,
       img: img ? (img.getAttribute('src') || img.getAttribute('data-src') || '') : null,
       rating: ratingEl ? (() => { const m = (ratingEl.textContent || '').match(/([\\d.,]+)\\s*out of/); return m ? parseFloat(m[1].replace(',', '.')) : null; })() : null,
       fulfill, sellerCount: sellerM ? parseInt(sellerM[1], 10) : null,
-      bsr: rankList, ranks: nRanks,
+      bsr: rankList, ranks: nRanks, listRank: listRank,
       rankInfo: rankInfo,
       bsrShop: nBsrShop, bsrShopCat: nBsrShopCat, bsrCat: nBsrCat, bsrCatName: nBsrCatName,
-      brand: panelBrand, seller: panelSeller, price: price, panelFulfill: panelFulfill,
+      brand: panelBrand || linkBrand || null, brandSrc: panelBrand ? 'panel' : (linkBrand ? 'link' : null), seller: panelSeller, price: price, panelFulfill: panelFulfill,
       panelSellerCount: mSellerCnt ? parseInt(mSellerCnt[1], 10) : null,
       sales30d: (panelSales30d != null && !isNaN(panelSales30d)) ? panelSales30d : null,
       listedAt: panelListedAt,
       trademark: (panelTmCount != null ? { count: panelTmCount, status: panelTmStatus } : null),
+      /* ★ 2026-11-10 选品字段: 评论数 + 重量(克/原文) + 尺寸 + 变体数 + A+ + 是否有面板
+       *   —— 这些是五维评分(竞争烈度/门槛/轻小件利润)的输入, 缺了就只能跳详情页逐件补采。 */
+      reviews: reviews,
+      weightG: panelWeightG,
+      weightRaw: panelWeightRaw,
+      sizeRaw: panelSize,
+      variants: panelVariants,
+      aplus: panelTxt ? panelAplus : null,
+      hasPanel: !!panelTxt,
       tmText: brandSeg ? brandSeg.trim().slice(0, 80) : null,
       is1688, is1688Url: is1688Url || (is1688 ? 'https://s.1688.com/selloffer/offer_search.htm?keywords=' + encodeURIComponent((title || '').slice(0, 60)) : null), priceCny, badge,
     });
   });
   return JSON.stringify(out);
 })()`;
+
+/**
+ * 页面健康探针 —— 判断"拿不到商品到底是为什么"
+ * 实测过的三种失败面: ① 验证码/机器人页 ② 软拦截页("Click the button below to continue shopping")
+ * ③ 正常但插件没注入(未登录/插件被禁)。原来一律抛"未提取到商品", 无法定位。
+ */
+async function cdpPageHealth(send) {
+  try {
+    const r = await send('Runtime.evaluate', {
+      expression: `JSON.stringify({ url: location.href.slice(0, 160), title: (document.title || '').slice(0, 90),
+        asinCount: document.querySelectorAll('div[data-asin]').length,
+        panelCount: document.querySelectorAll('[data-zying-asin]').length,
+        body: (document.body ? document.body.innerText : '').slice(0, 1200) })`,
+      returnByValue: true,
+    });
+    const v = JSON.parse((r && r.result && r.result.value) || '{}');
+    const t = String(v.title || '') + ' ' + String(v.body || '');
+    if (/captcha|Robot Check|Enter the characters|api-services-support@amazon|验证码|机器人验证/i.test(t)) return { ok: false, kind: 'captcha', ...v };
+    if (/Click the button below to continue shopping|continue shopping/i.test(t)) return { ok: false, kind: 'interstitial', ...v };
+    if (!v.asinCount) return { ok: false, kind: 'empty', ...v };
+    return { ok: true, kind: 'ok', ...v };
+  } catch (e) { return { ok: true, kind: 'probe-failed', err: String((e && e.message) || e) }; }
+}
 
 // ===== 列表页直采: 不跳详情页, 直接读列表页所有商品 + 智赢插件注入信息 (FBA/排名/卖家数/1688同款) =====
 // 输入: 任意 amazon 列表页 URL (搜索 / 类目 / 店铺, 如 /s?k=Car+Accessories&i=automotive...)
@@ -4112,7 +5522,15 @@ async function cdpListDirectCollect(url, opts = {}) {
     bumpCollectProgress({ step: '翻页采集', items: all.length, page: pg, pages: maxPages, rounds: pg });
     if (items.length < 16) break; // 无更多页
   }
-  if (!all.length) throw new Error('列表页未提取到商品 (可能需登录或页面结构变化)');
+  if (!all.length) {
+    /* ★ 2026-11-10: 分清"被拦截"和"页面结构变了/没登录" —— 原来只有一句笼统的"未提取到商品" */
+    const h = await cdpPageHealth(send);
+    if (!h.ok) {
+      throw new Error('列表页被拦截(' + h.kind + '): ' + String(h.title || h.url || '').slice(0, 80)
+        + ' —— 请在 ERP「浏览器」面板切到本机 Edge(target=user) 后重试, 或先在 Edge 里打开一次 Amazon 确认已登录');
+    }
+    throw new Error('列表页未提取到商品 (页面正常但没有商品卡片: 可能未登录/插件未注入/URL 不是列表页)');
+  }
   const list = all.slice(0, maxItems);
   const pagesDone = Math.min(maxPages, Math.max(1, Math.ceil(all.length / 16)));
 
@@ -4172,6 +5590,12 @@ async function cdpListDirectCollect(url, opts = {}) {
         else if (/未查到/.test(String(p.trademark.status || ''))) existing.brandStatus = 'notfound';
       }
       if (p.brand && (!existing.brand || existing.brand === 'Unknown')) existing.brand = p.brand;
+      /* ★ 2026-11-10: 已存在商品也补这四类列表级字段 (只补空, 不覆盖详情页采到的真值) */
+      if (p.reviews != null && existing.reviews == null) existing.reviews = p.reviews;
+      if (p.weightRaw && !existing.weight) existing.weight = p.weightRaw;
+      if (p.sizeRaw && !existing.size) existing.size = p.sizeRaw;
+      if (p.variants != null && existing.variantsCount == null) existing.variantsCount = p.variants;
+      if (p.aplus === true && !existing.aplus) existing.aplus = true;
       if (p.seller && !existing.mainSeller) existing.mainSeller = p.seller;
       if (p.panelSellerCount != null && !(existing.followCount > 0)) existing.followCount = p.panelSellerCount;
       if (p.fulfill && !existing.fulfill) existing.fulfill = p.fulfill;
@@ -4208,7 +5632,11 @@ async function cdpListDirectCollect(url, opts = {}) {
       price: p.price != null ? p.price : null, currency: siteCurrency(site),
       priceCny: p.priceCny || null,      // 人民币参考价 (插件把列表价换成人民币时才用)
       monthlySales: p.sales30d != null ? p.sales30d : null,
-      reviews: null, rating: p.rating || null, stock: null,
+      /* ★ 2026-11-10: 列表页其实读得到评论数/重量/尺寸/变体/A+, 原来写死 reviews:null 且不落重量 ——
+       *   选品要用的"评论 200 以内新品 / 轻小件"全靠这四项, 之前必须逐件跳详情页补采才有。 */
+      reviews: p.reviews != null ? p.reviews : null, rating: p.rating || null, stock: null,
+      weight: p.weightRaw || null, size: p.sizeRaw || null,
+      variantsCount: p.variants != null ? p.variants : null, aplus: p.aplus === true,
       listedAt: p.listedAt || null,
       // ★ 类目: 用面板给的真类目名 (店铺选品→宽类目, 榜单选品→细类目); 拿不到就不写, 绝不写 'ListPage' 这种占位
       bsr: (p.ranks && p.ranks.length) ? p.ranks : (p.bsr || []).map((rank) => ({ rank: rank, category: null })),
@@ -4229,6 +5657,112 @@ async function cdpListDirectCollect(url, opts = {}) {
   if (added > 0 || updatedCount > 0) save('products.json', products);
   return { site, url, maxPages, pagesDone, total: all.length, productCount: list.length, added, products: imported };
 }
+
+/**
+ * 等面板就绪 (P0-2) —— 替代固定硬等 N 秒
+ * 智赢插件的面板是异步逐个分析的: 已填面板数会先涨后停。这里每 tick 采样一次, 连续两次不增长
+ * 就认为"分析完 / 卡住了", 或达到目标比例(默认 75%)直接返回 —— 既不白等, 也不漏数据。
+ */
+async function cdpWaitPanelReady(send, opts = {}) {
+  const maxMs = Math.min(120000, Math.max(3000, opts.maxMs || 30000));
+  const tickMs = Math.max(1000, opts.tickMs || 2500);
+  const needRatio = opts.needRatio != null ? opts.needRatio : 0.75;
+  const t0 = Date.now();
+  let last = -1, stable = 0, filled = 0, panels = 0;
+  while (Date.now() - t0 < maxMs) {
+    try {
+      const r = await send('Runtime.evaluate', {
+        expression: `(() => { const ps = [...document.querySelectorAll('[data-zying-asin]')];
+          return JSON.stringify({ panels: ps.length, filled: ps.filter(function (p) { return (p.innerText || '').length > 20; }).length }); })()`,
+        returnByValue: true,
+      });
+      const v = JSON.parse((r && r.result && r.result.value) || '{}');
+      panels = v.panels || 0; filled = v.filled || 0;
+    } catch (e) { /* 采样失败不中断 */ }
+    if (filled === last) stable++; else stable = 0;
+    last = filled;
+    if (panels > 0 && filled >= Math.ceil(panels * needRatio)) break;
+    if (stable >= 2 && filled > 0) break;
+    await new Promise((res) => setTimeout(res, tickMs));
+  }
+  return { panels, filled, waitedMs: Date.now() - t0, ratio: panels ? Math.round((filled / panels) * 100) / 100 : 0 };
+}
+
+/**
+ * 蓝海选品扫描 (只读, 不入库)
+ * ==================================================================
+ * 与 cdpListDirectCollect 的区别: 不写 products.json、不改商品库, 只把列表页/榜单页的
+ * 卡片字段 + 插件面板字段读回来, 交给 selection-score.js 算五维分与候选。
+ * 目的: 选品是"看"的动作, 不该污染商品库; 确认要的品再走「加入商品库 + 一键补采」。
+ */
+async function cdpSelectionScan(url, opts = {}) {
+  const maxPages = Math.min(10, Math.max(1, opts.maxPages || 1));
+  const waitPluginMs = Math.min(40000, Math.max(0, opts.waitPluginMs != null ? opts.waitPluginMs : 12000));
+  const siteMatch = url.match(/amazon\.(com\.au|co\.uk|com|com\.mx|com\.br|de|fr|it|es|co\.jp|ca|in|nl|se|pl)/);
+  const site = siteMatch && CDP_SITE_CODE[siteMatch[1]] ? CDP_SITE_CODE[siteMatch[1]] : 'uk';
+  const tabs = await cdpGetTabs();
+  const page = tabs.find((t) => t.type === 'page' && t.url.includes('amazon')) || tabs.find((t) => t.type === 'page');
+  if (!page) throw new Error('Edge 无可用页面标签, 请确认 Edge 以 --remote-debugging-port=9222 启动');
+  const { send } = await cdpConnect(page.webSocketDebuggerUrl);
+
+  await send('Page.navigate', { url });
+  await new Promise((r) => setTimeout(r, 8000));
+  const glowChanged = await cdpSetGlowAddress(send, url, site);
+  if (glowChanged) {
+    await send('Page.navigate', { url });
+    await new Promise((r) => setTimeout(r, 8000));
+  }
+
+  const all = [];
+  const seen = new Set();
+  let health = null;
+  let ready = null;
+  for (let pg = 1; pg <= maxPages; pg++) {
+    if (collectStopRequested()) break;
+    if (pg > 1) {
+      const pgUrl = /\bpage=\d+/.test(url) ? url.replace(/\bpage=\d+/, 'page=' + pg)
+        : /\bpg=\d+/.test(url) ? url.replace(/\bpg=\d+/, 'pg=' + pg)
+          : url + (url.includes('?') ? '&' : '?') + 'pg=' + pg;
+      await send('Page.navigate', { url: pgUrl });
+      await new Promise((r) => setTimeout(r, 7000));
+    }
+    // 榜单页懒加载: 切前台 + 小步滚动 —— 实测智赢插件的面板【只在标签页前台且卡片进入视口时才填数据】
+    // (不切前台: 30 个面板容器全空; 切前台后 15 秒填 5 个 = 当前视口内那几个)
+    // 面板是插件按 ASIN 逐个分析的, 一遍扫过很多卡来不及填 → 走两遍, 第二遍把顶部卡片重新带回视口。
+    try { await send('Page.bringToFront', {}); } catch (e) {}
+    const sweep = async (times, frac, dwell) => {
+      for (let i = 0; i < times; i++) {
+        await send('Runtime.evaluate', { expression: 'window.scrollBy(0, Math.round(window.innerHeight*' + frac + '))' });
+        await new Promise((r) => setTimeout(r, dwell));
+      }
+    };
+    await sweep(16, 0.5, 1100);
+    await new Promise((r) => setTimeout(r, 5000));
+    await send('Runtime.evaluate', { expression: 'window.scrollTo(0, 0)' });
+    await new Promise((r) => setTimeout(r, 1200));
+    await sweep(16, 0.5, 700);
+    await send('Runtime.evaluate', { expression: 'window.scrollTo(0, 0)' });
+    // ★ P0-2: 就绪轮询取代硬等 —— 面板填满 75% 或连续两次不增长就继续, 省掉无谓等待
+    const readyNow = await cdpWaitPanelReady(send, { maxMs: Math.max(waitPluginMs, 8000) });
+    ready = readyNow;
+    console.log('[selection] 面板就绪:', JSON.stringify(readyNow));
+    health = await cdpPageHealth(send);
+    if (!health.ok) throw new Error('页面异常(' + health.kind + '): ' + String(health.title || health.url || '').slice(0, 80));
+    const r = await send('Runtime.evaluate', { expression: LIST_CARD_EXPR, returnByValue: true });
+    let items = [];
+    try { items = JSON.parse(r.result.value); } catch (e) { throw new Error('列表页解析失败: ' + e.message); }
+    const fresh = items.filter((x) => !seen.has(x.asin));
+    fresh.forEach((x) => seen.add(x.asin));
+    for (const x of fresh) all.push({ ...x, cat: null, catName: null, site });
+    bumpCollectProgress({ step: '选品扫描', items: all.length, page: pg, pages: maxPages, rounds: pg });
+    if (items.length < 12) break;
+  }
+  if (!all.length) throw new Error('未提取到商品 (页面正常但无卡片: 确认是 Amazon 列表/榜单页, 且插件已注入)');
+  return { site, url, pages: maxPages, total: all.length, items: all, ready, health: { kind: health && health.kind, panelCount: health && health.panelCount, asinCount: health && health.asinCount } };
+}
+
+// ===== 蓝海选品: 扫描 + 评分结果 (进程内保留最近一次, 供导表/入库) =====
+let selectionLast = null;
 
 // ===== 列表页筛选采集: 列表页直采(含插件信息) → 采集筛选前置过滤 → 只跳转通过筛选的商品取详情页数据 =====
 // 流程: 列表页翻页提取(插件 FBA/排名/卖家数/1688) → preFilterByList 前置筛(可用字段) →
@@ -4507,12 +6041,13 @@ async function cdpCategoryCollect(opts) {
   for (let pg = 1; pg <= maxPages; pg++) {
     if (collectStopRequested()) break;
     const pgUrl = pg === 1 ? url : url + (url.includes('?') ? '&' : '?') + 'page=' + pg;
+    /* ★ 站点一致性校验(2026-10-04, 按《优化文档.md》§5.2): 本函数自己 Page.navigate,
+     *   不经过 cdpSetGlowAddress 主挂载点 → 这里补一次(并行采集靠 cdpCheckSiteLocale 内部去重) */
+    try { await cdpCheckSiteLocale(send, pgUrl, site); } catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
     await send('Page.navigate', { url: pgUrl });
     await new Promise((r) => setTimeout(r, 8000));
     for (let i = 0; i < 4; i++) { await send('Runtime.evaluate', { expression: `window.scrollTo(0, ${(i + 1) * 4000})` }); await new Promise((r) => setTimeout(r, 900)); }
     await new Promise((r) => setTimeout(r, 1200));
-    /* ★ 2026-10-04 站点一致性校验: 本函数自己导航、不经过 cdpSetGlowAddress, 在这里补做一次 */
-    if (pg === 1) { try { await cdpCheckSiteLocale(send, pgUrl, site); } catch (e) { /* 不影响采集 */ } }
     const r = await send('Runtime.evaluate', {
       expression: `(() => {
         const out = [];
@@ -4631,13 +6166,13 @@ async function cdpSiteBulkCollect(opts = {}) {
         tab = await cdpCreateTab('https://' + host + '/');
         const { send } = await cdpConnect(tab.wsUrl);
         const pgUrl = pg === 1 ? base : base + (base.includes('?') ? '&' : '?') + 'page=' + pg;
+    /* ★ 站点一致性校验(2026-10-04, 按《优化文档.md》§5.2): 本函数自己 Page.navigate,
+     *   不经过 cdpSetGlowAddress 主挂载点 → 这里补一次(并行采集靠 cdpCheckSiteLocale 内部去重) */
+    try { await cdpCheckSiteLocale(send, pgUrl, site); } catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
         await send('Page.navigate', { url: pgUrl });
         await new Promise((r) => setTimeout(r, 9000));
         for (let i = 0; i < 4; i++) { await send('Runtime.evaluate', { expression: `window.scrollTo(0, ${(i + 1) * 4000})` }); await new Promise((r) => setTimeout(r, 800)); }
         await new Promise((r) => setTimeout(r, 1000));
-        /* ★ 2026-10-04 站点一致性校验: 本函数自己开标签页/导航, 不经过 cdpSetGlowAddress, 在这里补做一次。
-         *   并行 N 个标签页 → cdpCheckSiteLocale 内部按站点去重, 只有一个真跑, 其余等它。 */
-        if (pg === 1) { try { await cdpCheckSiteLocale(send, pgUrl, site); } catch (e) { /* 不影响采集 */ } }
         const r = await send('Runtime.evaluate', {
           expression: `(() => {
             const out = [];
@@ -4956,21 +6491,28 @@ const DETAIL_READ_EXPR = `(() => {
     // 类目层级已由 DETAIL_CORE_JS 统一提取
     const b = document.querySelector('#bylineInfo a, #bylineInfo_feature_div a');
     if (b) { const bt = b.textContent.trim().replace(/\\s+/g, ' ').replace(/^Brand:\\s*/i, '').trim(); if (bt && bt.length > 1 && bt.length < 60) out.brand = bt; }
-    const sels = ['#corePrice_feature_div .a-offscreen', '.apex-pricetopayvalue', '#price_inside_buybox', '.a-price .a-offscreen'];
-    /* ★ 2026-10-02 价格: 这里【只取原始文本】, 不在浏览器里 parseFloat。
-     * 旧写法 parseFloat(m[1].replace(/,/g,'')) 把德国站的 "29,99 €" 读成 2999 (虚高 100 倍),
-     * 把 "1.234,56 €" 读成 1.23456 (缩水 1 万倍) —— 因为德语的小数点是逗号。
-     * 现在把原始串带回 Node, 用 parseMoneyText(raw, site) 按站点格式解析。 */
-    for (const sel of sels) {
-      const el = document.querySelector(sel);
-      if (el) { const m = (el.textContent || '').match(/([\\d.,]+)/); if (m) { out.priceRaw = m[1]; break; } }
-    }
-    if (out.priceRaw == null) {
-      const w = document.querySelector('.a-price-whole');
-      const f = document.querySelector('.a-price-fraction');
-      // whole/fraction 是 Amazon 拆好的整数/小数两段, 无歧义 → 直接拼 (不经过千分位判断)
-      if (w) { const v = parseFloat((w.textContent || '').replace(/[^\\d]/g, '') + '.' + ((f ? (f.textContent || '').replace(/[^\\d]/g, '') : '') || '00')); if (!isNaN(v)) out.price = v; }
-    }
+    /* ★★ 2026-10-29 修【价格少小数点 → 34.99 被存成 3499】
+     *   实测(amazon.com.au): #corePrice_feature_div .a-offscreen 的文本是 "$3499"(没有小数点),
+     *   而 .a-price-whole="34" / .a-price-fraction="99" 才是完整信息。
+     *   旧顺序是「先读 offscreen, 命中就 break」→ priceRaw="3499" → parseMoneyText → 3499(把分当元, 虚高 100 倍),
+     *   下面的 whole/fraction 兜底永远走不到。
+     *   现在改为【先拼 whole+fraction】(纯数字、无千分位/小数点歧义), 拿不到才退回 offscreen 文本。 */
+    (function () {
+      const w = document.querySelector('#corePrice_feature_div .a-price-whole, .a-price-whole');
+      const f = document.querySelector('#corePrice_feature_div .a-price-fraction, .a-price-fraction');
+      if (w) {
+        const wn = String(w.textContent || '').replace(/[^\\d]/g, '');
+        const fn = f ? String(f.textContent || '').replace(/[^\\d]/g, '') : '';
+        if (wn) out.priceRaw = fn ? (wn + '.' + fn) : wn;
+      }
+      if (out.priceRaw == null) {
+        const sels = ['#corePrice_feature_div .a-offscreen', '.apex-pricetopayvalue', '#price_inside_buybox', '.a-price .a-offscreen'];
+        for (const sel of sels) {
+          const el = document.querySelector(sel);
+          if (el) { const m = (el.textContent || '').match(/([\\d.,]+)/); if (m) { out.priceRaw = m[1]; break; } }
+        }
+      }
+    })();
     const olp = document.body ? document.body.textContent : '';
     let fm = olp.match(/New\\s*\\(\\d+\\)\\s*from\\s*(?:€|£|A\\$|AU\\$|US\\$|C\\$|\\$)?\\s*([\\d.,]+)/i);
     if (!fm) fm = olp.match(/Neu\\s*\\(\\d+\\)\\s*ab\\s*(?:EUR|€)?\\s*([\\d.,]+)/i);
@@ -5020,18 +6562,33 @@ async function cdpPageGuard(send) {
 async function cdpReadDetail(send, host, it) {
   await send('Page.navigate', { url: 'https://' + host + '/dp/' + it.asin });
   await new Promise((r) => setTimeout(r, 2500));
-  // 等详情页渲染 (标题 + 主图), 最多 15s — 与采集链路同一就绪判定, 避免读到未渲染的空页
-  for (let w = 0; w < 15; w++) {
+  /* ★★ 2026-10-29 就绪判定加强【修"价格/评分/评论常读到 null"】
+   *   旧判据只等「标题 + 主图」就开抽 —— 但价格区/评分区是【后渲染】的,
+   *   慢页面上抽到的是"标题有了、价格还没有" → price/rating/reviews 全 null(实测 B0HHMHRPFW / B0HKFGQC91)。
+   *   现在要求: 标题 + 主图 + (价格区 或 明确的"不可售"标记) 才放行。
+   *   注意: 不可售商品本来就没有价格区, 所以把"Currently unavailable"也算作【就绪】, 否则会白等 15s。 */
+  let _na = false;
+  const READY_EXPR = `(() => {
+    const t = document.querySelector('#productTitle');
+    const i = document.querySelector('#landingImage, #imgTagWrapperId img, #main-image-container img, #imageBlock img');
+    const p = document.querySelector('#corePrice_feature_div .a-price-whole, #corePriceDisplay_desktop_feature_div .a-price-whole, .a-price-whole, #corePrice_feature_div .a-offscreen, .priceToPay');
+    const body = document.body ? document.body.textContent.slice(0, 6000) : '';
+    const na = /Currently unavailable|Derzeit nicht verf|Actuellement indisponible|Non disponibile|No disponible|Temporaneamente esaurito/i.test(body);
+    return JSON.stringify({ t: !!t, i: !!i, p: !!p, na: na });
+  })()`;
+  for (let w = 0; w < 22; w++) {
     try {
-      const rr = await send('Runtime.evaluate', {
-        expression: `(() => { const t = document.querySelector('#productTitle'); const i = document.querySelector('#landingImage, #imgTagWrapperId img, #main-image-container img, #imageBlock img'); return JSON.stringify({ t: !!t, i: !!i }); })()`,
-        returnByValue: true,
-      });
+      const rr = await send('Runtime.evaluate', { expression: READY_EXPR, returnByValue: true });
       const st = JSON.parse(rr.result.value);
-      if (st.t && st.i) break;
+      if (st.na) _na = true;
+      if (st.t && st.i && (st.p || st.na)) break;
+      // 标题+主图都有了、也确认不可售 → 直接放行(别再等不存在的价格)
+      if (st.t && st.na) break;
     } catch (e) { /* 继续等 */ }
     await new Promise((r) => setTimeout(r, 1000));
   }
+  /* 记下"页面明确不可售" —— 这类商品本来就没有价格/评分, 不该算成"采集失败" */
+  if (_na) it.unavailable = true;
   for (let s = 0; s < 2; s++) { await send('Runtime.evaluate', { expression: `window.scrollTo(0, ${(s + 1) * 3000})` }); await new Promise((r) => setTimeout(r, 600)); }
   await new Promise((r) => setTimeout(r, 800));
   const rf = await send('Runtime.evaluate', { expression: DETAIL_READ_EXPR, returnByValue: true });
@@ -5500,12 +7057,12 @@ async function cdpCategoryMenuCollect(opts = {}) {
   const { send } = await cdpConnect(page.webSocketDebuggerUrl);
   const steps = [];
   // ① 首页
+    /* ★ 站点一致性校验(2026-10-04, 按《优化文档.md》§5.2): 本函数自己 Page.navigate,
+     *   不经过 cdpSetGlowAddress 主挂载点 → 这里补一次(并行采集靠 cdpCheckSiteLocale 内部去重) */
+    try { await cdpCheckSiteLocale(send, 'https://' + host + '/', site); } catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
   await send('Page.navigate', { url: 'https://' + host + '/' });
   await new Promise((r) => setTimeout(r, 9000));
   steps.push('① 进入 ' + host);
-  /* ★ 2026-10-04 站点一致性校验: 本函数自己导航、不经过 cdpSetGlowAddress, 在这里补做一次。
-   *   首页上国旗/送货地址/货币 cookie 都在(货币读的是 i18n-prefs cookie, 不依赖商品价格)。 */
-  try { await cdpCheckSiteLocale(send, 'https://' + host + '/', site); } catch (e) { /* 不影响采集 */ }
   // ② 大类目: 从首页 nav_cs_* 链接中找目标类目 (模糊匹配类目名)
   const catName = (opts.category || '').toLowerCase();
   let mainUrl = null;
@@ -7421,17 +8978,26 @@ async function cdpBackfillMainImage(opts = {}) {
     const host = 'www.amazon.' + siteToHostSuffix(it.site || 'uk');
     bumpCollectProgress({ items: i + 1, added: fixed, step: '补主图 ' + it.asin + ' (' + (i + 1) + '/' + targets.length + ')' });
     try {
+    /* ★ 站点一致性校验(2026-10-04, 按《优化文档.md》§5.2): 本函数自己 Page.navigate 到详情页, 不经主挂载点 */
+    try { await cdpCheckSiteLocale(send, 'https://' + host + '/dp/' + it.asin, (it.site || 'uk')); } catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
       await send('Page.navigate', { url: 'https://' + host + '/dp/' + it.asin });
       await new Promise((r) => setTimeout(r, 2500));
-      // 等详情页渲染 (标题 + 主图), 最多 15s — 与采集链路同一就绪判定
-      for (let w = 0; w < 15; w++) {
+      /* ★ 2026-10-29 与 cdpReadDetail 同口径: 要求 标题+主图+(价格区 或 不可售标记) 才开抽,
+       *   否则慢页面上会读到"有标题没价格" → price/rating 全 null(实测 B0HHMHRPFW / B0HKFGQC91)。 */
+      const READY2 = `(() => {
+        const t = document.querySelector('#productTitle');
+        const i = document.querySelector('#landingImage, #imgTagWrapperId img, #main-image-container img, #imageBlock img');
+        const p = document.querySelector('#corePrice_feature_div .a-price-whole, #corePriceDisplay_desktop_feature_div .a-price-whole, .a-price-whole, #corePrice_feature_div .a-offscreen, .priceToPay');
+        const body = document.body ? document.body.textContent.slice(0, 6000) : '';
+        const na = /Currently unavailable|Derzeit nicht verf|Actuellement indisponible|Non disponibile|No disponible|Temporaneamente esaurito/i.test(body);
+        return JSON.stringify({ t: !!t, i: !!i, p: !!p, na: na });
+      })()`;
+      for (let w = 0; w < 22; w++) {
         try {
-          const rr = await send('Runtime.evaluate', {
-            expression: `(() => { const t = document.querySelector('#productTitle'); const i = document.querySelector('#landingImage, #imgTagWrapperId img, #main-image-container img, #imageBlock img'); return JSON.stringify({ t: !!t, i: !!i }); })()`,
-            returnByValue: true,
-          });
+          const rr = await send('Runtime.evaluate', { expression: READY2, returnByValue: true });
           const st = JSON.parse(rr.result.value);
-          if (st.t && st.i) break;
+          if (st.t && st.i && (st.p || st.na)) break;
+          if (st.t && st.na) break;
         } catch (e) { /* 继续等 */ }
         await new Promise((r) => setTimeout(r, 1000));
       }
@@ -7446,8 +9012,19 @@ async function cdpBackfillMainImage(opts = {}) {
       if (d.reviews != null) it.reviews = d.reviews;
       if (d.category) it.category = d.category;
       if (d.brand && (!it.brand || it.brand === 'Unknown')) it.brand = d.brand;
-      if (d.newFrom != null) { it.price = d.newFrom; it.minPrice = d.newFrom; if (d.price != null) it.buyBoxPrice = d.price; }
-      else if (d.price != null) { it.price = d.price; it.buyBoxPrice = d.price; it.minPrice = d.price; }   // 价格修正 → minPrice/buyBoxPrice 同步, 否则会残留旧价
+      /* ★★ 2026-10-29 修【补采永远改不了价格】: 详情表达式只填 priceRaw/newFromRaw, 从不填 d.price/d.newFrom,
+       *   所以旧写法 `if (d.newFrom != null) ... else if (d.price != null) ...` 是【死分支】—— 价格永远不更新。
+       *   现在与 cdpReadDetail 同口径: d.price 为空就用 parseMoneyText(priceRaw, 站点) 解析原始串。 */
+      const _siteForPrice2 = it.site || (String(host || '').match(/amazon\.([a-z.]+)/) || [])[1] || '';
+      const dPrice = (d.price != null) ? d.price : parseMoneyText(d.priceRaw, _siteForPrice2);
+      const dNewFrom = (d.newFrom != null) ? d.newFrom : parseMoneyText(d.newFromRaw, _siteForPrice2);
+      if (dNewFrom != null) { it.price = dNewFrom; it.minPrice = dNewFrom; if (dPrice != null) it.buyBoxPrice = dPrice; }
+      else if (dPrice != null) { it.price = dPrice; it.buyBoxPrice = dPrice; it.minPrice = dPrice; }   // 价格修正 → minPrice/buyBoxPrice 同步, 否则会残留旧价
+      /* 派生字段跟着价格走(否则价格改了、建议价/佣金还是旧的) */
+      if (it.price != null) {
+        it.aiSuggestPrice = Math.round((it.price - 0.5) * 100) / 100;
+        try { it.referralFee = Math.round(it.price * (referralRateFor(it.cat1).rate / 100) * 100) / 100; } catch (e) {}
+      }
       // 报价里的最低价若存在, minPrice 取 自身价 与 报价最低价 的较小值
       if (Array.isArray(it.offerPrices) && it.offerPrices.length) {
         const nums = [it.price, ...it.offerPrices.map((o) => o.price)].filter((v) => v != null);
@@ -7484,10 +9061,7 @@ async function cdpBackfillMainImage(opts = {}) {
 const SITE_CURRENCY = {
   uk: 'GBP', us: 'USD', au: 'AUD', ca: 'CAD', jp: 'JPY', in: 'INR', mx: 'MXN', br: 'BRL',
   sg: 'SGD', tr: 'TRY', ae: 'AED', sa: 'SAR', se: 'SEK', pl: 'PLN', nl: 'EUR', de: 'EUR',
-  fr: 'EUR', it: 'EUR', es: 'EUR', be: 'EUR', ie: 'EUR',
-  cn: 'CNY',   /* ★ 2026-10-04 补: 中国站点币种。实测 amazon.de 的官方货币下拉里【没有 CNY】
-                *   (只有 EUR/GBP/CHF/PLN/SEK), 但 Network.setCookie 硬设 i18n-prefs=CNY 亚马逊接受,
-                *   页面价格会渲染成 "CNY82.94" 这种"代码形式"(没有 ¥ 符号映射)。 */
+  fr: 'EUR', it: 'EUR', es: 'EUR', be: 'EUR', ie: 'EUR', cn: 'CNY',
 };
 const siteCurrency = (site) => SITE_CURRENCY[site] || 'EUR';
 // 币种符号校验: 只接受与站点币种匹配的符号
@@ -7665,12 +9239,13 @@ async function cdpBrandChain(url, maxBrands = 2, maxPages = 3, withPanel = true,
   const host = 'www.amazon.' + siteToHostSuffix(site);
 
   // 1. 店铺页商品 + 品牌链接
+    /* ★ 站点一致性校验(2026-10-04, 按《优化文档.md》§5.2): 本函数自己 Page.navigate,
+     *   不经过 cdpSetGlowAddress 主挂载点 → 这里补一次(并行采集靠 cdpCheckSiteLocale 内部去重) */
+    try { await cdpCheckSiteLocale(send, url, site); } catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
   await send('Page.navigate', { url });
   await new Promise((r) => setTimeout(r, 9000));
   for (let i = 0; i < 5; i++) { await send('Runtime.evaluate', { expression: `window.scrollTo(0, ${(i + 1) * 4000})` }); await new Promise((r) => setTimeout(r, 1000)); }
   await new Promise((r) => setTimeout(r, 1500));
-  /* ★ 2026-10-04 站点一致性校验: 本函数自己导航、不经过 cdpSetGlowAddress, 在这里补做一次 */
-  try { await cdpCheckSiteLocale(send, url, site); } catch (e) { /* 不影响采集 */ }
   const r1 = await send('Runtime.evaluate', {
     expression: `(() => {
       const out = [];
@@ -7802,9 +9377,6 @@ async function cdpBrandBatch(opts = {}) {
   if (!page) throw new Error('Edge 无可用页面标签, 请确认 Edge 以 --remote-debugging-port=9222 启动');
   const { send } = await cdpConnect(page.webSocketDebuggerUrl);
   await send('Runtime.enable');
-  /* ★ 2026-10-04 站点一致性校验: 本函数不为"站点首页"导航(直接进品牌页), 所以这里就地校验一次。
-   *   当前页若不在 amazon 上会静默跳过(不告警、不缓存), 等真正导航过去后会再校验。 */
-  try { await cdpCheckSiteLocale(send, 'https://' + host + '/', site); } catch (e) { /* 不影响采集 */ }
 
   const known = new Set(products.map((x) => String(x.asin || '').toUpperCase()));   // 库内已有 → 不重复采
   const brands = [];
@@ -7819,6 +9391,9 @@ async function cdpBrandBatch(opts = {}) {
     try {
       // ---- ① 线索商品详情页 → 品牌名 + 品牌跳转链接 ----
       bumpCollectProgress({ step: `品牌 ${li + 1}/${leads.length}: ${label} — 读品牌跳转链接`, brandsDone: li, brandsTotal: leads.length });
+    /* ★ 站点一致性校验(2026-10-04, 按《优化文档.md》§5.2): 本函数自己 Page.navigate,
+     *   不经过 cdpSetGlowAddress 主挂载点 → 这里补一次(并行采集靠 cdpCheckSiteLocale 内部去重) */
+    try { await cdpCheckSiteLocale(send, `https://${host}/dp/${lead.asin}`, site); } catch (e) { console.error('[locale]', '站点一致性校验异常(已忽略):', e && e.message); }
       await send('Page.navigate', { url: `https://${host}/dp/${lead.asin}` });
       await new Promise((r) => setTimeout(r, 7000));
       const guard = await cdpPageGuard(send);
@@ -8039,9 +9614,19 @@ const BRAND_LIST_JS = `(() => {
     const lk = el.querySelector('a[href*="/dp/"]');
     if (!lk) return;
     const t = el.querySelector('h2 span, h2');
-    const pr = el.querySelector('.a-price .a-offscreen');
-    let priceTxt = pr ? pr.textContent : '';
-    if (!clean(priceTxt)) { const pw = el.querySelector('.a-price-whole'); if (pw) priceTxt = pw.textContent; }
+    /* ★★ 2026-10-29 价格: 先拼 .a-price-whole + .a-price-fraction, 再退回 .a-offscreen。
+     *   原因(实测 amazon.com.au): offscreen 文本可能是 "$3499"(少小数点) → parseMoneyText → 3499(虚高 100 倍)。 */
+    let priceTxt = '';
+    (function () {
+      const pw = el.querySelector('.a-price-whole');
+      const pf = el.querySelector('.a-price-fraction');
+      if (pw) {
+        const wn = String(pw.textContent || '').replace(/[^\\d]/g, '');
+        const fn = pf ? String(pf.textContent || '').replace(/[^\\d]/g, '') : '';
+        if (wn) priceTxt = fn ? (wn + '.' + fn) : wn;
+      }
+      if (!clean(priceTxt)) { const pr = el.querySelector('.a-price .a-offscreen'); if (pr) priceTxt = pr.textContent; }
+    })();
     const badge = detectBadge((el.textContent || '').slice(0, 800));
     const one = out.length;
     push(asin, t ? t.textContent : '', priceTxt, lk.href);
@@ -8056,9 +9641,19 @@ const BRAND_LIST_JS = `(() => {
       for (let i = 0; i < 4 && box && box.parentElement; i++) box = box.parentElement;
       const boxTxt = box ? box.textContent : '';
       let priceTxt = '';
+      /* ★ 2026-10-29 同口径: whole+fraction 优先(offscreen 可能少小数点) */
       if (box) {
-        const pe = box.querySelector('.a-price .a-offscreen, .a-price-whole, [data-a-color="price"], .a-color-price');
-        if (pe) priceTxt = pe.textContent;
+        const pw2 = box.querySelector('.a-price-whole');
+        const pf2 = box.querySelector('.a-price-fraction');
+        if (pw2) {
+          const wn2 = String(pw2.textContent || '').replace(/[^\\d]/g, '');
+          const fn2 = pf2 ? String(pf2.textContent || '').replace(/[^\\d]/g, '') : '';
+          if (wn2) priceTxt = fn2 ? (wn2 + '.' + fn2) : wn2;
+        }
+        if (!clean(priceTxt)) {
+          const pe = box.querySelector('.a-price .a-offscreen, [data-a-color="price"], .a-color-price');
+          if (pe) priceTxt = pe.textContent;
+        }
       }
       if (!clean(priceTxt)) priceTxt = (boxTxt.match(/(?:A\\$|AU\\$|US\\$|C\\$|[$£€¥]|AUD|USD|GBP|EUR)\\s*[\\d.,]+/) || [''])[0];
       push(m[1], clean(a.textContent) || boxTxt.slice(0, 150), priceTxt, a.href);
@@ -9000,8 +10595,6 @@ function parseMoneyValue(v) {
   return { value: value, currency: currency, symbol: sym };
 }
 // FBA 配送费 / 站点币种换算用: 返回数值 (解析失败 → 0)
-function feeToNumber(v) { const p = parseMoneyValue(v); return p ? p.value : 0; }
-
 // ===== 利润测算 (单一实现: 明细逐项返回, 前端只渲染不重算) =====
 // 口径:
 //   ① 售价默认 BuyBox 价 (回退 price), 不再用"最低价"当收入
@@ -9127,7 +10720,7 @@ function computeProfit(p, req, taxOverrides, euData, rateInfo, euDate) {
 const { licenseStatus, hasFeature, deviceFingerprint, enforceEnabled, verifyLicenseText } = require('./license');
 
 // ===== HTTP 处理 =====
-const server = http.createServer((req, res) => {
+const opHandler = (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const p = url.pathname;
   let body = '';
@@ -9147,6 +10740,12 @@ const server = http.createServer((req, res) => {
       res.statusCode = code;
       res.end(JSON.stringify(data));
     };
+
+    /* ★ 2026-10-24 安全: 系统级操作(端口管理/浏览器控制/触发采集/查重开关)即使带了共享口令,
+     *   也只允许 ERP 所在的那台机器执行 —— 必须放在 send 定义之后, 否则 Cannot access 'send' before initialization */
+    if (!isLocalAddr(req) && (/^\/api\/(ports(\/(stop|start|delete))?|browser\/|collect\/)/.test(p) || /^\/api\/claims\/(settings|rebuild)/.test(p))) {
+      return send(403, { error: '该操作仅允许在 ERP 所在的那台机器上执行' });
+    }
 
     try {
       // ★ 路线 B: 跨源 POST JSON 会先发 OPTIONS 预检。原先只设了 Allow-Origin,
@@ -9711,6 +11310,21 @@ const server = http.createServer((req, res) => {
         }
         // 无采集在运行 → 清空上次停止标志, 正常开始新采集
         resetCollectStop();
+        /* ★ 2026-10-21 用户反复踩「没开采集浏览器 → CDP 连不上 → 链接 N 条 / 卖家 0 个 / 任务暂停」:
+         *   开始采集前先确保 CDP 在, 不在就自动拉起采集浏览器, 不再需要用户先手动打开。 */
+        {
+          const ensured = await ensureCollectBrowser(p);
+          if (!ensured.ok) {
+            return send(503, {
+              error: (ensured.error || '采集浏览器不可用') + ' —— 也可手动运行 启动采集浏览器.bat 后重试',
+              port: ensured.port, cdpDown: true,
+            });
+          }
+          if (ensured.started) {
+            try { pushActivity('collect-browser', '已自动拉起采集浏览器(端口 ' + ensured.port + ', ' + (ensured.via || 'user-profile') + ')'); } catch (e) {}
+            console.log('[collect] 已自动拉起采集浏览器 端口 ' + ensured.port);
+          }
+        }
         const MAP = {
           '/api/collect/category': ['category', '类目搜索采集'],
           '/api/collect/shop-list': ['shop-list', '店铺列表采集'],
@@ -9745,18 +11359,17 @@ const server = http.createServer((req, res) => {
       if (p === '/api/collect/completeness' && req.method === 'GET') {
         const from = String(url.searchParams.get('from') || '').trim();
         const minutes = parseInt(url.searchParams.get('minutes') || '0', 10) || 0;
-        if (from) return send(200, { ok: true, live: true, source: 'from=' + from, completeness: completenessSince(from) });
+        if (from) return send(200, { ok: true, live: true, source: 'from=' + from, completeness: completenessSince(from), locale: lastLocaleCheck || null });
         if (minutes > 0) {
           const t = new Date(Date.now() - minutes * 60000).toISOString().slice(0, 19).replace('T', ' ');
-          return send(200, { ok: true, live: true, source: 'last ' + minutes + 'min', completeness: completenessSince(t) });
+          return send(200, { ok: true, live: true, source: 'last ' + minutes + 'min', completeness: completenessSince(t), locale: lastLocaleCheck || null });
         }
         return send(200, { ok: true, live: false, completeness: lastCollectCompleteness || null, locale: lastLocaleCheck || null });
       }
-      /* ★ 2026-10-04 站点一致性校验结果(送货地址/国家地区/货币)。
-       *   由 cdpSetGlowAddress 尾部自动触发 —— 每个站点每次采集只校验一次(通过后 TTL 内不重复)。
-       *   ?force=1 现场重算一次(需采集浏览器在跑)。 */
+      /* ★ 2026-10-04(按《优化文档.md》§7): 站点一致性校验结果 —— 每个站点的
+       *   送货地址 / 国家地区 / 货币 是否与链接站点对上, 以及自动修正了什么。 */
       if (p === '/api/collect/locale' && req.method === 'GET') {
-        return send(200, { ok: true, locale: lastLocaleCheck || null, ttlMs: LOCALE_TTL_MS });
+        return send(200, { ok: true, locale: lastLocaleCheck || null, ttlMs: LOCALE_TTL_MS, countryFixTtlMs: COUNTRY_FIX_TTL });
       }
       // 采集记录 (历史批次): 按商品 collectedAt 聚合 — 相邻入库间隔 < 30 分钟视为同一次采集
       // 返回每次采集的起止时间(UTC, 精确到分钟) + 商品数量, 供采集面板"采集记录"加载历史并可点击跳转商品管理
@@ -10981,6 +12594,15 @@ const server = http.createServer((req, res) => {
         });
       }
 
+      /* ★ 2026-10-18 单品选品分析的判定规则（界面「❓ 选品规则」读这个, 真源在 product-insight.js） */
+      if (p === '/api/products/insight-rules' && req.method === 'GET') {
+        return send(200, {
+          ok: true,
+          rules: productInsight.RULES,
+          thresholds: productInsight.THRESHOLDS,
+          meta: productInsight.RULES_META,
+        });
+      }
       if (p === '/api/products' && req.method === 'GET') {
         // 支持两种入参: ① filter=<JSON>(统一过滤条件, 与采集过滤同一 schema) ② 传统散参数(兼容)
         const fraw = url.searchParams.get('filter');
@@ -11209,6 +12831,8 @@ const server = http.createServer((req, res) => {
           list = list.slice(offUsed, offUsed + lim);
           returned = list.length;
         }
+        /* ★ 2026-10-18 单品选品分析: 只给这一页打标签(用全库算类目基准, 60s 缓存, 失败不影响主流程) */
+        try { productInsight.annotate(list, products); } catch (e) {}
         return send(200, { total: totalAll, returned, offset: offUsed, items: list });
       }
 
@@ -11289,6 +12913,7 @@ const server = http.createServer((req, res) => {
 
       // 批量删除商品
       if (p === '/api/products/delete' && req.method === 'POST') {
+        if (!isLocalAddr(req)) return send(403, { error: '仅允许本机调用(危险操作)' });
         const asins = j.asins || [];
         const before = products.length;
         products = products.filter((x) => !asins.includes(x.asin));
@@ -11298,6 +12923,7 @@ const server = http.createServer((req, res) => {
 
       // 一键清空商品库 (显式用户操作, 允许写空 force=true)
       if (p === '/api/products/clear' && req.method === 'POST') {
+        if (!isLocalAddr(req)) return send(403, { error: '仅允许本机调用(危险操作)' });
         const before = products.length;
         products = [];
         save('products.json', products, true);
@@ -11306,6 +12932,7 @@ const server = http.createServer((req, res) => {
 
       // 重置商品库 (恢复种子数据)
       if (p === '/api/products/reset' && req.method === 'POST') {
+        if (!isLocalAddr(req)) return send(403, { error: '仅允许本机调用(危险操作)' });
         try {
           const seedFile = path.join(ROOT, '_tools', '_build_demo_data.js');
           const code = fs.readFileSync(seedFile, 'utf8');
@@ -11862,6 +13489,8 @@ const server = http.createServer((req, res) => {
        *   数分钟自恢复 → 所以必须限速(gapMs)且可断点续跑(失败批次不阻塞整体)。 */
       if (p === '/api/collect/api-run' && req.method === 'POST') {
         if (zyApiJob && zyApiJob.running) return send(409, { ok: false, error: '已有一个 API 采集任务在跑', job: apiJobPublic() });
+        /* ★ 2026-11-08 互斥(反向): BG 检测也在用同一个插件请求层，并发会触发频率限制 */
+        if (bgJob && bgJob.running) return send(409, { ok: false, error: 'BG 检测正在跑，等它结束再跑 API 采集（共用插件会话）' });
         const site = String(j.site || 'de').toLowerCase();
         const mode = String(j.mode || 'given');
         const dryRun = j.dryRun === true;
@@ -11953,6 +13582,159 @@ const server = http.createServer((req, res) => {
           try { ver = (await zyApi.pluginVersion()).Number; } catch (e) {}
           return send(200, { ok: true, extId: s.extId, page: s.pageUrl, modules: s.modules, apiMod: s.apiMod, reqMod: s.reqMod, pluginVersion: ver, apiLimit: limitVal });
         } catch (e) { return send(500, { ok: false, error: String(e.message).slice(0, 300) }); }
+      }
+
+      /* ══════════════════════════════════════════════════════════════════════
+       * BG 检测（Brand Gating 品牌门槛）—— 2026-11-08 接入
+       *
+       * 逆向来源: 智赢选品 5.1.27 `assets/js/content.js`（BG检测 徽标那一块）
+       *   账号列表  POST https://amazon.zying.net/api/CmdHandler?cmd=amazon_acc.sum      {page,pageSize}
+       *   BG 检测   POST https://amazon.zying.net/api/CmdHandler?cmd=amazon_hub_restriction.get  {aid, asin}
+       *   鉴权      token + signature 两个头，由插件请求层自带（zying-api.js 走插件隔离世界，不复刻签名）
+       *
+       * 语义: 用【某个已授权的亚马逊店铺账号 aid】查某 ASIN "在这家店能不能卖"。
+       *   所以结果是【账号 × ASIN】二维：同一个 ASIN，DE 店可售、GB 店可能需要批准。
+       *
+       * 结果五态（与插件面板一致）:
+       *   OK / ELIGIBLE / NORMAL            → 可售
+       *   APPROVAL_REQUIRED                 → 需要批准（要向亚马逊申请品牌批准）
+       *   NOT_ELIGIBLE / isRestricted:true  → 不可售
+       *   ASIN_NOT_FOUND                    → ASIN 不存在（目录里没有）
+       *   ERROR                             → 检查失败（可重试）
+       *
+       * ★ flag=9 = 账号已被禁用（实测直接调接口会返回「亚马逊帐户 X 已被禁用！」）。
+       *   前端 5.1.27 是 `filter(a => a.flag !== 9)`，被禁用的账号连选都选不到。
+       *   这里不静默过滤，而是把 account 列表原样返回 + usable 计数，让界面能明确提示"去重新授权"。
+       * ══════════════════════════════════════════════════════════════════════ */
+      if (p === '/api/bg/accounts' && req.method === 'GET') {
+        try {
+          const list = await bgAccounts();
+          const usable = list.filter((a) => a.usable).length;
+          return send(200, { ok: true, accounts: list, total: list.length, usable: usable,
+            note: usable ? null : '全部授权账号已被禁用(flag=9)，请先在智赢后台重新授权/启用店铺，BG 检测才能用' });
+        } catch (e) {
+          return send(500, { ok: false, error: String((e && e.message) || e).slice(0, 300), pluginHint: '需要采集浏览器 9222 + 智赢选品插件已登录' });
+        }
+      }
+
+      if (p === '/api/bg/check' && req.method === 'POST') {
+        if (bgJob && bgJob.running) return send(409, { ok: false, error: '已有 BG 检测任务在跑', job: bgJobPublic() });
+        if (collectProgress && collectProgress.running) return send(409, { ok: false, error: '已有采集/补采在跑(mode=' + collectProgress.mode + ')，等它结束再跑 BG 检测（都用同一个 CDP 会话）' });
+        /* ★ 2026-11-08 互斥: API 采集(zyApiJob) 和 BG 检测都走同一个插件请求层(session/token),
+         *   并发会互相触发智赢的频率限制（实测会回「接口 ... 请求过于频繁，请稍后重试」）。 */
+        if (zyApiJob && zyApiJob.running) return send(409, { ok: false, error: '已有「API 采集」任务在跑，等它结束再跑 BG 检测（共用插件会话）' });
+        try {
+          const accs = await bgAccounts();
+          const usable = accs.filter((a) => a.usable);
+          if (!usable.length) {
+            /* 业务状态而非协议错误 → 200 + ok:false，让前端能拿到 accounts 明细直接展示原因
+             * （用 400 会被前端 api() 统一抛异常，把账号清单和"已被禁用"的说明丢掉） */
+            return send(200, { ok: false, started: false, error: '没有可用的授权账号（' + accs.length + ' 个账号全部被禁用 flag=9）', accounts: accs,
+              hint: '去智赢后台重新授权/启用店铺后，账号 flag 会变成非 9，BG 检测即可使用' });
+          }
+          const wantAid = j.aid != null ? Number(j.aid) : null;
+          const pick = wantAid ? usable.find((a) => a.id === wantAid) : usable[0];
+          if (!pick) return send(400, { ok: false, error: '指定账号 aid=' + wantAid + ' 不可用', usable: usable.map((a) => ({ id: a.id, abbr: a.abbr })) });
+
+          const mode = String(j.mode || 'given');
+          let asins = Array.isArray(j.asins) ? j.asins.map((x) => String(x).trim().toUpperCase()).filter((x) => /^[A-Z0-9]{10}$/.test(x)) : [];
+          let skippedFresh = 0;
+          if (mode !== 'given') {
+            let pool = products.slice();
+            if (j.site) pool = pool.filter((x) => (x.site || '') === String(j.site).toLowerCase());
+            if (mode === 'unchecked') pool = pool.filter((x) => !x.bgStatus);
+            else if (mode === 'blocked') pool = pool.filter((x) => x.bgStatus === 'APPROVAL_REQUIRED' || x.bgStatus === 'NOT_ELIGIBLE');
+            const freshH = j.freshHours == null ? 72 : Math.max(0, Number(j.freshHours));
+            if (freshH > 0) {
+              const cut = Date.now() - freshH * 3600e3;
+              const before = pool.length;
+              pool = pool.filter((x) => { const t = x.bgCheckedAt ? Date.parse(String(x.bgCheckedAt).replace(' ', 'T')) : NaN; return !(t && t > cut); });
+              skippedFresh = before - pool.length;
+            }
+            asins = pool.map((x) => x.asin);
+          }
+          const limit = Math.max(0, Number(j.limit) || 0);
+          if (limit) asins = asins.slice(0, limit);
+          if (!asins.length) return send(200, { ok: true, total: 0, note: '没有需要检测的商品' });
+
+          bgJob = {
+            running: true, startedAt: now(), aid: pick.id, abbr: pick.abbr, accountName: pick.name,
+            mode: mode, total: asins.length, skippedFresh: skippedFresh, done: 0, got: 0, failed: 0,
+            byStatus: {}, stopped: false, error: null, samples: [], asins: null,
+          };
+          const job = bgJob;
+          (async () => {
+            try {
+              const byAsin = new Map(products.map((x, i) => [x.asin, i]));
+              const gapMs = j.gapMs == null ? 250 : Math.max(0, Number(j.gapMs));
+              for (const asin of asins) {
+                if (job.stopped) break;
+                const idx = byAsin.get(asin);
+                if (idx == null) { job.failed++; job.done++; continue; }
+                try {
+                  const status = await bgCheckOne(pick.id, asin);
+                  const it = products[idx];
+                  it.bgStatus = status;
+                  it.bgAid = pick.id;
+                  it.bgAbbr = pick.abbr || null;
+                  it.bgAccount = pick.name || null;
+                  it.bgCheckedAt = now();
+                  it.bgByAccount = Object.assign({}, it.bgByAccount || {}, { [String(pick.abbr || pick.id)]: { status: status, at: it.bgCheckedAt } });
+                  job.byStatus[status] = (job.byStatus[status] || 0) + 1;
+                  job.got++;
+                  if (job.samples.length < 10) job.samples.push({ asin, status });
+                } catch (e) {
+                  const msg = String((e && e.message) || e).slice(0, 160);
+                  job.failed++;
+                  job.lastError = msg;
+                  // 账号被禁用/未授权 → 整批没意义，直接停
+                  if (/已被禁用|未授权|请先登录|token/i.test(msg)) {
+                    job.error = msg; job.stopped = true;
+                    break;
+                  }
+                }
+                job.done++;
+                if (job.done % 20 === 0) save('products.json', products);
+                if (gapMs) await new Promise((r) => setTimeout(r, gapMs));
+              }
+              save('products.json', products);
+            } catch (e) {
+              job.error = String((e && e.message) || e).slice(0, 300);
+            } finally {
+              job.running = false; job.finishedAt = now();
+            }
+          })();
+          return send(200, { ok: true, started: true, job: bgJobPublic() });
+        } catch (e) {
+          return send(500, { ok: false, error: String((e && e.message) || e).slice(0, 300) });
+        }
+      }
+      if (p === '/api/bg/status' && req.method === 'GET') return send(200, bgJobPublic());
+      if (p === '/api/bg/stop' && req.method === 'POST') {
+        if (bgJob) { bgJob.stopped = true; bgJob.running = false; }
+        return send(200, { ok: true, stopped: true });
+      }
+      /* 单条探测（不写库，用于排障/验证接口是否通）
+       * ★ 业务层失败(账号被禁用/未授权)也返回 200 + ok:false + error，让界面能直接展示原因，
+       *   而不是抛 500 把真实原因埋掉（实测账号 flag=9 时后端会回「亚马逊帐户 X 已被禁用！」）。 */
+      if (p === '/api/bg/probe' && req.method === 'POST') {
+        try {
+          const accs = await bgAccounts();
+          const aid = j.aid != null ? Number(j.aid) : (accs.find((a) => a.usable) || accs[0] || {}).id;
+          const asin = String(j.asin || '').trim().toUpperCase();
+          if (!aid || !/^[A-Z0-9]{10}$/.test(asin)) return send(400, { ok: false, error: '需要合法 aid 与 asin', accounts: accs });
+          const acc = accs.find((a) => a.id === aid) || null;
+          try {
+            const raw = await bgRawRestriction(aid, asin);
+            return send(200, { ok: true, aid, asin, abbr: acc && acc.abbr, account: acc && acc.name, status: bgParseStatus(raw, asin), raw: raw });
+          } catch (e) {
+            const msg = String((e && e.message) || e).slice(0, 300);
+            return send(200, { ok: false, aid, asin, abbr: acc && acc.abbr, account: acc && acc.name,
+              accountDisabled: /已被禁用|未授权|请先登录/i.test(msg), error: msg, accounts: accs });
+          }
+        } catch (e) {
+          return send(500, { ok: false, error: String((e && e.message) || e).slice(0, 300), pluginHint: '需要采集浏览器 9222 + 智赢选品插件已登录' });
+        }
       }
 
       if (p === '/api/collect/brand-batch' && req.method === 'POST') {
@@ -12759,8 +14541,10 @@ const server = http.createServer((req, res) => {
         if (!rawItems.length) return send(400, { error: 'items 为空' });
         if (rawItems.length > 500) return send(400, { error: '单次最多 500 条, 收到 ' + rawItems.length });
         let added = 0, updated = 0; const bad = []; const ids = [];
+        /* ★ 多店铺隔离 (2026-10-06): 这次入账算谁的 —— 插件带上来的店铺优先, 其次后端记的当前店铺 */
+        const reqShop = shopClean(j.shop || j.currentShop || j.shopName) || currentShopName();
         for (const raw of rawItems) {
-          const it = normalizeListingItem(raw, j.site);
+          const it = normalizeListingItem(raw, j.site, reqShop);
           if (!it) { bad.push(raw && raw.asin ? raw.asin : '(无ASIN)'); continue; }
           const idx = listingRecords.findIndex((r) => r.id === it.id);
           if (idx >= 0) {
@@ -12771,6 +14555,11 @@ const server = http.createServer((req, res) => {
               failCount: listingRecords[idx].failCount, failReason: listingRecords[idx].failReason,
               failAt: listingRecords[idx].failAt, failFields: listingRecords[idx].failFields,
               fillResult: listingRecords[idx].fillResult, fillAt: listingRecords[idx].fillAt,
+              /* ★ 多店铺隔离: 重新采集一次商品信息, 【不该】把这条记录换到另一个店铺名下, 也不该抹掉拦截痕迹。
+               *   店铺归属只在"确认上传"(/api/listing/upload) 时由当前登录店铺决定。 */
+              shop: listingRecords[idx].shop, shopUserId: listingRecords[idx].shopUserId, sellingId: listingRecords[idx].sellingId,
+              blockedBy: listingRecords[idx].blockedBy, blockedAt: listingRecords[idx].blockedAt,
+              blockCount: listingRecords[idx].blockCount, blocks: listingRecords[idx].blocks,
             };
             listingRecords[idx] = Object.assign({}, listingRecords[idx], it, keep);
             updated++;
@@ -12779,17 +14568,157 @@ const server = http.createServer((req, res) => {
         }
         save('listing-records.json', listingRecords);
         pushNotify('上架记录入账', '新增 ' + added + ' 条, 更新 ' + updated + ' 条' + (bad.length ? ', 非法 ' + bad.length + ' 条' : ''), '来源: 插件详情页采集');
-        return send(200, { ok: true, added, updated, invalid: bad.length, invalidAsins: bad.slice(0, 20), ids, stats: listingStats() });
+        return send(200, { ok: true, added, updated, invalid: bad.length, invalidAsins: bad.slice(0, 20), ids, shop: reqShop, stats: listingStats() });
       }
 
       // 列表 (默认按 savedAt 倒序; 支持关键词/站点/状态过滤)
+      /* ══════════ ★ 店铺 API (2026-10-06 多店铺隔离) ══════════
+       * 店铺 = ifast 账号名。上架器在 ifast 页里逆向读到 createUserName 后 POST 到这里:
+       *   · 后端记住"当前店铺" → 上架记录 / 填表任务 / 上传日志 / 归档 都按它隔离
+       *   · 未登录(没上报过)时不写任何记录归属, 也不过滤 —— 界面照旧能看, 不会突然空白 */
+      if (p === '/api/shop/register' && req.method === 'POST') {
+        const ra = String((req.socket && req.socket.remoteAddress) || '');
+        if (!/^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/.test(ra)) return send(403, { error: '仅允许本机调用' });
+        const r = shopRegister(j.shop || j.name || j.createUserName, { userId: j.userId, sites: j.sites, groups: j.groups });
+        if (!r.ok) return send(400, { error: r.error });
+        if (r.changed || !r.throttled) save('shops.json', shopStore, true);
+        return send(200, {
+          ok: true, current: currentShopName(), shop: r.item, changed: r.changed, throttled: !!r.throttled,
+          items: shopStore.items, stats: listingStats(),
+        });
+      }
+      if (p === '/api/shop/list' && req.method === 'GET') {
+        const st = listingStats();
+        return send(200, {
+          ok: true, current: currentShopName(), currentAt: shopStore.currentAt || null,
+          items: shopStore.items.map((x) => Object.assign({}, x, { records: st.byShop[x.name] || 0, listed: st.byShopListed[x.name] || 0, blocked: st.byShopBlocked[x.name] || 0 })),
+          byShop: st.byShop, byShopSite: st.byShopSite,
+          total: listingRecords.length, unassigned: st.unassigned,
+        });
+      }
+      if (p === '/api/shop/current' && req.method === 'POST') {
+        const n = shopClean(j.shop || j.name);
+        if (!n) return send(400, { error: 'shop 为空' });
+        const it = shopFind(n);
+        if (!it) return send(404, { error: '没有登记过这个店铺: ' + n + ' (先在上架器里登录一次, 或先 register)' });
+        shopStore.current = n;
+        shopStore.currentUserId = it.userId == null ? null : it.userId;
+        shopStore.currentAt = now();
+        save('shops.json', shopStore, true);
+        return send(200, { ok: true, current: n, shop: it });
+      }
+      if (p === '/api/shop/delete' && req.method === 'POST') {
+        const n = shopClean(j.shop || j.name);
+        if (!n) return send(400, { error: 'shop 为空' });
+        /* ★ 只删"店铺登记"(登录记录 + 当前店铺指针), 【不删】这个店铺的上架记录 ——
+         *   删登记不该顺手删数据; 真要清记录请用 /api/listing/records/clear {shop:"..."}。 */
+        const del = shopDelete(n);
+        save('shops.json', shopStore, true);
+        return send(200, {
+          ok: true, removed: del.removed, current: del.current, items: del.items,
+          keptRecords: listingRecords.filter((r) => shopEq(r.shop, n)).length,
+          note: '只删了店铺登记, 该店铺的上架记录仍保留(如需清除: /api/listing/records/clear {shop})',
+        });
+      }
+
+      /* ══════════ ★ 查重预检 (2026-10-06) ══════════
+       * 插件在 ifast 页"填表 / 点保存之前"先问一次: 命中就【别提交】。
+       * 口径见 listingDedupe: 同 asin + 同 site 只要已 listed(不论店铺, 含本店铺) → 拦截;
+       * 站点不同(店铺A 德国站 / 店铺B 法国站) → 不拦。 */
+      if (p === '/api/listing/check' && req.method === 'GET') {
+        const asin = String(url.searchParams.get('asin') || '').toUpperCase().trim();
+        const site = String(url.searchParams.get('site') || '').toLowerCase().trim();
+        if (!/^[A-Z0-9]{10}$/.test(asin) || !site) return send(400, { error: '需要 asin(10 位) 和 site' });
+        const shopSel = shopParamOf(url.searchParams.get('shop'));
+        const dd = listingDedupe(asin, site, shopSel.shop);
+        /* ★ 2026-10-07: 开关关掉时【照实报事实, 但不拦】——
+         *   duplicated 仍然是事实(供界面提示"这个品已在…上架过"), 而 enforce 才是"要不要拦"。
+         *   上架器只认 `duplicated && enforce !== false`, 这样关了开关也能把真相显示出来。 */
+        const enforce = blockingEnabled();
+        return send(200, {
+          ok: true, key: { asin, site }, shop: shopSel.shop || null, currentShop: currentShopName(),
+          duplicated: dd.duplicated, enforce, blocked: dd.duplicated && enforce, scope: dd.scope,
+          reason: dd.duplicated ? (dd.scope === 'same-shop' ? 'same-shop-duplicate' : 'cross-shop-duplicate') : null,
+          message: dd.duplicated
+            ? (enforce ? dedupeMessage(dd, asin, site)
+              : ('⚠ 该商品已在「' + (((dd.where || [])[0] || {}).shop || SHOP_UNKNOWN) + '」(' + String(site).toUpperCase() + ') 于 '
+                + String((((dd.where || [])[0] || {}).at) || '').slice(0, 16)
+                + ' 上架过 —— 但「重复上架拦截」当前是【关闭】状态, 不会拦, 可以继续提交'))
+            : '该商品(同 ASIN + 同站点)没有上架记录, 可以继续',
+          where: dd.where,
+          blockingEnabled: enforce,
+          /* ★ 2026-10-24 PRD F3(提交前最后一道): 跨店台账判决。
+           *   bridge 在真正发 product_add/item_add 之前会问这里 —— 与「重复上架拦截」总开关无关,
+           *   由 claimSettings.enabled 控制; 但**近期(30 分钟内)有 override 审计的算用户已确认**, 放行。 */
+          claims: (function () {
+            try {
+              if (claimSettings.enabled === false) return { enabled: false, verdict: 'pass' };
+              const cc = claimCheck({ asin: asin, site: site, scope: 'asin' });
+              const blk = (cc.items || []).find((x) => x.level === 'block');
+              let overridden = false, over = null;
+              if (blk) {
+                const key = String(asin).toUpperCase() + '@' + String(site).toLowerCase();
+                for (const c of listingClaims) {
+                  if (!c || String(c.asin || '').toUpperCase() !== String(asin).toUpperCase() || String(c.site || '') !== site) continue;
+                  for (const o2 of (c.overrides || [])) {
+                    /* ★ now() 写的是 UTC('YYYY-MM-DD HH:mm:ss'), 必须按 UTC 解析, 否则差 8 小时窗口永不成立(实测踩到) */
+                    const t = Date.parse(String(o2.at || '').replace(' ', 'T') + 'Z');
+                    if (t && (Date.now() - t) <= 30 * 60000) { overridden = true; over = o2; }
+                  }
+                }
+              }
+              return {
+                enabled: true, verdict: cc.verdict, blocked: !!blk && !overridden, overridden: overridden,
+                overrideAt: over ? over.at : null,
+                reason: blk ? blk.reason : null,
+                message: blk ? ('该品已在「' + ((blk.hit && (blk.hit.storeName || blk.hit.storeId)) || '其他店铺') + '」'
+                  + String(site).toUpperCase() + ' 站' + (blk.hit && blk.hit.at ? (' 于 ' + String(blk.hit.at).slice(0, 16)) : '') + ' 上过'
+                  + (blk.note ? ('（' + blk.note + '）') : '')) : null,
+                hit: blk ? blk.hit : null,
+              };
+            } catch (e) { return { enabled: true, verdict: 'pass', error: String((e && e.message) || e) }; }
+          })(),
+          rule: '同 ASIN + 同站点: 只要已上架过(不论哪个店铺, 含本店铺)一律拦截, 且不算上架; 站点不同则不拦。'
+            + ' —— 该行为受「重复上架拦截」开关控制(设置页可切换)。',
+        });
+      }
+
+      /* ══════════ ★ 「重复上架拦截」总开关 (2026-10-07) ══════════
+       * 用户原话: 「给这个店铺拦截功能加上一个开关，现阶段设置为关闭」。
+       * 关掉后: 同 asin + 同 site 已上架也【不再拦】, 重复上传照常入队并提交(是否重复上架由 ifast 决定)。
+       * 关掉不影响"留痕": 上架记录/归档/店铺隔离照旧, 只是不再阻断。 */
+      if (p === '/api/listing/blocking' && req.method === 'GET') {
+        const bl = shopStore.blocking || {};
+        return send(200, {
+          ok: true, enabled: blockingEnabled(), at: bl.at || null, note: bl.note || null,
+          desc: blockingEnabled()
+            ? '同 ASIN + 同站点 只要已上架过(含本店铺) → 拦截, 且不算上架'
+            : '已关闭: 同 ASIN + 同站点 已上架也【不再拦截】, 重复上传会照常提交',
+          dupRows: listingRecords.filter((r) => isBlockedRow(r)).length,
+        });
+      }
+      if (p === '/api/listing/blocking' && req.method === 'POST') {
+        const ra = String((req.socket && req.socket.remoteAddress) || '');
+        if (!/^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/.test(ra)) return send(403, { error: '仅允许本机调用' });
+        if (typeof j.enabled !== 'boolean') return send(400, { error: '需要 enabled: true|false' });
+        const bl = setBlocking(j.enabled, j.note);
+        pushNotify('重复上架拦截 ' + (bl.enabled ? '已开启' : '已关闭'), bl.note, '来源: 插件设置页 / ERP');
+        return send(200, { ok: true, enabled: bl.enabled, at: bl.at, note: bl.note });
+      }
+
       /* ★ 2026-09-25 插件「确认上传」→ 落库 + 标记待填(供 bridge 在 ifast 页自动填表) */
       if (p === '/api/listing/upload' && req.method === 'POST') {
         const ra = String((req.socket && req.socket.remoteAddress) || '');
         if (!/^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/.test(ra)) return send(403, { error: '仅允许本机调用' });
         const rawItems = Array.isArray(j.items) ? j.items : (j.item ? [j.item] : []);
         if (!rawItems.length) return send(400, { error: 'items 为空' });
+        /* ★ 多店铺隔离 (2026-10-06): 谁在传 —— 决定这次上架记在哪个店铺名下, 也是查重里的"本店铺" */
+        const reqShop = shopClean(j.shop || j.currentShop || j.shopName) || currentShopName();
         let added = 0, updated = 0; const ids = []; const bad = [];
+        const blockedItems = [];        // ★ 被查重拦下的(同店重复 + 跨店重复) —— 拦截也要留痕
+        /* ★ 2026-10-24 PRD F5: 前端弹窗点「我确认，强制上架」→ j.force=true, 不拦但要留 override 审计 */
+        const forceAll = j.force === true;
+        const forcedItems = [];
         for (const raw of rawItems) {
           /* ★ 2026-09-26 防"半截更新把多变体名单清空":
            *   normalizeListingItem 写的是 `Array.isArray(raw.variantItems) ? … : []` ——
@@ -12809,19 +14738,94 @@ const server = http.createServer((req, res) => {
               if (raw.fillMode === undefined) raw.fillMode = old.fill.fillMode || null;
             }
           }
-          const it = normalizeListingItem(raw, j.site);
+          const it = normalizeListingItem(raw, j.site, reqShop);
           if (!it) { bad.push(raw && raw.asin ? raw.asin : '(无ASIN)'); continue }
-          /* ★ 再次上传 = 用户要重新走一遍填表 → 打一个"重填"时间戳;
+          /* ★★ 查重拦截 (用户 2026-10-06 拍板): 同 asin + 同 site 只要已【listed】,
+           *   不论哪个店铺、【含本店铺】→ 一律拦截; 站点不同则不拦(德国站/法国站是两个独立上架)。
+           *   落点必须在这里 —— bridge 是靠 fill 任务去 ifast 填表并点保存的:
+           *   不入队 = 提交请求永远不会发出去(与"只有请求还没发出才允许拦截"的回退纪律一致)。
+           * ★ 2026-10-07: 受「重复上架拦截」总开关控制 —— 关闭时跳过本段(照常入队提交), 见 blockingEnabled()。 */
+          const dedupeOn = blockingEnabled();
+          const dd = dedupeOn ? listingDedupe(it.asin, it.site, reqShop) : { duplicated: false, scope: 'none', where: [], hits: [] };
+          const forceIt = forceAll || (raw && raw.force === true);
+          if (dd.duplicated && forceIt) {
+            /* 强制上架: 不拦, 但把「谁在什么时候强行放过哪个品」写进台账 overrides(PRD §11 可观测) */
+            const w0 = (dd.where || [])[0] || {};
+            forcedItems.push({ asin: it.asin, site: it.site, scope: dd.scope, blockedFrom: w0 });
+            try {
+              const hitC = listingClaims.filter((c) => c && c.asin === it.asin && String(c.site || '') === String(it.site || '')).sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')))[0];
+              if (hitC) {
+                if (!Array.isArray(hitC.overrides)) hitC.overrides = [];
+                hitC.overrides.push({ at: now(), machineId: machineInfo.id, machineName: machineInfo.name, operator: reqShop || null, reason: j.forceReason ? String(j.forceReason).slice(0, 120) : '强制上架', from: (w0.storeName || w0.storeId || null) });
+                claimSave();
+              }
+            } catch (e) { console.error('[claims] override 审计失败: ' + ((e && e.message) || e)); }
+          }
+          if (dd.duplicated && !forceIt) {
+            const br = listingRecordBlocked(it.asin, it.site, reqShop, dd, { title: raw.title, url: raw.url, shopUserId: raw.shopUserId, source: 'ext-upload-blocked' });
+            blockedItems.push({
+              id: br.id, asin: it.asin, site: it.site, shop: br.shop, scope: dd.scope,
+              reason: dd.scope === 'same-shop' ? 'same-shop-duplicate' : 'cross-shop-duplicate',
+              message: dedupeMessage(dd, it.asin, it.site), where: dd.where,
+            });
+            continue;                                   // ★ 不入队、不落 fill → 不会提交 ifast
+          }
+          /* ★ 2026-10-24 PRD F2 服务端第二道: 跨店台账查重。
+           *   与老「重复上架拦截」总开关(blockingEnabled)【独立】—— 那个开关用户早前让关掉过,
+           *   这里由 claimSettings.enabled 单独控制(默认开, 可用 POST /api/claims/settings 关)。
+           *   命中同站点同 ASIN(含本店) → 拦; 前端弹窗确认过(force:true) → 放行并写 override 审计。
+           *   判据在 claimCheck 里, 数据来源 = 上架记录 + 上架器「🔄 同步商品」的 ifast 真实在架清单。
            *   状态本身不再存, 由上传记录推导(见 uploadResultOf/fillStateOf) */
+          if (claimSettings.enabled !== false) {
+            try {
+              const cc = claimCheck({ asin: it.asin, site: it.site, scope: 'asin' });
+              const blk = (cc.items || []).find((x) => x.level === 'block');
+              if (blk) {
+                const h0 = blk.hit || {};
+                const where0 = [{ shop: h0.shop || null, site: it.site, at: h0.at || null, sellingId: h0.storeId || null, storeName: h0.storeName || null, url: null, id: null }];
+                if (forceIt) {
+                  /* 用户已在前端弹窗确认强制 → 放行 + 写 override 审计(PRD F5) */
+                  forcedItems.push({ asin: it.asin, site: it.site, scope: 'claims', blockedFrom: where0[0] });
+                  const hitC = listingClaims.filter((c) => c && c.asin === it.asin && String(c.site || '') === String(it.site || '')).sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')))[0];
+                  if (hitC) {
+                    if (!Array.isArray(hitC.overrides)) hitC.overrides = [];
+                    hitC.overrides.push({ at: now(), machineId: machineInfo.id, machineName: machineInfo.name, operator: reqShop || null, reason: j.forceReason ? String(j.forceReason).slice(0, 120) : '上传前弹窗确认强制上架', from: (h0.storeName || h0.storeId || null) });
+                    claimSave();
+                  }
+                } else {
+                  const dd2 = {
+                    duplicated: true,
+                    scope: blk.reason === 'same_asin_same_site_same_store' ? 'same-shop' : 'cross-shop',
+                    where: where0, hits: [],
+                  };
+                  const br = listingRecordBlocked(it.asin, it.site, reqShop, dd2, { title: raw.title, url: raw.url, shopUserId: raw.shopUserId, source: 'claims-blocked' });
+                  blockedItems.push({
+                    id: br.id, asin: it.asin, site: it.site, shop: br.shop, scope: dd2.scope,
+                    reason: 'claims-' + blk.reason,
+                    message: '该品已在「' + (h0.storeName || h0.storeId || '其他店铺') + '」' + String(it.site).toUpperCase() + ' 站'
+                      + (h0.at ? (' 于 ' + String(h0.at).slice(0, 16)) : '') + ' 上过' + (blk.note ? ('（' + blk.note + '）') : '') + ' —— 跨店重复, 已拦截',
+                    where: where0,
+                  });
+                  continue;                                   /* 不入队、不落 fill → 不会提交 ifast */
+                }
+              }
+            } catch (e) { console.error('[claims] 上传前查重异常(放行): ' + ((e && e.message) || e)); }
+          }
           it.refillAt = now();
           const idx = listingRecords.findIndex((r) => r.id === it.id);
           if (idx >= 0) {
+            /* ★ 多店铺隔离: 当前登录店铺优先; 请求没带店铺就沿用原归属(不把已有记录的店铺抹掉) */
+            if (!shopClean(it.shop)) it.shop = listingRecords[idx].shop;
             const keep = {
               status: listingRecords[idx].status, note: listingRecords[idx].note, listedAt: listingRecords[idx].listedAt, fillAt: listingRecords[idx].fillAt, fillResult: listingRecords[idx].fillResult,
               /* ★ 同 ingest: 重新入队不清上传记录 */
               uploads: listingRecords[idx].uploads, uploadsTotal: listingRecords[idx].uploadsTotal,
               failCount: listingRecords[idx].failCount, failReason: listingRecords[idx].failReason,
               failAt: listingRecords[idx].failAt, failFields: listingRecords[idx].failFields,
+              /* ★ 拦截痕迹同理: 不能被一次"重新上传"抹掉 */
+              blockedBy: listingRecords[idx].blockedBy, blockedAt: listingRecords[idx].blockedAt,
+              blockCount: listingRecords[idx].blockCount, blocks: listingRecords[idx].blocks,
+              shopUserId: it.shopUserId != null ? it.shopUserId : listingRecords[idx].shopUserId,
             };
             listingRecords[idx] = Object.assign({}, listingRecords[idx], it, keep);
             updated++;
@@ -12829,9 +14833,23 @@ const server = http.createServer((req, res) => {
           ids.push(it.id);
         }
         save('listing-records.json', listingRecords);
-        pushNotify('上传任务入账', '新增 ' + added + ' 条, 更新 ' + updated + ' 条' + (bad.length ? (', 非法 ' + bad.length) : ''), '到 ifast 的「导入导出 → 添加跟卖」里填入');
+        pushNotify('上传任务入账', '新增 ' + added + ' 条, 更新 ' + updated + ' 条' + (bad.length ? (', 非法 ' + bad.length) : '') + (blockedItems.length ? ', 拦截 ' + blockedItems.length + ' 条' : '') + (reqShop ? '' : ' (未登录店铺, 记为未分类)'), '到 ifast 的「导入导出 → 添加跟卖」里填入');
+        if (blockedItems.length) {
+          pushNotify('上架被查重拦截', blockedItems.length + ' 个商品未提交 ifast',
+            blockedItems.slice(0, 5).map((x) => x.asin + '@' + x.site + ' ← ' + (x.scope === 'same-shop' ? '本店铺已上架' : '店铺「' + ((x.where[0] && x.where[0].shop) || SHOP_UNKNOWN) + '」已上架')).join(' | '));
+        }
         const todo = listingRecords.filter((r) => { const s = fillStateOf(r); return s === 'pending' || s === 'failed' }).length;
-        return send(200, { ok: true, added, updated, invalid: bad.length, ids, todo, stats: listingStats() });
+        const allBlocked = blockedItems.length > 0 && ids.length === 0;
+        return send(200, {
+          /* ★ 全被拦 → ok:false + blocked:true(插件据此提示并【不要】去填表); 部分被拦 → ok:true 但仍带 blocked 详情 */
+          ok: !allBlocked, blocked: blockedItems.length > 0, blockedCount: blockedItems.length,
+          reason: allBlocked ? blockedItems[0].reason : null,
+          message: allBlocked ? blockedItems[0].message
+            : (blockedItems.length ? '有 ' + blockedItems.length + ' 个商品因查重被拦截, 未提交 ifast' : null),
+          blockedItems, where: blockedItems.length ? blockedItems[0].where : [],
+          forced: forcedItems.length, forcedItems,
+          added, updated, invalid: bad.length, ids, todo, shop: reqShop, stats: listingStats(),
+        });
       }
 
       /* ★ bridge(跑在 ifast.top) 取要填的任务。
@@ -12843,10 +14861,15 @@ const server = http.createServer((req, res) => {
         const limit = Math.min(50, Math.max(1, parseInt(url.searchParams.get('limit') || '5', 10) || 5));
         const only = String(url.searchParams.get('status') || 'todo');
         const wantAsin = String(url.searchParams.get('asin') || '').toUpperCase().trim();
+        /* ★ 多店铺隔离 (2026-10-06): 只发【当前店铺】的待填任务 —— 上架器登录什么店铺就用什么店铺的数据。
+         *   ?shop=* 可取全部(排障用); 后端还不知道当前店铺时(插件还没上报)不过滤, 免得填表链断掉。 */
+        const shopSel = shopParamOf(url.searchParams.get('shop'));
         // ★ 只有真的带 fill 数据(插件「确认上传」落下来的)才算任务:
         //   历史记录(旧采集入库生成的)没有 fill 对象, 却曾被默认成 todo, 会让 bridge 去填一堆空值。
         const hasFill = listingHasFill;
         let list = listingRecords.filter((r) => {
+          if (isBlockedRow(r)) return false;                   // ★ 被查重拦截的绝不是任务: 不能去填表, 更不能提交
+          if (!shopMatch(r, shopSel)) return false;
           if (wantAsin && String(r.asin || '').toUpperCase() !== wantAsin) return false;
           if (only === 'all') return hasFill(r) || (r.uploads || []).length > 0;
           const st = fillStateOf(r);
@@ -12854,7 +14877,11 @@ const server = http.createServer((req, res) => {
           return st === only;
         });
         const noFill = listingRecords.filter((r) => !hasFill(r)).length;
-        return send(200, { ok: true, total: list.length, skippedNoFill: noFill, items: list.slice(0, limit).map(decorateListing) });
+        return send(200, {
+          ok: true, total: list.length, skippedNoFill: noFill,
+          shop: shopSel.shop || null, shopFilter: shopFilterActive(shopSel),
+          items: list.slice(0, limit).map(decorateListing),
+        });
       }
 
       /* ★ 把已填/已上传的记录退回「待填」—— 重新填一遍或填错了重来 */
@@ -12902,13 +14929,26 @@ const server = http.createServer((req, res) => {
           .map((x) => String(x.label || '?') + (x.note ? '(' + String(x.note).slice(0, 60) + ')' : ''))
           .slice(0, 8);
         const reason = j.note ? String(j.note).slice(0, 300) : (failed ? '(扩展没给失败原因)' : null);
-        r.fillResult = { at, dryRun: dry, ok: !failed, submitted, fields, readBack: j.readBack || null, note: reason };
+        /* ★ 2026-10-07 区分【真失败】与【提交前就被拦下】(见 uploadResultOf 的说明):
+         *   · 真失败  = submitted===true && ok===false  → 上传结果=失败(该重传)
+         *   · 被拦下  = submitted!==true && ok===false  → 一个字节都没发出去(商品已存在/探活没过),
+         *               这【不是上传结果】: 只追加一条流水留痕, 不改状态、不加失败次数。
+         *     旧行为会把"已上架成功"的记录降级成 failed → 界面上"记录显示失败、ifast 里却在售"。 */
+        const preflight = failed && !submitted;
+        /* ★ 2026-10-07 用户要求「店铺内已上架该商品 → 返回信息写【已上架】」:
+         *   插件在"商品已存在(本店铺已上架)"时会回报 alreadyListed:true —— 那种情况即使没产生写入
+         *   (noChange: 线上与本次要写的一致, 不该重复写), 结果也必须落成【已上架】, 而不是"没有结果"。 */
+        const alreadyListed = j.alreadyListed === true;
+        const noChange = j.noChange === true;
+        r.fillResult = { at, dryRun: dry, ok: preflight ? null : !failed, submitted, preflight: preflight || undefined, fields, readBack: j.readBack || null, note: reason };
         r.fillAt = at;
         r.refillAt = null;              // ★ 新结果回来了 → 清掉"重填"标记(队列位置改由结果决定)
         r.uploadsTotal = (r.uploadsTotal || 0) + 1;
         if (!Array.isArray(r.uploads)) r.uploads = [];
         r.uploads.unshift({
-          at, attempt: r.uploadsTotal, ok: !failed, submitted, dryRun: dry,
+          at, attempt: r.uploadsTotal, ok: preflight ? null : !failed, submitted, dryRun: dry,
+          preflight: preflight || undefined,
+          alreadyListed: alreadyListed || undefined, noChange: noChange || undefined,
           reason,
           fieldsOk: fields.filter((x) => x && x.ok !== false).length,
           fieldsBad: badFields.length, badFields,
@@ -12917,17 +14957,63 @@ const server = http.createServer((req, res) => {
           from: j.from ? String(j.from).slice(0, 40) : null,
         });
         if (r.uploads.length > 30) r.uploads.length = 30;      // 只留最近 30 次, 别让记录文件无限长
-        if (failed) {
+        /* ★ 多店铺隔离 (2026-10-06): 上架器当前登录的店铺就是这次上架的实际归属(记录没归属时补上) */
+        const repShop = shopClean(j.shop || j.currentShop || j.shopName);
+        if (repShop && !shopClean(r.shop)) r.shop = repShop;
+        /* ★ 拦截失效的兜底: 被查重拦下的商品理论上走不到这里(它在 /upload 时就没入队, bridge 拿不到它)。
+         *   但万一请求已经发出去了 —— 按"回退纪律": 一旦提交就不再假装没发生, 如实记成已上架并【明确告警】。 */
+        let blockedMissed = false;
+        if (isBlockedRow(r) && submitted && !failed) {
+          blockedMissed = true;
+          r.blocked = false; r.unblockedAt = at;
+          r.unblockedReason = '被查重拦截后仍实际提交成功(拦截未生效)';
+        }
+        if (preflight) {
+          /* 提交前的拦截: 留痕但不改状态 —— 已上架的仍是已上架, 待填的仍在队列里(还能重试) */
+          r.preflightCount = (r.preflightCount || 0) + 1;
+        } else if (failed) {
           r.status = 'failed'; r.failReason = reason; r.failAt = at; r.failCount = (r.failCount || 0) + 1;
           r.failFields = badFields;
         } else {
-          if (submitted) { r.status = 'listed'; r.listedAt = at; }
+          /* ★ alreadyListed: 商品在店铺内已上架 —— 即便本次没有产生写入(noChange), 结果也是【已上架】 */
+          if (submitted || alreadyListed) { r.status = 'listed'; r.listedAt = r.listedAt || at; }
+          if (alreadyListed) { r.alreadyListed = true; r.alreadyListedAt = at; r.alreadyListedCount = (r.alreadyListedCount || 0) + 1; }
+        }
+        /* ★ 2026-10-24 跨店台账(PRD §8.2): 真提交过 → 记一条「这个 ASIN 在这个店铺这个站点被上过」。
+         *   店铺身份取 bridge 从 ifast 页面读回的 readBack.selling(跟卖组 id=名称); 台账主键 asin@site@storeId。 */
+        try {
+          if (r.asin && r.site && (submitted || alreadyListed)) {
+            const rb2 = (r.fillResult && r.fillResult.readBack) || null;
+            const sell2 = parseReadBackPair(rb2 && rb2.selling);
+            const sitePair2 = parseReadBackPair(rb2 && rb2.site);
+            claimUpsert({
+              asin: r.asin, site: r.site, siteId: (sitePair2 && sitePair2.id) || null,
+              storeId: sell2.id || ('?shop:' + (shopClean(r.shop) || 'none')), storeName: sell2.name || null,
+              shop: shopClean(r.shop) || null,
+              parentAsin: r.parentAsin || (r.variant && r.variant.parentAsin) || null,
+              status: failed ? 'failed' : 'listed', source: 'bridge', at: at,
+              machineId: machineInfo.id, machineName: machineInfo.name,
+              title: r.title || null, brand: r.brand || null, image: r.mainImage || null,
+            });
+            claimSave();
+          }
+        } catch (e) { console.error('[claims] 上架后写台账失败: ' + ((e && e.message) || e)); }
+        /* ★ 上架成功 → 同步写一条选品归档(条目带店铺, 按 shop → site 隔离; 重复上架只累加 times) */
+        let archived = null;
+        if (!failed && submitted && (r.status || '') === 'listed') {
+          try { archived = archiveAddListing(r); }
+          catch (e) { console.error('[archive] 上架自动归档失败: ' + ((e && e.message) || e)); }
         }
         save('listing-records.json', listingRecords);
+        if (blockedMissed) {
+          pushNotify('⚠️ 查重拦截未生效', '被拦截的商品 ' + r.asin + '@' + r.site + ' 仍然提交成功了',
+            '拦截只能保证"ERP 不再把提交请求发出去"(不入队 → bridge 拿不到任务)。这次提交来自别处(手动/旧标签页), 已如实记为已上架。');
+        }
         return send(200, {
-          ok: true, id: r.id, status: r.status,
+          ok: true, id: r.id, status: r.status, shop: r.shop || null, archived, blockedMissed,
+          preflight: preflight,                       // ★ true = 提交前就被拦下(不是上传失败, 状态未变)
           uploadResult: uploadResultOf(r), fillState: fillStateOf(r), fillStatus: legacyFillStatusOf(r),
-          attempts: r.uploadsTotal, failCount: r.failCount || 0,
+          attempts: r.uploadsTotal, failCount: r.failCount || 0, preflightCount: r.preflightCount || 0,
           fillResult: r.fillResult, uploads: r.uploads.slice(0, 10), stats: listingStats(),
         });
       }
@@ -12936,15 +15022,18 @@ const server = http.createServer((req, res) => {
       if (p === '/api/listing/uploads' && req.method === 'GET') {
         const result = String(url.searchParams.get('result') || '').trim();     // ok | failed | 空=全部
         const site = String(url.searchParams.get('site') || '').trim().toLowerCase();
+        /* ★ 多店铺隔离 (2026-10-06): 上传日志同样按店铺隔离(默认当前店铺, ?shop=* 看全部) */
+        const shopSel = shopParamOf(url.searchParams.get('shop'));
         const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get('limit') || '100', 10) || 100));
         const rows = [];
         for (const r of listingRecords) {
+          if (!shopMatch(r, shopSel)) continue;
           if (site && String(r.site || '').toLowerCase() !== site) continue;
           for (const u of (r.uploads || [])) {
             if (result === 'failed' && u.ok !== false) continue;
             if (result === 'ok' && u.ok === false) continue;
             rows.push(Object.assign({
-              id: r.id, asin: r.asin, site: r.site, parentAsin: r.parentAsin,
+              id: r.id, asin: r.asin, site: r.site, parentAsin: r.parentAsin, shop: r.shop || null,
               title: r.title ? String(r.title).slice(0, 80) : null,
               nowStatus: r.status || 'pending', nowFillStatus: legacyFillStatusOf(r),
               nowResult: uploadResultOf(r),
@@ -12953,7 +15042,7 @@ const server = http.createServer((req, res) => {
           }
         }
         rows.sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')));
-        return send(200, { ok: true, total: rows.length, items: rows.slice(0, limit), stats: listingStats() });
+        return send(200, { ok: true, total: rows.length, shop: shopSel.shop || null, shopFilter: shopFilterActive(shopSel), items: rows.slice(0, limit), stats: listingStats() });
       }
 
       if (p === '/api/listing/records' && req.method === 'GET') {
@@ -12963,46 +15052,84 @@ const server = http.createServer((req, res) => {
         /* ★ 上传记录筛选 —— 按【上传结果】这一种状态数据筛(状态简化后口径):
          *   ok 成功 / failed 失败 / none 还没有结果 / everfailed 历史上失败过(含后来成功的) */
         const upload = String(url.searchParams.get('upload') || '').trim();
-        let list = listingRecords.slice();
+        /* ★ 多店铺隔离 (2026-10-06): 默认只返回【当前店铺】的记录(插件登录什么店铺就用什么数据)。
+         *   ?shop=* 看全部(排障/总览), ?shop=none 看未分类, ?shop=<名字> 指定店铺。 */
+        const shopSel = shopParamOf(url.searchParams.get('shop'));
+        let list = listingRecords.filter((r) => shopMatch(r, shopSel));
+        /* ★ 被查重拦截的记录: 默认【一起返回】(要能在界面上看到并追溯), ?blocked=exclude 排除、=only 只看拦截 */
+        const blockedQ = String(url.searchParams.get('blocked') || '').trim().toLowerCase();
+        if (blockedQ === 'exclude') list = list.filter((r) => !isBlockedRow(r));
+        else if (blockedQ === 'only' || blockedQ === '1') list = list.filter((r) => isBlockedRow(r));
         if (site) list = list.filter((r) => String(r.site || '') === site);
         if (status) list = list.filter((r) => (r.status || 'pending') === status);
         if (upload === 'failed') list = list.filter((r) => uploadResultOf(r) === 'failed');
         else if (upload === 'ok') list = list.filter((r) => uploadResultOf(r) === 'ok');
         else if (upload === 'none') list = list.filter((r) => uploadResultOf(r) === null);
         else if (upload === 'everfailed') list = list.filter((r) => (r.failCount || 0) > 0);
-        if (q) list = list.filter((r) => (String(r.asin) + ' ' + String(r.title || '') + ' ' + String(r.brand || '') + ' ' + String(r.parentAsin || '')).toLowerCase().includes(q));
+        /* ★ 2026-10-07 修【假警报】: q 的匹配范围原来只有 asin/title/brand/parentAsin ——
+         *   而插件工作台/采集器轮询"我这次上传的结果"时传的是**记录 id**(形如 B0HH88QHWR@uk),
+         *   带 @站点 的串永远匹配不到 → 轮询 40×4 秒全是 0 条 → 报"等了 160 秒还没看到提交结果"
+         *   (实测: 该商品其实早已上架成功)。把 id 也纳入匹配范围 —— 这样老版本插件的调用也能命中。 */
+        if (q) list = list.filter((r) => (String(r.asin) + ' ' + String(r.title || '') + ' ' + String(r.brand || '') + ' ' + String(r.parentAsin || '') + ' ' + String(r.id || '')).toLowerCase().includes(q));
         const limit = Math.min(1000, Math.max(1, parseInt(url.searchParams.get('limit') || '200', 10) || 200));
         const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0);
-        return send(200, { total: list.length, offset, limit, items: list.slice(offset, offset + limit).map(decorateListing), stats: listingStats() });
+        const st2 = listingStats();
+        return send(200, {
+          total: list.length, offset, limit,
+          shop: shopSel.shop || null, shopFilter: shopFilterActive(shopSel), shopMode: shopSel.mode || 'default',
+          currentShop: currentShopName(), shops: st2.shops, byShop: st2.byShop, byShopSite: st2.byShopSite,
+          blocked: blockedQ || 'include',
+          items: list.slice(offset, offset + limit).map(decorateListing), stats: st2,
+        });
       }
 
       // 单条详情
       if (p === '/api/listing/record' && req.method === 'GET') {
         const id = String(url.searchParams.get('id') || '');
-        const r = listingRecords.find((x) => x.id === id) || listingRecords.find((x) => x.asin === String(url.searchParams.get('asin') || '').toUpperCase());
-        if (!r) return send(404, { error: '找不到记录: ' + id });
-        return send(200, decorateListing(r));
+        const wantAsin = String(url.searchParams.get('asin') || '').toUpperCase().trim();
+        /* ★ 多店铺隔离 (2026-10-06): 按 asin 查时优先给当前店铺的那条(同 asin 在不同店铺是不同记录) */
+        const shopSel = shopParamOf(url.searchParams.get('shop'));
+        let r = id ? (listingRecords.find((x) => x.id === id) || null) : null;
+        if (!r && wantAsin) {
+          const hits = listingRecords.filter((x) => String(x.asin || '').toUpperCase() === wantAsin && shopMatch(x, shopSel));
+          r = hits.find((x) => !isBlockedRow(x)) || hits[0] || null;
+        }
+        if (!r) return send(404, { error: '找不到记录: ' + (id || wantAsin) });
+        return send(200, Object.assign(decorateListing(r), { shop: r.shop || null, currentShop: currentShopName() }));
       }
 
       // 改状态/备注 (上架工具回写"已上架"用)
       if (p === '/api/listing/records/status' && req.method === 'POST') {
         const ids = Array.isArray(j.ids) ? j.ids : (j.id ? [j.id] : []);
         const st = String(j.status || '').trim();
-        if (!ids.length) return send(400, { error: 'ids 为空' });
-        if (!['pending', 'listed', 'failed'].includes(st)) return send(400, { error: 'status 需为 pending/listed/failed' });
-        let n = 0;
+        /* ★ 多店铺隔离 (2026-10-06): status 多了 blocked; 并且支持"不给 ids, 按 shop/site 批量改" */
+        const shopSel = shopParamOf(j.shop === undefined ? '' : j.shop);
+        const siteF = String(j.site || '').trim().toLowerCase();
+        if (!ids.length && !shopFilterActive(shopSel) && !siteF) return send(400, { error: 'ids 为空 (或给 shop / site 条件做批量改)' });
+        if (!['pending', 'listed', 'failed', 'blocked'].includes(st)) return send(400, { error: 'status 需为 pending/listed/failed/blocked' });
+        let n = 0; const archived = [];
         listingRecords.forEach((r) => {
-          if (!ids.includes(r.id)) return;
+          const hit = ids.length
+            ? ids.includes(r.id)
+            : (shopMatch(r, shopSel) && (!siteF || String(r.site || '').toLowerCase() === siteF));
+          if (!hit) return;
           r.status = st; n++;
           if (j.note != null) r.note = String(j.note).slice(0, 300);
-          if (st === 'listed') r.listedAt = r.listedAt || now();
+          if (st === 'listed') {
+            r.listedAt = r.listedAt || now();
+            /* 人工改判为已上架 → 解除拦截标记(它现在真的上架了), 并同步一条归档 */
+            if (isBlockedRow(r)) { r.blocked = false; r.unblockedAt = now(); r.unblockedReason = '人工改判为已上架'; }
+            const a = archiveAddListing(r);
+            if (a) archived.push(a.key);
+          }
         });
         save('listing-records.json', listingRecords);
-        return send(200, { ok: true, updated: n, stats: listingStats() });
+        return send(200, { ok: true, updated: n, archived, shop: shopSel.shop || null, stats: listingStats() });
       }
 
       // 删除
       if (p === '/api/listing/records/delete' && req.method === 'POST') {
+        if (!isLocalAddr(req)) return send(403, { error: '仅允许本机调用(危险操作)' });
         const ids = Array.isArray(j.ids) ? j.ids : (j.id ? [j.id] : []);
         const before = listingRecords.length;
         listingRecords = listingRecords.filter((r) => !ids.includes(r.id));
@@ -13010,12 +15137,28 @@ const server = http.createServer((req, res) => {
         return send(200, { ok: true, deleted: before - listingRecords.length, stats: listingStats() });
       }
 
-      // 清空 (显式操作)
+      // 清空 (显式操作) —— ★ 多店铺隔离: 给了 shop/site 就只清那部分, 什么都不给 = 整库清空(老行为保留)
       if (p === '/api/listing/records/clear' && req.method === 'POST') {
-        const n = listingRecords.length;
-        listingRecords = [];
+        if (!isLocalAddr(req)) return send(403, { error: '仅允许本机调用(危险操作)' });
+        const shopRaw = String(j.shop == null ? '' : j.shop).trim();
+        const siteF = String(j.site || '').trim().toLowerCase();
+        const scoped = (!!shopRaw && shopRaw !== '*') || !!siteF;
+        /* ★ 2026-10-24: 必须显式 confirm:"CLEAR" —— 之前任何 POST 都能把整库清空, 实测差点误删 214 条 */
+        if (String(j.confirm || '') !== 'CLEAR') return send(400, { error: '清空上架记录需要 confirm:"CLEAR" 显式确认' });
+        if (!scoped) {
+          const n = listingRecords.length;
+          listingRecords = [];
+          save('listing-records.json', listingRecords, true);
+          return send(200, { ok: true, cleared: n, scope: 'all', stats: listingStats() });
+        }
+        const shopSel = shopParamOf(shopRaw);
+        const before = listingRecords.length;
+        listingRecords = listingRecords.filter((r) => !(shopMatch(r, shopSel) && (!siteF || String(r.site || '').toLowerCase() === siteF)));
         save('listing-records.json', listingRecords, true);
-        return send(200, { ok: true, cleared: n, stats: listingStats() });
+        return send(200, {
+          ok: true, cleared: before - listingRecords.length, remaining: listingRecords.length,
+          scope: 'shop', shop: shopSel.shop || null, shopMode: shopSel.mode, site: siteF || null, stats: listingStats(),
+        });
       }
 
       // 导出 (给上品工具/手工粘贴用): json | csv | txt(逗号分隔 ASIN)
@@ -13024,6 +15167,10 @@ const server = http.createServer((req, res) => {
         const ids = String(url.searchParams.get('ids') || '').split(',').map((s) => s.trim()).filter(Boolean);
         const onlyAsin = url.searchParams.get('asinOnly') === '1';
         let list = ids.length ? listingRecords.filter((r) => ids.includes(r.id)) : listingRecords.slice();
+        /* ★ 多店铺隔离 (2026-10-06): 导出也能按店铺/站点隔离(不传 = 全部, 导出是"把库带走") */
+        const shopRaw = String(url.searchParams.get('shop') || '').trim();
+        if (shopRaw) { const sel = shopParamOf(shopRaw); list = list.filter((r) => shopMatch(r, sel)) }
+        if (url.searchParams.get('site')) list = list.filter((r) => String(r.site || '') === String(url.searchParams.get('site')).toLowerCase());
         if (url.searchParams.get('status')) list = list.filter((r) => (r.status || 'pending') === url.searchParams.get('status'));
         if (fmt === 'txt' || onlyAsin) {
           return send(200, { ok: true, total: list.length, text: list.map((r) => r.asin).join(',') });
@@ -13031,13 +15178,15 @@ const server = http.createServer((req, res) => {
         if (fmt === 'csv') {
           const head = ['asin', 'parentAsin', 'site', 'title', 'brand', 'price', 'currency', 'bsrShop', 'bsrCat', 'sales30d', 'listedAt', 'fulfill', 'childCount', 'childAsins', 'status',
             /* ★ 2026-09-27 上传记录也导出去(上架记录只做记录 → 记录要能带走) */
-            'uploadResult', 'uploadAttempts', 'failCount', 'lastUploadAt', 'lastFailAt', 'failReason'];
+            'uploadResult', 'uploadAttempts', 'failCount', 'lastUploadAt', 'lastFailAt', 'failReason',
+            /* ★ 2026-10-06 多店铺隔离: 店铺列 --- 加在【最后】, 不打乱前面已有的列序(老工具按位置读列) */
+            'shop', 'shopUserId', 'blockedReason'];
           const rows = list.map((r) => {
             const kids = (r.variant && r.variant.children) ? r.variant.children.map((c) => c.asin).join('|') : '';
             const p2 = r.panel || {};
             const us = r.uploads || [];
             const last = us[0] || null;
-            /* ★ 状态简化后: 导出的是"上传结果"(成功/失败/空), 不再写「未上传/已填未传」这类中间态 */
+            /* ★ 状态简化后: 导出的是"上传结果"(成功/失败/空), 不再写「未填未传」这类中间态 */
             const resNow = uploadResultOf(r);
             const upResult = resNow === 'ok' ? '成功' : (resNow === 'failed' ? '失败' : '');
             return [r.asin, r.parentAsin || '', r.site || '', '"' + String(r.title || '').replace(/"/g, '""') + '"', '"' + String(r.brand || '') + '"',
@@ -13046,7 +15195,9 @@ const server = http.createServer((req, res) => {
               (r.variant && r.variant.childCount) || 0, '"' + kids + '"', r.status || 'pending',
               upResult, r.uploadsTotal || us.length || 0, r.failCount || 0,
               last ? last.at : '', r.failAt || '',
-              '"' + String(r.failReason || '').replace(/"/g, '""') + '"'].join(',');
+              '"' + String(r.failReason || '').replace(/"/g, '""') + '"',
+              '"' + String(r.shop || SHOP_UNKNOWN) + '"', r.shopUserId != null ? r.shopUserId : '',
+              '"' + String(r.note || '').replace(/"/g, '""') + '"'].join(',');
           });
           return send(200, { ok: true, total: list.length, csv: head.join(',') + '\n' + rows.join('\n') });
         }
@@ -13076,8 +15227,14 @@ const server = http.createServer((req, res) => {
           items = list.slice(0, limit).map(archiveItemFromProduct).filter((x) => x && x.asin);
         } else {
           let list = listingRecords.slice();
+          /* ★ 多店铺隔离 (2026-10-06): 被查重拦截的记录【不进归档】(拦截 = 没上架) —— 除非显式按 id 指定 */
+          if (!ids.length) list = list.filter((r) => !isBlockedRow(r));
           if (ids.length) list = list.filter((r) => ids.includes(r.id) || ids.includes(String(r.asin || '').toUpperCase()));
           if (site) list = list.filter((r) => String(r.site || '').toLowerCase() === site);
+          /* ★ 归档也按店铺隔离: {shop:"王依凡"} 只归档这个店铺的; {shop:"*"} / 不传 = 全部 */
+          const shopRaw = String(j.shop == null ? '' : j.shop).trim();
+          const shopSel = shopRaw ? shopParamOf(shopRaw) : null;
+          if (shopSel) list = list.filter((r) => shopMatch(r, shopSel));
           const st = String(j.status || '').trim();
           if (st) list = list.filter((r) => (r.status || 'pending') === st);
           if (q) list = list.filter((r) => (String(r.asin || '') + ' ' + String(r.title || '') + ' ' + String(r.brand || '') + ' ' + String(r.parentAsin || '')).toLowerCase().includes(q));
@@ -13096,6 +15253,9 @@ const server = http.createServer((req, res) => {
         if (!items.length) return send(200, { ok: false, error: '这些品以前都归档过了(这次开了"跳过重复")', matched, dupCount });
         const bySite = {};
         items.forEach((it) => { const k = it.site || '?'; bySite[k] = (bySite[k] || 0) + 1; });
+        /* ★ 多店铺隔离 (2026-10-06): 批次也记"分店铺"计数, 便于按店铺看这一批是什么 */
+        const byShop = {};
+        items.forEach((it) => { const k = it.shop || SHOP_UNKNOWN; byShop[k] = (byShop[k] || 0) + 1; });
         /* ★ v2: 条目进【去重表】(同一个品只存一份, 记 firstArchivedAt/times), 批次只存 key 列表 */
         if (!selectionArchive.items || typeof selectionArchive.items !== 'object') selectionArchive.items = {};
         const keys = items.map((it) => it.key).filter(Boolean);
@@ -13112,26 +15272,56 @@ const server = http.createServer((req, res) => {
           batchId: 'B' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
           name: String(j.name || '').trim().slice(0, 80) || ('选品归档 ' + now().slice(0, 16)),
           source, note: j.note ? String(j.note).slice(0, 300) : null,
-          createdAt: at, count: items.length, bySite, dupCount, keys,
+          createdAt: at, count: items.length, bySite, byShop, dupCount, keys,
         };
         selectionArchive.batches.unshift(batch);
-        while (selectionArchive.batches.length > 200) selectionArchive.batches.pop();   // 兜底: 别让这个文件无限膨胀
+        archiveTrim();          // ★ 用 archiveTrim: 常驻的「上架归档(自动)」批次不许被裁掉
         save('selection-archive.json', selectionArchive, true);
         const overflow = matched - items.length - droppedDup;
         pushNotify('选品归档', '批次「' + batch.name + '」存了 ' + items.length + ' 个品' +
           (dupCount ? ' (其中 ' + dupCount + ' 个以前归档过)' : '') + (overflow > 0 ? ', 另有 ' + overflow + ' 个超出上限未存' : ''),
           '来源: ' + (source === 'products' ? '商品库' : '上架记录'));
-        return send(200, { ok: true, batchId: batch.batchId, name: batch.name, count: batch.count, matched, dupCount, droppedDup, overflow, bySite, stats: archiveStats() });
+        return send(200, { ok: true, batchId: batch.batchId, name: batch.name, count: batch.count, matched, dupCount, droppedDup, overflow, bySite, byShop, stats: archiveStats() });
       }
 
-      // 批次列表 (不带 items, 页面展开时再单独取)
+      /* 批次列表 —— ★ 2026-10-06 加 shop/site: 同时给出「店铺 → 站点」二级分类计数。
+       *   ?shop=* 或 不传 = 全部(归档是"库", 默认看全, 界面按店铺分组);
+       *   ?shop=王依凡 / ?shop=none(未分类) / ?site=uk 可再收窄。 */
       if (p === '/api/archive/list' && req.method === 'GET') {
-        return send(200, {
+        const shopRaw = String(url.searchParams.get('shop') || '').trim();
+        const siteQ = String(url.searchParams.get('site') || '').trim().toLowerCase();
+        const stats = archiveStats();
+        const out = {
           ok: true,
           batches: selectionArchive.batches.map((b) => ({
             batchId: b.batchId, name: b.name, source: b.source, note: b.note || null, createdAt: b.createdAt,
-            count: b.count || (b.keys || []).length, bySite: b.bySite || {}, dupCount: b.dupCount || 0,
+            count: b.count || (b.keys || []).length, bySite: b.bySite || {}, dupCount: b.dupCount || 0, live: b.live === true,
           })),
+          stats,
+          shop: shopRaw || null, site: siteQ || null,
+          byShop: stats.byShop, byShopSite: stats.byShopSite,
+        };
+        if (url.searchParams.get('grouped') !== '0') {
+          const list = archiveQuery({ dedup: '1', shop: shopRaw, site: siteQ });
+          out.grouped = archiveShopTree(list);
+          out.groupedTotal = list.length;
+        }
+        return send(200, out);
+      }
+
+      /* ★ 归档条目按「店铺 → 站点」二级分组返回(带条目) —— ERP 客户端归档页直接用这个渲染 */
+      if (p === '/api/archive/grouped' && req.method === 'GET') {
+        const sp = (k, d) => url.searchParams.get(k) || d || '';
+        const shopRaw = String(url.searchParams.get('shop') || '').trim();
+        const list = archiveQuery({
+          dedup: sp('dedup', '1'), batchId: sp('batchId'), site: sp('site'), q: sp('q'), shop: shopRaw,
+          cat1: sp('cat1'), tag: sp('tag'), priceMin: sp('priceMin'), priceMax: sp('priceMax'),
+          marginMin: sp('marginMin'), marginMax: sp('marginMax'), salesMin: sp('salesMin'), rankMax: sp('rankMax'),
+        });
+        const limit = Math.min(5000, Math.max(1, parseInt(url.searchParams.get('limit') || '2000', 10) || 2000));
+        return send(200, {
+          ok: true, total: list.length, limit, shop: shopRaw || null,
+          groups: archiveGroupByShop(list.slice(0, limit)),
           stats: archiveStats(),
         });
       }
@@ -13144,13 +15334,13 @@ const server = http.createServer((req, res) => {
          *   实测: 老批次里的品后来又被归档过 → 去重把它们算到新批次头上 → 点老批次返回 0 条。 */
         const sp = (k, d) => url.searchParams.get(k) || d || '';
         const list = archiveQuery({
-          dedup: batchId ? '0' : (dedup ? '1' : '0'), batchId: batchId, site: sp('site'), q: sp('q'),
+          dedup: batchId ? '0' : (dedup ? '1' : '0'), batchId: batchId, site: sp('site'), q: sp('q'), shop: String(url.searchParams.get('shop') || '').trim(),
           cat1: sp('cat1'), tag: sp('tag'), priceMin: sp('priceMin'), priceMax: sp('priceMax'),
           marginMin: sp('marginMin'), marginMax: sp('marginMax'), salesMin: sp('salesMin'), rankMax: sp('rankMax'),
         });
         const limit = Math.min(1000, Math.max(1, parseInt(url.searchParams.get('limit') || '200', 10) || 200));
         const offset = Math.max(0, parseInt(url.searchParams.get('offset') || '0', 10) || 0);
-        return send(200, { ok: true, total: list.length, offset, limit, dedup, items: list.slice(offset, offset + limit), stats: archiveStats() });
+        return send(200, { ok: true, total: list.length, offset, limit, dedup, shop: String(url.searchParams.get('shop') || '').trim() || null, items: list.slice(offset, offset + limit), stats: archiveStats() });
       }
 
       /* ===== ★ 选品归档 · 分布统计 与 标签 (2026-09-27) ===== */
@@ -13159,11 +15349,11 @@ const server = http.createServer((req, res) => {
       if (p === '/api/archive/stats' && req.method === 'GET') {
         const sp = (k, d) => url.searchParams.get(k) || d || '';
         const dist = archiveDistribution({
-          dedup: sp('dedup', '1'), batchId: sp('batchId'), site: sp('site'), q: sp('q'),
+          dedup: sp('dedup', '1'), batchId: sp('batchId'), site: sp('site'), q: sp('q'), shop: String(url.searchParams.get('shop') || '').trim(),
           cat1: sp('cat1'), tag: sp('tag'), priceMin: sp('priceMin'), priceMax: sp('priceMax'),
           marginMin: sp('marginMin'), marginMax: sp('marginMax'), salesMin: sp('salesMin'), rankMax: sp('rankMax'),
         });
-        return send(200, Object.assign({ ok: true, query: { dedup: url.searchParams.get('dedup') !== '0', batchId: sp('batchId'), site: sp('site') } }, dist, { stats: archiveStats() }));
+        return send(200, Object.assign({ ok: true, query: { dedup: url.searchParams.get('dedup') !== '0', batchId: sp('batchId'), site: sp('site'), shop: String(url.searchParams.get('shop') || '').trim() || null } }, dist, { stats: archiveStats() }));
       }
 
       // 打标签 / 去标签 (爆款/试销/放弃/季节品) —— 标签按 asin@site 存, 重新归档不会丢
@@ -13186,6 +15376,36 @@ const server = http.createServer((req, res) => {
         return send(200, { ok: true, changed: n, tags: selectionArchive.tags });
       }
 
+      /* ★ 删归档条目 (2026-10-06): 归档错/测试数据要能删掉, 而不是只能删整批或清空整个库。
+       *   同时把引用它的批次 keys 里摘掉并重算 count/bySite/byShop —— 不留"指向空气的键"。 */
+      if (p === '/api/archive/item/delete' && req.method === 'POST') {
+        const ra = String((req.socket && req.socket.remoteAddress) || '');
+        if (!/^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/.test(ra)) return send(403, { error: '仅允许本机调用' });
+        const keys = (Array.isArray(j.keys) ? j.keys : (j.key ? [j.key] : [])).map((x) => String(x)).filter(Boolean);
+        if (!keys.length) return send(400, { error: '要给 keys (形如 "店铺|ASIN@站点" 或 "ASIN@站点")' });
+        const set = new Set(keys);
+        let hit = 0;
+        keys.forEach((k) => { if (selectionArchive.items && selectionArchive.items[k]) { delete selectionArchive.items[k]; hit++ } });
+        keys.forEach((k) => { if (selectionArchive.tags) delete selectionArchive.tags[k] });
+        selectionArchive.batches.forEach((b) => {
+          if (!Array.isArray(b.keys)) return;
+          const before = b.keys.length;
+          b.keys = b.keys.filter((k) => !set.has(k));
+          if (b.keys.length === before) return;
+          b.count = b.keys.length;
+          b.bySite = {}; b.byShop = {};
+          b.keys.forEach((k) => {
+            const it = selectionArchive.items[k];
+            if (!it) return;
+            const s = it.site || '?', sh = it.shop || SHOP_UNKNOWN;
+            b.bySite[s] = (b.bySite[s] || 0) + 1;
+            b.byShop[sh] = (b.byShop[sh] || 0) + 1;
+          });
+        });
+        save('selection-archive.json', selectionArchive, true);
+        return send(200, { ok: true, deleted: hit, requested: keys.length, stats: archiveStats() });
+      }
+
       // 导出文件: csv(Excel 直接开, 前端加 BOM) | json
       if (p === '/api/archive/export' && req.method === 'GET') {
         const fmt = String(url.searchParams.get('format') || 'csv').toLowerCase();
@@ -13193,7 +15413,7 @@ const server = http.createServer((req, res) => {
         const sp = (k, d) => url.searchParams.get(k) || d || '';
         const list = archiveQuery({
           dedup: batchId ? '0' : (url.searchParams.get('dedup') !== '0' ? '1' : '0'), batchId: batchId,
-          site: sp('site'), q: sp('q'), cat1: sp('cat1'), tag: sp('tag'),
+          site: sp('site'), q: sp('q'), cat1: sp('cat1'), tag: sp('tag'), shop: String(url.searchParams.get('shop') || '').trim(),
           priceMin: sp('priceMin'), priceMax: sp('priceMax'), marginMin: sp('marginMin'), marginMax: sp('marginMax'),
           salesMin: sp('salesMin'), rankMax: sp('rankMax'),
         });
@@ -13387,7 +15607,10 @@ const server = http.createServer((req, res) => {
         const asin = url.searchParams.get('asin');
         const prod = products.find((x) => x.asin === asin);
         if (!prod) return send(404, { error: '商品不存在' });
-        return send(200, { ...prod, compliance: complianceCheck(prod) });
+        /* ★ 2026-10-18 详情页也要带单品选品分析标签（与卡片同一份口径） */
+        const one = { ...prod };
+        try { productInsight.annotate([one], products); } catch (e) {}
+        return send(200, { ...one, compliance: complianceCheck(one) });
       }
 
       /* ★ 2026-10-02 按「卖家」批量回填卖家国家(中国卖家) —— 供国旗采集脚本用。
@@ -13459,11 +15682,260 @@ const server = http.createServer((req, res) => {
         });
       }
 
+      /* ===== 类目市场分析 (自包含 HTML, 不依赖 client.js) ===============
+       *   GET /api/market/list                            → 可分析类目(HTML)
+       *   GET /api/market/list?format=json                → JSON
+       *   GET /api/market/analyze?site=au&cat=Automotive  → 分析报告(HTML)
+       *   GET /api/market/analyze?...&format=json|md      → 原始产物
+       * ================================================================ */
+      if (p === '/api/market/list') {
+        try {
+          const rows = marketApi.listCategories();
+          if (url.searchParams.get('format') === 'json') return send(200, { ok: true, rows });
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          return res.end(marketApi.renderList(rows));
+        } catch (e) {
+          return send(500, { ok: false, error: String((e && e.message) || e) });
+        }
+      }
+
+      if (p === '/api/market/analyze') {
+        const site = String(url.searchParams.get('site') || '').trim();
+        const cat = String(url.searchParams.get('cat') || '').trim();
+        const fmt = url.searchParams.get('format') || 'html';
+        if (!site || !cat) return send(400, { ok: false, error: '缺少 site / cat 参数' });
+        try {
+          const r = marketApi.analyze(site, cat);
+          if (!r.ok) {
+            if (fmt === 'json') return send(500, r);
+            res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+            return res.end(marketApi.renderReport({
+              ok: false, site: site, cat: cat, ccy: marketApi.SITE_CCY[site] || '',
+              norm: { meta: { row_count_raw: 0, row_count_kept: 0, dropped: {}, quality: {} } },
+              metrics: null,
+            }).replace('</div></body>', '<div class="alert badb">⛔ 分析失败（' +
+              String(r.step) + '）：' + String(r.err || '').slice(0, 400) + '</div></div></body>'));
+          }
+          if (fmt === 'json') return send(200, { ok: true, meta: r.norm.meta, metrics: r.metrics });
+          if (fmt === 'md') {
+            res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+            return res.end(r.md);
+          }
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          return res.end(marketApi.renderReport(r));
+        } catch (e) {
+          return send(500, { ok: false, error: String((e && e.message) || e) });
+        }
+      }
+
       if (p === '/api/ip/cache/clear' && (req.method === 'POST' || req.method === 'GET')) {
         return send(200, { ...ipCheck.cacheClear(), ...ipCheck.cacheStats() });
       }
 
-      // 单个关键词查重: GET /api/ip/search?q=xxx&sites=amazon.de&sources=tmview&nice=11&limit=30
+      // ===== 蓝海选品分析 (blueocean) =====
+//   GET /api/blueocean/analyze?site=de,uk&group=五金工具&maxWeightKg=0.6&priceMin=10&priceMax=60
+//       &minSales=10&limit=50&tmFree=1
+//   纯分析：只读商品库，不触发采集。采 + 补采请先走 /api/collect/list-direct 与 /api/products/refresh-detail
+if (p === '/api/blueocean/analyze' && req.method === 'GET') {
+  try {
+    const q = url.searchParams;
+    const sites = (q.get('site') || q.get('sites') || 'de,uk,au,us').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+    const groupsRaw = (q.get('group') || q.get('groups') || '').split(',').map((s) => s.trim()).filter(Boolean);
+    const groups = groupsRaw.length ? groupsRaw : undefined;
+    const out = require('./blueocean.js').analyze(products, {
+      sites,
+      groups,
+      maxWeightKg: q.get('maxWeightKg') || undefined,
+      priceMin: q.get('priceMin') || undefined,
+      priceMax: q.get('priceMax') || undefined,
+      minSales: q.get('minSales') || undefined,
+      minSample: q.get('minSample') || undefined,
+      limit: q.get('limit') || undefined,
+      requireTrademarkFree: q.get('tmFree') !== '0',
+    });
+    return send(200, out);
+  } catch (e) {
+    return send(500, { ok: false, error: String((e && e.message) || e) });
+  }
+}
+
+      /* ===== 蓝海选品 (selection) =====
+       *   POST /api/select/scan        {url,maxPages,waitPluginMs,priceMin,priceMax} → 扫描+评分
+       *   GET  /api/select/last        → 最近一次结果 (刷新页面/重新打开不丢)
+       *   GET  /api/select/export?type=candidates|all → CSV (带 BOM, Excel 直接开)
+       *   POST /api/select/to-products {asins:[...]}  → 选中的品入库(供「一键补采」补详情)
+       */
+      if (p === '/api/select/scan' && req.method === 'POST') {
+        const urlIn = String(j.url || '').trim();
+        if (!/^https:\/\/(www\.)?amazon\./.test(urlIn)) return send(400, { error: '无效的 amazon 列表页/榜单页 URL' });
+        const maxPages = Math.min(10, Math.max(1, j.maxPages || 1));
+        const waitPluginMs = Math.min(40000, Math.max(0, j.waitPluginMs != null ? j.waitPluginMs : 12000));
+        beginCollectProgress('selection-scan', '蓝海选品扫描');
+        let out;
+        try {
+          out = await cdpSelectionScan(urlIn, { maxPages, waitPluginMs });
+          endCollectProgress();
+        } catch (e) {
+          endCollectProgress();
+          return send(500, { error: String((e && e.message) || e) });
+        }
+        const sel = require('./selection-score.js');
+        const selCache = require('./selection-cache.js');
+        /* ★ P0-1: 先拿上次缓存补全(品牌/重量/商品类型等稳定事实), 再把这次读到的存起来。
+         *   面板按 ASIN 分析且限速, 同一个品的面板字段没必要每次重新等。 */
+        const cachedFilled = selCache.enrich(out.items);
+        const cacheRemembered = selCache.remember(out.items);
+        const cacheStats = selCache.stats();
+        const nv = (v) => { const n = Number(v); return isFinite(n) && n > 0 ? n : null; };
+        // 类目名: 榜单页取 URL 段, 搜索页取 i= 参数
+        const catName = (() => {
+          const m = urlIn.match(/bestsellers\/([^/?#]+)/);
+          if (m) return decodeURIComponent(m[1]);
+          const q = urlIn.match(/[?&]i=([^&]+)/);
+          if (q) return decodeURIComponent(q[1]);
+          const k = urlIn.match(/[?&]k=([^&]+)/);
+          return k ? decodeURIComponent(k[1].replace(/\+/g, ' ')) : '未分类';
+        })();
+        for (const it of out.items) {
+          it.catName = catName;
+          /* 排名: 榜单徽章 > 面板大排名 > BSR 数组最大值 —— 三个来源都读不到就留空 (不猜) */
+          if (it.rank == null) {
+            it.rank = it.listRank != null ? it.listRank
+              : (it.bsrShop != null ? it.bsrShop
+                : ((it.bsr && it.bsr.length) ? Math.max.apply(null, it.bsr.filter((v) => Number(v) > 0)) : null));
+          }
+        }
+        const items = out.items;
+        const groups = sel.scoreGroups(items, (r) => r.catName);
+        const byType = sel.scoreGroups(items.filter((x) => x.ptype), (r) => (r.catName || '') + ' / ' + r.ptype);
+        const cands = sel.candidates(items, { priceMin: nv(j.priceMin) || 10, priceMax: nv(j.priceMax) || 45 });
+        const cov = sel.coverage(items);
+        selectionLast = { at: now(), url: urlIn, site: out.site, catName, items, groups, byType, candidates: cands, coverage: cov, health: out.health };
+        try { save('selection-last.json', { at: selectionLast.at, url: urlIn, site: out.site, catName, items, coverage: cov }); } catch (e) { /* 存盘失败不影响返回 */ }
+        pushActivity('collect', '蓝海选品: ' + catName + ' ' + items.length + ' 条 / 候选 ' + cands.length, { site: out.site, url: urlIn });
+        console.log('[selection]', catName, items.length, '条 / 候选', cands.length, '/ 覆盖', JSON.stringify(cov));
+        const slim = items.map((x) => ({
+          asin: x.asin, title: (x.title || '').slice(0, 120), brand: x.brand, price: x.price, priceCny: x.priceCny,
+          rating: x.rating, reviews: x.reviews, rank: x.rank, fulfill: x.panelFulfill || x.fulfill,
+          amazonSeller: (x.panelFulfill ? (x.panelFulfill === 'AMZ') : null), sellerCount: x.panelSellerCount != null ? x.panelSellerCount : x.sellerCount,
+          weightG: x.weightG, weightRaw: x.weightRaw, sizeRaw: x.sizeRaw, variants: x.variants, aplus: x.aplus,
+          ptype: x.ptype, is1688: x.is1688, hasPanel: x.hasPanel, site: x.site, catName: x.catName,
+          trademark: x.trademark, listedAt: x.listedAt, sales30d: x.sales30d,
+        }));
+        return send(200, {
+          ok: true, at: selectionLast.at, url: urlIn, site: out.site, catName, coverage: cov,
+          groups, byType, candidates: cands.slice(0, 300), items: slim, health: out.health,
+          cache: { usedForThisScan: cachedFilled, rememberedNow: cacheRemembered, totalAsins: cacheStats.asins, file: cacheStats.file, savedAt: cacheStats.savedAt },
+          panel: { filled: out.ready && out.ready.filled, panels: out.ready && out.ready.panels, waitedMs: out.ready && out.ready.waitedMs },
+        });
+      }
+      if (p === '/api/select/last' && req.method === 'GET') {
+        if (!selectionLast) return send(200, { ok: false, empty: true });
+        return send(200, {
+          ok: true, at: selectionLast.at, url: selectionLast.url, site: selectionLast.site, catName: selectionLast.catName,
+          coverage: selectionLast.coverage, groups: selectionLast.groups, byType: selectionLast.byType,
+          candidates: selectionLast.candidates.slice(0, 300),
+        });
+      }
+      if (p === '/api/select/export' && req.method === 'GET') {
+        if (!selectionLast) return send(404, { error: '还没有扫描结果, 先跑一次扫描' });
+        const sel = require('./selection-score.js');
+        const type = url.searchParams.get('type') || 'candidates';
+        let rows;
+        if (type === 'all') {
+          rows = selectionLast.items.map((x) => ({
+            asin: x.asin, title: x.title, brand: x.brand, price: x.price, rating: x.rating, reviews: x.reviews,
+            weightG: x.weightG, ptype: x.ptype, catName: x.catName, rank: x.rank, variants: x.variants,
+            followCount: x.panelSellerCount, amazonSeller: x.panelFulfill === 'AMZ', aplus: x.aplus,
+            site: x.site, cards: [], pick: null,
+          }));
+        } else rows = selectionLast.candidates;
+        const csv = sel.toCSV(rows);
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="selection-' + String(selectionLast.catName || 'scan').replace(/[^\w.-]/g, '_') + '-' + Date.now() + '.csv"',
+        });
+        return res.end(csv);
+      }
+      /* ★ P1-1: 候选品商标查重 —— 把选品和知产查重连起来。
+       *   之前要查商标必须手工去「知产查重」页一个个贴品牌名; 现在候选表勾上直接查。
+       *   只收品牌名(面板/链接给的), 查目标站点辖区; 单次最多 12 个, 避免把外部库打爆。 */
+      if (p === '/api/select/ip-check' && req.method === 'POST') {
+        if (!selectionLast) return send(400, { error: '先扫描再查商标' });
+        const list = (Array.isArray(j.asins) ? j.asins : String(j.asins || '').split(','))
+          .map((s) => String(s).trim().toUpperCase()).filter(Boolean).slice(0, 12);
+        if (!list.length) return send(400, { error: '缺少 asins (最多 12 个)' });
+        const site = String(j.site || selectionLast.site || 'uk');
+        const marketSites = ['amazon.' + siteToHostSuffix(site)];
+        const out = [];
+        for (const asin of list) {
+          const it = selectionLast.items.find((x) => x.asin === asin);
+          if (!it) { out.push({ asin, error: '不在最近一次扫描结果里' }); continue; }
+          const brand = it.brand || (it.trademark && it.trademark.brand) || null;
+          if (!brand) { out.push({ asin, brand: null, error: '缺品牌名(面板未填), 无法查重' }); continue; }
+          try {
+            const r = await ipCheck.search(brand, { sites: marketSites, limit: 5 });
+            const hits = (r && r.items) || [];
+            const alive = hits.filter((x) => /已注册|注册有效|有效|registered|alive/i.test(
+              String(x.status || '') + ' ' + String(x.statusText || '') + ' ' + (x.alive ? 'alive' : '')));
+            out.push({
+              asin, brand,
+              risk: hits.length === 0 ? 'low' : (alive.length ? 'high' : 'medium'),
+              hits: hits.length, alive: alive.length,
+              top: hits.slice(0, 3).map((x) => ({ title: (x.title || '').slice(0, 60), office: x.office || null, status: x.status || x.statusText || null, id: x.id || null })),
+              checkedAt: now(),
+            });
+          } catch (e) { out.push({ asin, brand, error: String((e && e.message) || e) }); }
+        }
+        return send(200, { ok: true, site, results: out });
+      }
+
+      if (p === '/api/select/to-products' && req.method === 'POST') {
+        if (!selectionLast) return send(400, { error: '先扫描再入库' });
+        const list = (Array.isArray(j.asins) ? j.asins : String(j.asins || '').split(','))
+          .map((s) => String(s).trim().toUpperCase()).filter(Boolean);
+        if (!list.length) return send(400, { error: '缺少 asins' });
+        const used = new Set(products.map((x) => x.asin));
+        let added = 0;
+        const addedAsins = [];
+        for (const asin of list) {
+          if (used.has(asin)) continue;
+          const x = selectionLast.items.find((it) => it.asin === asin);
+          if (!x) continue;
+          used.add(asin);
+          const item = {
+            id: asin, asin: asin, rank: x.rank ? '#' + x.rank : null,
+            title: x.title, brand: x.brand || null, brandStatus: 'unchecked', bgMark: false, tmMark: false,
+            patentRisk: false, trademarkCount: (x.trademark && x.trademark.count) || 0,
+            followCount: x.panelSellerCount != null ? x.panelSellerCount : (x.sellerCount || 0),
+            chinaSeller: null, sellerCountryCode: null,
+            fulfill: x.panelFulfill || x.fulfill || null,
+            amazonSell: (x.panelFulfill === 'AMZ') ? true : null,
+            mainSeller: x.seller || null, mainImage: x.img || null, offerPrices: null,
+            price: x.price != null ? x.price : null, currency: siteCurrency(selectionLast.site),
+            priceCny: x.priceCny || null,
+            monthlySales: x.sales30d != null ? x.sales30d : null,
+            reviews: x.reviews != null ? x.reviews : null, rating: x.rating || null, stock: null,
+            weight: x.weightRaw || null, size: x.sizeRaw || null,
+            variantsCount: x.variants != null ? x.variants : null, aplus: x.aplus === true,
+            listedAt: x.listedAt || null,
+            bsr: [], bsrShop: null, bsrShopCat: null, bsrCat: null, bsrCatName: null,
+            selectionRank: x.rank || null, selectionCat: selectionLast.catName,
+            variations: 0, variants: null, referralFee: null, netProfit: null,
+            site: selectionLast.site, category: 'Selection', collectedAt: now(), source: 'selection-scan',
+            saved: false, real: true, is1688: x.is1688 || false, is1688Url: x.is1688Url || null, badge: x.badge || null,
+          };
+          if (item.price != null) item.referralFee = Math.round(item.price * (referralRateFor(item.cat1).rate / 100) * 100) / 100;
+          products.unshift(applyRankFields(item));
+          added++;
+          addedAsins.push(asin);
+        }
+        if (added) save('products.json', products);
+        pushNotify('选品入库', '从「' + (selectionLast.catName || '') + '」加入 ' + added + ' 个商品', '后续可在商品管理里对这些品做「一键补采」补详情');
+        return send(200, { ok: true, added, asins: addedAsins, total: products.length });
+      }
+
+// 单个关键词查重: GET /api/ip/search?q=xxx&sites=amazon.de&sources=tmview&nice=11&limit=30
       // ★ sites 是核心参数: 决定"只看哪个市场有效的商标" —— 上德国站就只看在德国有效的。
       if (p === '/api/ip/search' && req.method === 'GET') {
         const q = url.searchParams.get('q') || url.searchParams.get('term') || '';
@@ -13633,6 +16105,532 @@ const server = http.createServer((req, res) => {
         });
       }
 
+      /* ★ 店铺/列表链接查重: 商品列表页 → 采 ASIN + 品牌 + 站点 → 逐品牌查商标（后台任务, 翻页与查库都慢）
+       *   POST { urls:[...], pages:''|n, sources:[], limit, apply, maxBrands, deep }
+       *   pages 留空/0 = 采集该列表的全部页; 单个商品链接 (/dp/ASIN) 也接受 */
+      if (p === '/api/ip/list-check' && req.method === 'POST') {
+        if (ipListJob && ipListJob.running) return send(409, { error: '已有列表查重任务在跑, 先停止或等它跑完', job: ipListSummary() });
+        const rawList = Array.isArray(j.urls) ? j.urls : String(j.urls || j.url || '').split(/[\r\n,;\t ]+/);
+        const urls = rawList.map((s) => String(s || '').trim()).filter(Boolean);
+        if (!urls.length) return send(400, { error: '请填写至少一个店铺/商品列表链接' });
+        const list = urls.slice(0, 20);
+        const wp = parseInt(j.pages, 10);
+        const pages = isFinite(wp) && wp > 0 ? Math.min(60, wp) : 0;      // 0 = 全部页
+        const sources = Array.isArray(j.sources) ? j.sources
+          : (j.sources ? String(j.sources).split(',').map((s) => s.trim()).filter(Boolean) : undefined);
+        const limit = Math.min(100, Math.max(5, parseInt(j.limit || '30', 10) || 30));
+        const apply = j.apply === true;
+        // 默认不限品牌数(上限 500 作保险): 用户要求「采到的品牌全部查商标」; 品牌多时就跑得久, 随时可停
+        const maxBrands = Math.min(500, Math.max(1, parseInt(j.maxBrands || '0', 10) || 500));
+        const deep = j.deep !== false;      // 列表卡片没品牌的 ASIN 是否去详情页读品牌
+        const deepCap = Math.min(40, Math.max(0, parseInt(j.deepCap || '20', 10) || 20));
+
+        ipListJob = {
+          id: 'ipl-' + Date.now().toString(36), running: true, startedAt: now(), finishedAt: null,
+          stage: 'collect', current: '', pages, sources: sources || null, apply,
+          productCount: 0, brandCount: 0, lists: [], results: [], errors: [],
+          summary: { high: 0, medium: 0, low: 0, none: 0, unknown: 0, failed: 0 },
+          stopFlag: false,
+        };
+        const job = ipListJob;
+
+        (async () => {
+          try {
+            const brandMap = new Map();                       // key = siteId|brand(lower)
+            const addBrand = (brand, asin, siteId, asinSeen) => {
+              const b = cleanBrand(brand);
+              if (!b) return false;
+              const k = siteId + '|' + b.toLowerCase();
+              if (!brandMap.has(k)) brandMap.set(k, { brand: b, asins: [], siteId });
+              const rec = brandMap.get(k);
+              const a = String(asin || '').trim();
+              if (a && !rec.asins.includes(a)) rec.asins.push(a);
+              if (asinSeen && !asinSeen.has(a)) asinSeen.add(a);
+              return true;
+            };
+            // 商品库 ASIN→品牌 索引 (143k 条, 建一次省几万次线性查找)
+            const libBrand = new Map();
+            products.forEach((x) => { if (x.asin && x.brand) libBrand.set(x.asin, x.brand); });
+
+            /* ===== 1) 逐个链接采集 ===== */
+            for (const u of list) {
+              if (job.stopFlag) break;
+              const c = classifyAmzLink(u);
+              if (!c) { job.errors.push({ url: u, error: '无效链接' }); continue; }
+              job.current = u;
+
+              if (c.isList) {
+                job.stage = 'collect';
+                try {
+                  const p0 = parseAmzUrl(u);
+                  const siteId = p0.siteId || (c.siteId || null);
+                  const out = await cdpListBrands(u, {
+                    pages: job.pages || 0,
+                    shouldStop: () => job.stopFlag,
+                    onPage: (pr) => { job.current = u + ' 第 ' + pr.page + ' 页 (+' + pr.added + ', 共 ' + pr.total + ')'; },
+                  });
+                  const sid = out.siteId || siteId;
+                  if (!sid) { job.errors.push({ url: u, error: '识别不出站点(链接里没有 amazon.xx 域名)' }); continue; }
+                  job.pages = Math.max(job.pages, out.pages || 0);
+                  job.productCount += out.items.length;
+                  const inList = new Set();
+                  out.items.forEach((it) => { if (it.brand) addBrand(it.brand, it.asin, sid, inList); });
+                  const missing = out.items.filter((it) => !it.brand).map((it) => it.asin);
+                  // 列表卡片没品牌: ① 商品库补(免费) ② 仍缺的按需去详情页读品牌(有上限)
+                  let filledLib = 0;
+                  const stillMiss = [];
+                  missing.forEach((a) => {
+                    const b = libBrand.get(a);
+                    if (b) { if (addBrand(b, a, sid, inList)) filledLib++; } else stillMiss.push(a);
+                  });
+                  let filledDetail = 0;
+                  if (deep && stillMiss.length) {
+                    for (const a of stillMiss.slice(0, deepCap)) {
+                      if (job.stopFlag) break;
+                      try {
+                        const br = await cdpReadBrandSite('https://www.' + siteToHostSuffix(sid) + '/dp/' + a);
+                        if (br.brand) { if (addBrand(br.brand, a, sid, inList)) filledDetail++; }
+                      } catch (e) { /* 单条失败不中断 */ }
+                    }
+                  }
+                  ipListJobSave();      // 采集阶段也落一次(商品/品牌数不为空)
+                  job.lists.push({
+                    url: u, site: sid, pages: out.pages || 0, products: out.items.length,
+                    brands: inList.size, noBrand: out.items.length - inList.size,
+                    filledFromLib: filledLib, filledFromDetail: filledDetail,
+                    note: out.note || '', stopped: !!out.stopped,
+                  });
+                } catch (e) {
+                  job.errors.push({ url: u, error: '采集失败: ' + ((e && e.message) || e) });
+                }
+              } else {
+                // 单个商品链接: 商品库优先, 没有就开临时标签页读详情页
+                job.stage = 'collect';
+                const p0 = parseAmzUrl(u);
+                if (!p0.asin) { job.errors.push({ url: u, error: '不是列表页, 也找不到 ASIN' }); continue; }
+                const sid = p0.siteId || (c.siteId || null);
+                if (!sid) { job.errors.push({ url: u, asin: p0.asin, error: '识别不出站点' }); continue; }
+                job.productCount += 1;
+                let brand = libBrand.get(p0.asin) || '';
+                if (!brand && deep) {
+                  try { const br = await cdpReadBrandSite(u); brand = br.brand || ''; } catch (e) { /* ignore */ }
+                }
+                if (brand) addBrand(brand, p0.asin, sid, null);
+                else job.errors.push({ url: u, asin: p0.asin, error: '没采到品牌名' });
+                job.lists.push({ url: u, site: sid, pages: 0, products: 1, brands: brand ? 1 : 0, noBrand: brand ? 0 : 1, note: '单个商品链接' });
+              }
+            }
+
+            /* ===== 2) 逐个品牌查商标 (同一品牌只查一次) ===== */
+            const brands = [...brandMap.values()].slice(0, maxBrands);
+            job.brandCount = brands.length;
+            job.stage = 'check';
+            for (const rec of brands) {
+              if (job.stopFlag) break;
+              job.current = rec.brand;
+              try {
+                const r = await ipCheck.search(rec.brand, { sites: [rec.siteId], sources: job.sources || undefined, limit });
+                if (r.error) { job.errors.push({ brand: rec.brand, error: r.error }); job.summary.failed++; continue; }
+                const v = ipCheck.brandVerdict(r.risk);
+                const hits = (r.items || []).filter((h) => h.inMarket && h.statusGroup !== 'dead').slice(0, 6);
+                if (job.apply) {
+                  rec.asins.forEach((a) => {
+                    const prod = products.find((x) => x.asin === a);
+                    if (!prod) return;
+                    prod.ipCheck = {
+                      at: now(), term: rec.brand, level: r.risk.level, score: r.risk.score,
+                      market: r.market ? r.market.name : null, advice: r.risk.advice, text: v.text,
+                      tmAlive: r.risk.trademark.alive, tmExactAlive: r.risk.trademark.exactAlive,
+                    };
+                    prod.brandStatus = v.brandStatus;
+                    prod.trademarkCount = v.trademarkCount;
+                    prod.tmText = v.text;
+                    prod.tmCountries = [...new Set(hits.filter((h) => h.statusGroup === 'alive').map((h) => h.office).filter(Boolean))];
+                  });
+                }
+                job.results.push({
+                  brand: rec.brand, site: rec.siteId, siteName: r.market ? r.market.name : '',
+                  asins: rec.asins, level: r.risk.level, score: r.risk.score, advice: r.risk.advice,
+                  brandStatus: v.brandStatus, trademarkCount: v.trademarkCount, total: r.total,
+                  sources: r.sources, skipped: r.skipped, items: hits,
+                });
+                job.summary[r.risk.level] = (job.summary[r.risk.level] || 0) + 1;
+                ipListJobSave();      // ★ 每完成一个品牌落一次盘, 中途被重启也不丢已完成的部分
+              } catch (e) {
+                job.errors.push({ brand: rec.brand, error: String((e && e.message) || e) });
+                job.summary.failed++;
+              }
+            }
+            if (job.apply) { save('products.json', products, true); }
+          } catch (e) {
+            job.errors.push({ error: '任务异常: ' + ((e && e.message) || e) });
+          } finally {
+            job.running = false;
+            job.finishedAt = now();
+            job.stage = 'done';
+            job.current = '';
+            ipListJobSave();
+            try {
+              pushNotify('列表知产查重完成',
+                `${job.lists.length} 个列表 / ${job.productCount} 个商品 / ${job.brandCount} 个品牌`,
+                `高危 ${job.summary.high || 0} · 中风险 ${job.summary.medium || 0} · 低风险 ${job.summary.low || 0} · 无冲突 ${job.summary.none || 0} · 无法判定 ${job.summary.unknown || 0}`);
+            } catch (e) { /* ignore */ }
+          }
+        })();
+
+        return send(200, { ok: true, id: job.id, lists: list.length, pages, job: ipListSummary() });
+      }
+
+      if (p === '/api/ip/list-job' && req.method === 'GET') {
+        if (!ipListJob) return send(200, { ok: true, job: null });
+        return send(200, { ok: true, job: ipListSummary() });
+      }
+
+      if (p === '/api/ip/list-stop' && req.method === 'POST') {
+        if (!ipListJob) return send(200, { ok: true, stopped: false });
+        ipListJob.stopFlag = true;
+        return send(200, { ok: true, stopped: true, job: ipListSummary() });
+      }
+
+      if (p === '/api/ip/list-clear' && req.method === 'POST') {
+        if (ipListJob && ipListJob.running) return send(409, { error: '正在运行, 先停止再清空' });
+        ipListJob = null;
+        return send(200, { ok: true });
+      }
+
+      /* ★ 链接查重: 填写 Amazon 商品链接 → 采品牌 + 站点 → 针对该站点查商标。
+       *   POST { urls:[...] | url:'...', sites?, sources?, limit?, cdp?:true, apply?:false }
+       *   品牌来源: 先查商品库(零成本) → 库里没有才开临时标签页读详情页 bylineInfo → 读完关闭。
+       *   apply=true 时把结论写回商品库对应商品 (brandStatus/trademarkCount/tmCountries)。 */
+      if (p === '/api/ip/link' && req.method === 'POST') {
+        const rawList = Array.isArray(j.urls) ? j.urls : String(j.urls || j.url || '').split(/[\r\n,;\t ]+/);
+        const urls = rawList.map((s) => String(s || '').trim()).filter(Boolean);
+        if (!urls.length) return send(400, { error: '请填写至少一个 Amazon 商品链接' });
+        const list = urls.slice(0, Math.min(50, Math.max(1, parseInt(j.maxLinks || '20', 10) || 20)));
+        const sources = Array.isArray(j.sources) ? j.sources : (j.sources ? String(j.sources).split(',').map((s) => s.trim()).filter(Boolean) : undefined);
+        const limit = Math.min(100, Math.max(5, parseInt(j.limit || '30', 10) || 30));
+        const useCdp = j.cdp !== false;
+        const apply = j.apply === true;
+        const fixedSite = j.site ? 'amazon.' + siteToHostSuffix(String(j.site).replace(/^amazon\./, '')) : null;
+
+        const results = [];
+        for (const raw of list) {
+          const p1 = parseAmzUrl(raw);
+          const siteId = p1.siteId || fixedSite;
+          if (!p1.asin) { results.push({ url: raw, ok: false, error: '链接里找不到 ASIN (形如 /dp/B0XXXXXXXX)' }); continue; }
+          const prod = products.find((x) => x.asin === p1.asin);
+          let brand = '';
+          let brandFrom = '';
+          let pageTitle = '';
+          if (prod && prod.brand) { brand = prod.brand; brandFrom = '商品库'; }
+          if (!brand && useCdp) {
+            try {
+              const b = await cdpReadBrandSite(raw);
+              pageTitle = b.title || '';
+              if (b.pageError === 'not-found') {
+                results.push({ url: raw, ok: false, asin: p1.asin, site: siteId, inLibrary: !!prod, error: `打不开: 该 ASIN 在 ${siteId || 'Amazon'} 页面不存在 (Page Not Found) —— 检查链接的站点域名和 ASIN 是否对得上` });
+                continue;
+              }
+              if (b.pageError === 'blocked') {
+                results.push({ url: raw, ok: false, asin: p1.asin, site: siteId, inLibrary: !!prod, error: '被 Amazon 反爬拦了 (验证码页), 稍后重试或换个网络' });
+                continue;
+              }
+              if (b.brand) { brand = b.brand; brandFrom = '详情页(CDP)'; }
+            } catch (e) {
+              results.push({ url: raw, ok: false, asin: p1.asin, site: siteId, inLibrary: !!prod, error: '详情页读取失败: ' + ((e && e.message) || e) });
+              continue;
+            }
+          }
+          if (!brand) {
+            results.push({
+              url: raw, ok: false, asin: p1.asin, site: siteId, inLibrary: !!prod, pageTitle,
+              error: useCdp ? '详情页没解析出品牌名 (可能被反爬拦了, 重试或改用已在商品库的链接)' : '商品库里没有这个 ASIN, 且已关闭浏览器读取',
+            });
+            continue;
+          }
+          let r;
+          try {
+            r = await ipCheck.search(brand, { sites: siteId ? [siteId] : [], sources, limit });
+          } catch (e) {
+            results.push({ url: raw, ok: false, asin: p1.asin, site: siteId, brand, brandFrom, error: '查商标失败: ' + ((e && e.message) || e) });
+            continue;
+          }
+          if (r.error) { results.push({ url: raw, ok: false, asin: p1.asin, site: siteId, brand, brandFrom, error: r.error }); continue; }
+
+          const v = ipCheck.brandVerdict(r.risk);
+          const hits = (r.items || []).filter((h) => h.inMarket && h.statusGroup !== 'dead').slice(0, 8);
+          if (apply && prod) {
+            prod.ipCheck = {
+              at: now(), term: brand, level: r.risk.level, score: r.risk.score,
+              market: r.market ? r.market.name : null, advice: r.risk.advice, text: v.text,
+              tmAlive: r.risk.trademark.alive, tmExactAlive: r.risk.trademark.exactAlive,
+            };
+            prod.brandStatus = v.brandStatus;
+            prod.trademarkCount = v.trademarkCount;
+            prod.tmText = v.text;
+            prod.tmCountries = [...new Set(hits.filter((h) => h.statusGroup === 'alive').map((h) => h.office).filter(Boolean))];
+          }
+          results.push({
+            url: raw, ok: true, asin: p1.asin, site: siteId,
+            siteName: r.market ? r.market.name : '', brand, brandFrom, inLibrary: !!prod, pageTitle,
+            level: r.risk.level, score: r.risk.score, advice: r.risk.advice, reasons: r.risk.reasons,
+            brandStatus: v.brandStatus, trademarkCount: v.trademarkCount,
+            total: r.total, sources: r.sources, skipped: r.skipped, items: hits,
+          });
+        }
+        if (apply) save('products.json', products, true);
+
+        const summary = { links: list.length, ok: 0, high: 0, medium: 0, low: 0, none: 0, unknown: 0, failed: 0 };
+        results.forEach((x) => {
+          if (!x.ok) { summary.failed++; return; }
+          summary.ok++;
+          summary[x.level] = (summary[x.level] || 0) + 1;
+        });
+        return send(200, { ok: true, total: results.length, summary, results });
+      }
+
+      /* ══ ★ 2026-10-24 跨店重复上架拦截 (PRD-v0.1) ══════════════════════════
+       * 路径说明: /api/claims 这条路径早被「草稿箱」占用(GET 返回草稿列表),
+       *   所以 PRD §9 里的 GET /api/claims(台账查询) 落地为 GET /api/claims/ledger, 其余路径一致。
+       */
+      /* ══ ★ 2026-10-24 ifast 店铺商品同步 ══════════════════════════════════════
+       * 用户要求: 「上架器插件加一个同步按钮, 登录完 ifast 后通过 api 接口同步店铺内的所有商品数据」。
+       * 数据源(采集浏览器里 ifast 已登录时): 
+       *   GET /amazon/selling//user/selling.json   → 跟卖组(=店铺)
+       *   GET /amazon/site/enable                  → 站点(含 sellerId)
+       *   GET /amazon/selling/item/item_list.json?page=N&limit=100 → 商品, 实测 count=2218, limit 100 可用
+       * 落库: ifast-items.json(明细) + ifast-sync.json(概要), 同时写进跨店台账(claims) —— 
+       *   这样「这个 ASIN 在哪些店铺上过」不再只靠我们自己记的 214 条, 而是 ifast 的真实在架清单。
+       */
+      if (p === '/api/ifast/sync' && req.method === 'POST') {
+        try {
+          const rows = Array.isArray(j.rows) ? j.rows : [];
+          if (j.groups) {
+            ifastGroups = (j.groups || []).map((g) => ({ id: String(g.id == null ? '' : g.id), name: g.name || null, onSale: g.onSaleDesc || null, offSale: g.offSaleDesc || null, status: (g.status == null ? null : g.status) }));
+          }
+          if (j.sites) {
+            ifastSites = (j.sites || []).map((s) => ({ id: String(s.id == null ? '' : s.id), country: String(s.country || '').toUpperCase(), name: s.name || null, sellerId: s.sellerId || null }));
+          }
+          const r = ifastItemsSync(rows);
+          let claimsWrote = 0;
+          if (rows.length) claimsWrote = claimsFromIfastRows(r.normalized, j.source || 'ifast-sync');
+          const out = {
+            ok: true, chunk: j.chunk == null ? null : j.chunk, pages: j.pages == null ? null : j.pages,
+            added: r.added, updated: r.updated, total: ifastItems.length, claimsWrote: claimsWrote,
+          };
+          if (j.final) {
+            const byStore = {}, bySite = {};
+            const gName = new Map(ifastGroups.map((g) => [g.id, g.name]));
+            for (const it of ifastItems) {
+              const sk = it.storeId || '(空)';
+              if (!byStore[sk]) byStore[sk] = { storeId: sk, storeName: gName.get(sk) || it.storeName || null, count: 0, listed: 0 };
+              byStore[sk].count++;
+              if (it.status === 'listed') byStore[sk].listed++;
+              const si = it.site || '(空)';
+              bySite[si] = (bySite[si] || 0) + 1;
+            }
+            ifastSyncMeta = {
+              at: now(), total: ifastItems.length, countReported: j.count == null ? null : j.count,
+              byStore: Object.keys(byStore).map((k) => byStore[k]).sort((a, b) => b.count - a.count),
+              bySite: bySite, groups: ifastGroups, sites: ifastSites, machine: machineInfo,
+            };
+            try { save('ifast-sync.json', ifastSyncMeta, true); } catch (e) { }
+            out.summary = ifastSyncMeta;
+            console.log('[ifast-sync] 完成: ' + ifastItems.length + ' 条, 店铺 ' + ifastGroups.length + ' 个, 站点 ' + Object.keys(bySite).length + ' 个');
+          }
+          try { save('ifast-items.json', ifastItems, true); } catch (e) { console.error('[ifast-sync] 落盘失败: ' + ((e && e.message) || e)); }
+          return send(200, out);
+        } catch (e) { return send(500, { error: String((e && e.message) || e) }); }
+      }
+
+      if (p === '/api/ifast/items' && req.method === 'GET') {
+        const q = String(url.searchParams.get('q') || '').trim().toUpperCase();
+        const storeF = String(url.searchParams.get('storeId') || '').trim();
+        const siteF = String(url.searchParams.get('site') || '').toLowerCase().trim();
+        const limit = Math.min(5000, Math.max(1, Number(url.searchParams.get('limit') || 500) || 500));
+        /* ★ 2026-10-24: 店铺商品也合并本地 + 各 peer(带 src) */
+        const __allItems = allItemsWithSrc();
+        let list = __allItems.filter((it) => {
+          if (storeF && String(it.storeId || '') !== storeF) return false;
+          if (siteF && String(it.site || '') !== siteF) return false;
+          if (q && !(String(it.asin || '').includes(q) || String(it.title || '').toUpperCase().includes(q) || String(it.sku || '').toUpperCase().includes(q))) return false;
+          return true;
+        });
+        const total = list.length;
+        return send(200, {
+          ok: true, total: total, shown: Math.min(limit, total), items: list.slice(0, limit),
+          sync: ifastSyncMeta, groups: ifastGroups, sites: ifastSites,
+        });
+      }
+
+      if (p === '/api/machine' && req.method === 'GET') return send(200, Object.assign({ ok: true }, machineInfo));
+
+      if (p === '/api/claims/check' && req.method === 'POST') {
+        try {
+          return send(200, claimCheck({
+            asins: j.asins, asin: j.asin, site: j.site, storeId: j.storeId,
+            scope: j.scope, parentAsin: j.parentAsin,
+          }));
+        } catch (e) { return send(500, { error: String((e && e.message) || e) }); }
+      }
+
+      if (p === '/api/claims/commit' && req.method === 'POST') {
+        const list = Array.isArray(j.items) ? j.items : [j];
+        let n = 0;
+        for (const it of list) {
+          if (!it || !it.asin || !it.site) continue;
+          claimUpsert({
+            asin: it.asin, site: it.site, siteId: it.siteId || null,
+            storeId: it.storeId || null, storeName: it.storeName || null,
+            shop: it.shop || currentShopName() || null,
+            parentAsin: it.parentAsin || null,
+            status: it.status || 'listed',
+            source: it.source || 'ext',
+            at: it.at || now(),
+            machineId: machineInfo.id, machineName: machineInfo.name,
+            title: it.title || null, brand: it.brand || null, image: it.image || null,
+          });
+          n++;
+        }
+        claimSave();
+        return send(200, { ok: true, committed: n, total: listingClaims.length });
+      }
+
+      if (p === '/api/claims/override' && req.method === 'POST') {
+        const A = String(j.asin || '').toUpperCase().trim();
+        const S = String(j.site || '').toLowerCase().trim();
+        if (!A || !S) return send(400, { error: '需要 asin 与 site' });
+        const rec = { at: now(), machineId: machineInfo.id, machineName: machineInfo.name, operator: j.operator || currentShopName() || null, reason: j.reason || null, storeId: j.storeId || null };
+        const hit = listingClaims.find((c) => c && c.asin === A && String(c.site || '') === S
+          && (!j.storeId || String(c.storeId || '') === String(j.storeId)));
+        if (hit) {
+          if (!Array.isArray(hit.overrides)) hit.overrides = [];
+          hit.overrides.push(rec);
+          claimSave();
+          return send(200, { ok: true, recorded: 1, key: hit.key, overrides: hit.overrides.length });
+        }
+        /* 台账里还没有这条(比如第一次就在本店上) → 建一条 pending 再把 override 挂上 */
+        const made = claimUpsert({
+          asin: A, site: S, storeId: j.storeId || null, storeName: j.storeName || null,
+          shop: currentShopName() || null, parentAsin: j.parentAsin || null,
+          status: 'pending', source: 'ext', at: now(),
+          machineId: machineInfo.id, machineName: machineInfo.name,
+          title: j.title || null, overrides: [rec],
+        });
+        claimSave();
+        return send(200, { ok: true, recorded: 1, key: made && made.key, overrides: 1, created: true });
+      }
+
+      if (p === '/api/claims/rebuild' && req.method === 'POST') {
+        try { return send(200, claimsRebuild({ keepManual: j.keepManual !== false })); }
+        catch (e) { return send(500, { error: String((e && e.message) || e) }); }
+      }
+
+      if (p === '/api/claims/settings') {
+        if (req.method === 'GET') return send(200, Object.assign({ ok: true }, claimSettings, { machine: machineInfo }));
+        if (req.method === 'POST') {
+          if (j.retainDays != null) { const n = Number(j.retainDays); if (!isNaN(n) && n > 0) claimSettings.retainDays = n; }
+          if (j.blockSameStore != null) claimSettings.blockSameStore = !!j.blockSameStore;
+          if (j.enabled != null) claimSettings.enabled = !!j.enabled;
+          if (Array.isArray(j.whitelistPairs)) claimSettings.whitelistPairs = j.whitelistPairs.slice(0, 100);
+          claimSaveSettings();
+          return send(200, Object.assign({ ok: true }, claimSettings));
+        }
+      }
+
+      if (p === '/api/claims/ledger' && req.method === 'GET') {
+        const q = String(url.searchParams.get('q') || '').trim().toUpperCase();
+        const siteF = String(url.searchParams.get('site') || '').toLowerCase().trim();
+        const storeF = String(url.searchParams.get('storeId') || '').trim();
+        const levelF = String(url.searchParams.get('level') || '').toLowerCase().trim();   // block | warn | override | listed
+        const limit = Math.min(2000, Math.max(1, Number(url.searchParams.get('limit') || 300) || 300));
+        /* ★ 2026-10-24: 台账列表合并本地 + 各 peer(每条带 src/srcName), 断开 peer 就看不到了 */
+        const __allClaims = allClaimsWithSrc();
+        let rows = __allClaims.filter((c) => {
+          if (!c) return false;
+          if (siteF && String(c.site || '') !== siteF) return false;
+          if (storeF && String(c.storeId || '') !== storeF) return false;
+          if (q && !(String(c.asin || '').includes(q) || String(c.title || '').toUpperCase().includes(q)
+            || String(c.brand || '').toUpperCase().includes(q) || String(c.storeName || '').toUpperCase().includes(q))) return false;
+          if (levelF === 'override' && !((c.overrides || []).length)) return false;
+          if (levelF === 'listed' && String(c.status || '') !== 'listed') return false;
+          if (levelF === 'block' && String(c.status || '') === 'listed') return false;
+          return true;
+        });
+        const byStore = {};
+        for (const c of __allClaims) { const k = String(c.storeId || '(未记录)'); byStore[k] = (byStore[k] || 0) + 1; }
+        rows = rows.slice(0, limit);
+        const __srcs = {};
+        for (const c of __allClaims) { const k = String(c.src || 'local'); __srcs[k] = (__srcs[k] || 0) + 1 }
+        return send(200, {
+          ok: true, total: __allClaims.length, shown: rows.length, items: rows,
+          sources: Object.keys(__srcs).map((k) => ({ id: k, name: k === 'local' ? (machineInfo.name || '本机') : ((__allClaims.find((c) => c.src === k) || {}).srcName || k), count: __srcs[k] })),
+          stores: Object.keys(byStore).map((k) => ({
+            storeId: k, storeName: (listingClaims.find((c) => String(c.storeId || '(未记录)') === k) || {}).storeName || null,
+            count: byStore[k],
+          })).sort((a, b) => b.count - a.count),
+          sites: Array.from(new Set(listingClaims.map((c) => String(c.site || '')))).filter(Boolean).sort(),
+          settings: claimSettings, machine: machineInfo,
+        });
+      }
+
+      /* 平台真数据: 某 ASIN 在各店铺/各站点的在架情况 (数据源 = ifast item_list.json) */
+      /* ══ ★ 2026-10-24 商品管理「已上架」标记 ═══════════════════════════════
+       * 用途: 商品库里一条商品可能"已经在店铺A(或别的设备)上架过" —— 商品管理列表要能打标签。
+       * 数据源 = allClaimsWithSrc(): 本地台账 + 各已连接设备同步来的台账(带 src/srcName)。
+       * 断开设备后 mark 自然消失(和"其他店铺数据只有连端口才可见"一致)。
+       */
+      if (p === '/api/claims/mark-batch' && req.method === 'POST') {
+        const asins = (Array.isArray(j.asins) ? j.asins : [])
+          .map((x) => String(x == null ? '' : x).toUpperCase().trim())
+          .filter(Boolean).slice(0, 800);
+        const marks = {};
+        if (asins.length) {
+          const want = new Set(asins);
+          let all = [];
+          try { all = allClaimsWithSrc() } catch (e) { all = listingClaims }
+          for (const c of all) {
+            const A = String(c.asin || '').toUpperCase();
+            if (!want.has(A)) continue;
+            const m = marks[A] || (marks[A] = { asin: A, n: 0, sites: [], stores: [], srcs: [], items: [] });
+            m.n++;
+            if (c.site && m.sites.indexOf(c.site) < 0) m.sites.push(c.site);
+            const sn = c.storeName || c.storeId || '(未知店)';
+            if (m.stores.indexOf(sn) < 0) m.stores.push(sn);
+            const src = c.src || 'local';
+            if (m.srcs.indexOf(src) < 0) m.srcs.push(src);
+            if (m.items.length < 8) {
+              m.items.push({
+                storeName: sn, site: c.site || null, at: c.at || null,
+                src: src, srcName: c.srcName || null, status: c.status || null,
+              });
+            }
+          }
+        }
+        return send(200, { ok: true, asked: asins.length, hit: Object.keys(marks).length, marks: marks, peers: (typeof peers !== 'undefined' ? peers.length : 0) });
+      }
+
+      if (p === '/api/claims/platform' && req.method === 'POST') {
+        try {
+          if (String(j.action || 'rows') === 'groups') {
+            const g = await ifastSellingGroups();
+            return send(200, Object.assign({ ok: true, action: 'groups' }, g));
+          }
+          const asin = String(j.asin || '').toUpperCase().trim();
+          if (!asin) return send(400, { error: '需要 asin' });
+          const r = await ifastListingRows(asin, j.siteId || null);
+          const mine = new Map();
+          for (const c of listingClaims) { if (c && c.storeId) mine.set(String(c.storeId), c.storeName || null); }
+          r.rows = (r.rows || []).map((x) => Object.assign({}, x, {
+            inLedger: !!(x.sellingId && mine.has(String(x.sellingId))),
+            ledgerStoreName: (x.sellingId && mine.get(String(x.sellingId))) || null,
+          }));
+          r.sites = Array.from(new Set(r.rows.map((x) => String(x.country || '')))).filter(Boolean);
+          r.storeCount = new Set(r.rows.map((x) => String(x.sellingId || ''))).size;
+          return send(200, Object.assign({ ok: true, action: 'rows' }, r));
+        } catch (e) { return send(503, { error: String((e && e.message) || e), ifast: true }); }
+      }
+
       if (p === '/api/claims' && req.method === 'GET') return send(200, { total: claims.length, items: claims });
       if (p === '/api/claims' && req.method === 'POST') {
         const r = claim(j.asin, j.opts || {});
@@ -13668,13 +16666,306 @@ const server = http.createServer((req, res) => {
         return send(200, { ok: true });
       }
 
+      /* ══ ★ 2026-10-24 局域网共享端口 ══════════════════════════════════ */
+      if (p === '/api/ports' && req.method === 'GET') {
+        return send(200, {
+          ok: true, max: EXTRA_PORT_MAX, min: EXTRA_PORT_MIN, base: extraBasePort(), ips: extraLanIps(),
+          ports: extraPorts.map(extraPortView).sort((a, b) => a.port - b.port),
+        });
+      }
+      if (p === '/api/ports' && req.method === 'POST') {
+        /* ★ 2026-10-24 用户要求: 「点击创建端口可以自动创建一个新端口」——
+         *   不传 port 就自动挑一个空闲端口; 传了就用传的。
+         *   并且默认「建新的就把老的关掉」, 防止端口越积越多导致堵塞(可传 keepOld:true 保留)。 */
+        let port = Number(j.port);
+        const autoChosen = !Number.isInteger(port) || port <= 0;
+        if (autoChosen) {
+          const fp = await extraPickFreePort();
+          if (!fp) return send(500, { error: '没有空闲端口可用了(3090~3199 全被占) —— 先删掉不用的端口' });
+          port = fp;
+        }
+        if (!Number.isInteger(port) || port < EXTRA_PORT_MIN || port > 65535) return send(400, { error: '端口必须是 ' + EXTRA_PORT_MIN + '~65535 的整数' });
+        if (port === extraBasePort()) return send(400, { error: '端口 ' + port + ' 是 ERP 主端口, 不用再建' });
+        if (extraPorts.length >= EXTRA_PORT_MAX) return send(400, { error: '最多 ' + EXTRA_PORT_MAX + ' 个共享端口 —— 先删掉不用的, 免得端口太多拥堵' });
+        let closedOld = [];
+        if (j.keepOld !== true) { try { closedOld = await extraCloseOthers(port) } catch (e) {} }
+        const exist = extraPortRecord(port);
+        if (exist) exist.enabled = true;
+        else extraPorts.push({ port: port, enabled: true, at: now(), token: extraPortToken(), note: (j.note ? String(j.note).slice(0, 60) : null) });
+        { const rr0 = extraPortRecord(port); if (rr0 && !rr0.token) rr0.token = extraPortToken(); }   // 老记录补口令
+        extraPortSave();
+        const r = await extraPortStart(port);
+        if (!r.ok) { const rec = extraPortRecord(port); if (rec) rec.enabled = false; extraPortSave(); return send(500, { error: r.error }) }
+        try { pushActivity('ports', '已开启共享端口 ' + port + (autoChosen ? '(自动)' : '') + (closedOld.length ? (' · 已关闭旧端口 ' + closedOld.join(',')) : '')); } catch (e) {}
+        const recV = extraPortRecord(port) || {};
+        return send(200, {
+          ok: true, port: port, autoChosen: autoChosen, closedOld: closedOld,
+          url: (extraPortView(recV) || {}).url || null, token: recV.token || null,
+          ips: extraLanIps(), ports: extraPorts.map(extraPortView),
+        });
+      }
+      if ((p === '/api/ports/stop' || p === '/api/ports/start' || p === '/api/ports/delete') && req.method === 'POST') {
+        const port = Number(j.port);
+        const rec = extraPortRecord(port);
+        if (!rec) return send(404, { error: '没有端口 ' + port });
+        if (p === '/api/ports/stop') {
+          await extraPortStopServer(port);
+          rec.enabled = false; extraPortSave();
+          try { pushActivity('ports', '已停止共享端口 ' + port); } catch (e) {}
+          return send(200, { ok: true, port: port, running: false, ports: extraPorts.map(extraPortView) });
+        }
+        if (p === '/api/ports/start') {
+          rec.enabled = true;
+          const r = await extraPortStart(port);
+          if (!r.ok) { rec.enabled = false; extraPortSave(); return send(500, { error: r.error }) }
+          extraPortSave();
+          return send(200, { ok: true, port: port, running: true, ports: extraPorts.map(extraPortView) });
+        }
+        /* delete: 彻底关闭 + 删掉记录(端口释放, 不会再被恢复) */
+        await extraPortStopServer(port);
+        extraPorts = extraPorts.filter((x) => Number(x.port) !== port);
+        extraPortSave();
+        try { pushActivity('ports', '已删除共享端口 ' + port + ' (彻底关闭)'); } catch (e) {}
+        return send(200, { ok: true, port: port, deleted: true, ports: extraPorts.map(extraPortView) });
+      }
+
+      /* ══ ★ 2026-10-24 设备间双向同步 (peers) ══════════════════════════════
+       * 本机 ↔ 另一台设备: 连上对方的共享端口后, 双向交换 跨店台账(claims) + 店铺商品(items)。
+       * "所有数据都在设备本地": 对方的数据只缓存在 peer-data.json[peerId], 断开即清空。
+       */
+      if (p === '/api/peers' && req.method === 'GET') {
+        const list = await peerStatusList();
+        return send(200, {
+          ok: true, machine: machineInfo, total: list.length,
+          claimsLocal: listingClaims.length, itemsLocal: ifastItems.length,
+          claimsMerged: allClaimsWithSrc().length, itemsMerged: allItemsWithSrc().length,
+          peers: list,
+        });
+      }
+
+      if (p === '/api/peers' && req.method === 'POST') {
+        const url = peerNormUrl(j.url);
+        if (!url) return send(400, { error: '需要 url, 例如 http://192.168.86.13:3099/zy/口令' });
+        const probe = await peerHttp(url + '/api/machine', 'GET', null, 6000);
+        if (!probe.ok || !probe.json || !probe.json.id) {
+          return send(400, {
+            error: '连不上对方: ' + ((probe && (probe.error || (probe.json && probe.json.error))) || ('HTTP ' + (probe && probe.status)))
+              + ' —— 地址要带共享口令(形如 http://IP:端口/zy/口令), 并确认对方防火墙放行',
+          });
+        }
+        /* ★ 2026-10-24: 别连自己 —— 本机端口的数据本来就在本地, 连自己只会多一条无意义的记录 */
+        if (String(probe.json.id) === String(machineInfo.id)) {
+          return send(400, {
+            error: '这是【本机】的端口(或本机内网 IP) —— 数据本来就在这台机器上, 不用连接自己。'
+              + '把地址发给其他设备, 让它们来连; 你要同步别人的数据, 就填对方的 IP:端口 / 完整地址。',
+            self: true,
+          });
+        }
+        const pid = String(probe.json.id);
+        const pname = String(j.name || probe.json.name || pid).slice(0, 40);
+        let rec = peers.find((x) => x && String(x.id) === pid);
+        if (rec) { rec.url = url; rec.name = pname; rec.at = now() }
+        else { rec = { id: pid, name: pname, url: url, at: now(), lastSyncAt: null }; peers.push(rec) }
+        peerSave();
+        /* ★ 2026-10-24 用户要求: 每次连接都自动同步【所有已连接设备】(不只刚连的这台) */
+        const synced = [];
+        try { synced.push(Object.assign({ id: rec.id, name: rec.name }, await peerSyncOne(rec))) }
+        catch (e) { synced.push({ id: rec.id, name: rec.name, ok: false, error: String((e && e.message) || e) }) }
+        for (const other of peers) {
+          if (!other || String(other.id) === String(rec.id)) continue;
+          try { synced.push(Object.assign({ id: other.id, name: other.name }, await peerSyncOne(other))) }
+          catch (e) { synced.push({ id: other.id, name: other.name, ok: false, error: String((e && e.message) || e) }) }
+        }
+        const sync = synced.find((x) => String(x.id) === String(rec.id)) || synced[0] || null;
+        return send(200, { ok: true, peer: { id: rec.id, name: rec.name, url: rec.url }, sync: sync, synced: synced });
+      }
+
+      if (p === '/api/peers/sync' && req.method === 'POST') {
+        const id = String(j.id || '');
+        const rec = peers.find((x) => x && String(x.id) === id);
+        if (!rec) return send(404, { error: '没有这个设备: ' + id });
+        const r = await peerSyncOne(rec);
+        return send(r.ok ? 200 : 502, r);
+      }
+
+      if (p === '/api/peers/sync-all' && req.method === 'POST') {
+        const out = [];
+        for (const rec of peers) {
+          if (!rec || !rec.url) continue;
+          try { out.push(Object.assign({ id: rec.id, name: rec.name }, await peerSyncOne(rec))) }
+          catch (e) { out.push({ id: rec.id, name: rec.name, ok: false, error: String((e && e.message) || e) }) }
+        }
+        const okN = out.filter((x) => x.ok).length;
+        return send(200, { ok: true, total: out.length, okCount: okN, results: out, claims: allClaimsWithSrc().length, items: allItemsWithSrc().length });
+      }
+
+      if (p === '/api/peers/delete' && req.method === 'POST') {
+        const id = String(j.id || j.peerId || '');
+        const before = peers.length;
+        peers = peers.filter((x) => !x || String(x.id) !== id);
+        if (id && peerData[id]) { delete peerData[id]; peerDataSave() }
+        try { claimIdxRebuild() } catch (e) {}   // ★ 断开后必须重建索引, 否则判决索引里还留着对方的数据
+        peerSave();
+        return send(200, { ok: true, removed: before - peers.length, purged: !!id, total: peers.length });
+      }
+
+      /* 给 peer 拉取用: 只导出本机数据 */
+      if (p === '/api/sync/export' && req.method === 'GET') {
+        return send(200, peerExportPayload());
+      }
+
+      /* 接收 peer 推来的数据 */
+      if (p === '/api/sync/import' && req.method === 'POST') {
+        try { return send(200, peerImportPayload(j)) }
+        catch (e) { return send(500, { error: String((e && e.message) || e) }) }
+      }
+
       return send(404, { error: '未知接口: ' + p });
     } catch (e) {
       console.error('[API ERROR]', p, e.stack);
       return send(500, { error: e.message });
     }
   });
-});
+};
+/* ★ 2026-10-24: 主服务与「共享端口」共用同一个请求处理器 —— 所以额外端口上所有接口都可用 */
+const server = http.createServer(opHandler);
+
+/* ══════════ ★ 2026-10-24 局域网共享端口 (PRD F7 多机共享) ══════════
+ * 用户要求: 「上架器加端口创建按钮和端口填空框 —— 创建后其他内网设备通过该端口实现数据传输;
+ *   每个端口可以停止使用; 删除端口后端口彻底关闭, 防止端口进程过多导致拥堵。」
+ * 做法: 额外端口复用同一个 opHandler, 监听 0.0.0.0(局域网可达); 清单落盘 ports.json, 重启自动恢复。
+ * 安全: 本机才允许的危险接口(/api/listing/upload 等)仍按客户端 IP 校验, 不会因为开了端口就放开。
+ * 上限: 最多 EXTRA_PORT_MAX 个 —— 用户明确要求防"端口进程过多导致拥堵"。
+ */
+const PORTS_FILE = 'ports.json';
+const EXTRA_PORT_MAX = 8;
+const EXTRA_PORT_MIN = 1024;
+let extraPorts = load(PORTS_FILE, []);
+if (!Array.isArray(extraPorts)) extraPorts = [];
+const extraServers = new Map();
+function extraBasePort() { try { const a = server.address(); return (a && a.port) || PORT } catch (e) { return PORT } }
+function extraLanIps() {
+  const out = [];
+  try {
+    const os = require('os');
+    const nic = os.networkInterfaces() || {};
+    for (const k of Object.keys(nic)) {
+      for (const a of (nic[k] || [])) { if (a && a.family === 'IPv4' && !a.internal) out.push(a.address) }
+    }
+  } catch (e) {}
+  return Array.from(new Set(out));
+}
+function extraPortSave() { try { save(PORTS_FILE, extraPorts, true) } catch (e) { console.error('[ports] 落盘失败: ' + ((e && e.message) || e)) } }
+function extraPortRecord(port) { return extraPorts.find((x) => x && Number(x.port) === Number(port)) || null }
+function extraPortToken() { try { return require('crypto').randomBytes(4).toString('hex') } catch (e) { return String(Date.now()).slice(-8) } }
+const isLocalAddr = (req) => /^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1|::ffff:0:1)$/.test(String((req.socket && req.socket.remoteAddress) || ''));
+function extraPortView(p) {
+  const t = p.token || '';
+  const ip = (extraLanIps()[0] || '127.0.0.1');
+  return {
+    port: Number(p.port), running: extraServers.has(Number(p.port)), enabled: p.enabled !== false,
+    at: p.at || null, note: p.note || null, token: t || null,
+    url: t ? ('http://' + ip + ':' + Number(p.port) + '/zy/' + t) : ('http://' + ip + ':' + Number(p.port)),
+  };
+}
+/* ★ 2026-10-24 安全(PRD §11): 局域网访问共享端口必须带口令。
+ *   两种带法: ① 路径前缀 /zy/<口令>/api/xxx (另一台电脑直接把整串填进「ERP 地址」)
+ *             ② 请求头 X-ZY-Token
+ *   本机(127.0.0.1)一律免口令 —— 本机 GUI/工具/我自己的脚本都不受影响。 */
+function extraPortGuard(port, token) {
+  return (req, res) => {
+    try {
+      /* ★ 2026-10-24: 先把 /zy/<口令> 前缀剥掉(本机访问也剥) —— 否则本机带前缀请求会 404 */
+      const u0 = String(req.url || '');
+      const mm0 = /^\/zy\/([a-f0-9A-Za-z]+)(\/.*)?$/.exec(u0);
+      if (mm0 && token && mm0[1] === token) { req.url = mm0[2] || '/'; return opHandler(req, res) }
+      if (!token || isLocalAddr(req)) return opHandler(req, res);
+      const u = String(req.url || '');
+      const mm = /^\/zy\/([a-f0-9A-Za-z]+)(\/.*)?$/.exec(u);
+      if (mm && mm[1] === token) { req.url = mm[2] || '/'; return opHandler(req, res) }
+      const hdr = String((req.headers && req.headers['x-zy-token']) || '');
+      if (hdr && hdr === token) return opHandler(req, res);
+      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+      return res.end(JSON.stringify({ ok: false, error: '缺少共享口令 —— 请用弹窗里给出的完整地址(形如 http://IP:端口/zy/口令)', port: port }));
+    } catch (e) { try { res.writeHead(500); res.end('{"ok":false}') } catch (e2) {} }
+  };
+}
+function extraPortStart(port) {
+  port = Number(port);
+  if (extraServers.has(port)) return Promise.resolve({ ok: true, already: true });
+  return new Promise((resolve) => {
+    const rec0 = extraPortRecord(port) || {};
+    const srv = http.createServer(extraPortGuard(port, rec0.token || ''));
+    let settled = false;
+    const fail = (e) => {
+      if (settled) return; settled = true;
+      resolve({ ok: false, error: '端口 ' + port + ' 起不来: ' + ((e && e.code === 'EADDRINUSE') ? '已被其他程序占用' : ((e && e.message) || e)) });
+    };
+    srv.once('error', fail);
+    srv.listen(port, '0.0.0.0', () => {
+      if (settled) return; settled = true;
+      srv.removeListener('error', fail);
+      srv.on('error', (e) => { if (!__isBenign(e)) console.error('[ports] ' + port + ': ' + ((e && e.message) || e)) });
+      srv.on('connection', (sock) => { try { sock.on('error', () => {}) } catch (e) {} });
+      extraServers.set(port, srv);
+      console.log('[ports] 共享端口 ' + port + ' 已开启 (监听 0.0.0.0, 局域网可访问)');
+      resolve({ ok: true });
+    });
+  });
+}
+function extraPortStopServer(port) {
+  port = Number(port);
+  const srv = extraServers.get(port);
+  if (!srv) return Promise.resolve({ ok: true, already: true });
+  return new Promise((resolve) => {
+    const done = () => { if (extraServers.has(port)) extraServers.delete(port); resolve({ ok: true }) };
+    try {
+      srv.close(done);
+      if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections();
+    } catch (e) { done() }
+    setTimeout(() => { if (extraServers.has(port)) { try { srv.close() } catch (e) {} done() } }, 1500);
+  });
+}
+/** 自动挑一个空闲端口(在 3090~3199 里找一个能 bind 的; 已被本机共享端口占用的跳过) */
+function extraPickFreePort(from, to) {
+  const lo = from || 3090, hi = to || 3199;
+  const used = new Set(extraPorts.map((x) => Number(x.port)));
+  return new Promise((resolve) => {
+    const net = require('net');
+    const tryOne = (p) => {
+      if (p > hi) return resolve(null);
+      if (used.has(p) || p === extraBasePort()) return tryOne(p + 1);
+      const t = net.createServer();
+      t.once('error', () => { try { t.close() } catch (e) {} tryOne(p + 1) });
+      t.listen(p, '0.0.0.0', () => { t.close(() => resolve(p)) });
+    };
+    tryOne(lo);
+  });
+}
+/** 关掉并删除除 keepPort 以外的所有共享端口(用户要求: 建新端口时杀掉老的, 防端口堵塞) */
+async function extraCloseOthers(keepPort) {
+  const closed = [];
+  for (const p of extraPorts.slice()) {
+    if (Number(p.port) === Number(keepPort)) continue;
+    await extraPortStopServer(p.port);
+    closed.push(Number(p.port));
+  }
+  if (closed.length) {
+    extraPorts = extraPorts.filter((x) => Number(x.port) === Number(keepPort));
+    extraPortSave();
+    console.log('[ports] 已关闭旧端口: ' + closed.join(',') + '（只保留 ' + keepPort + '）');
+  }
+  return closed;
+}
+
+async function extraPortRestore() {
+  const on = extraPorts.filter((x) => x && x.enabled !== false);
+  for (const x of on) {
+    const r = await extraPortStart(x.port);
+    if (!r.ok) console.error('[ports] 恢复端口 ' + x.port + ' 失败: ' + r.error);
+  }
+  if (on.length) console.log('[ports] 已恢复 ' + on.length + ' 个共享端口');
+}
 
 /* ★ 2026-09-26 崩溃兜底(重要):
  * 症状: 一关「服务器」页 / 刷新页面 / 网络抖动, 整个 ERP 后端直接死掉, 前端全部接口 502/ECONNREFUSED。
@@ -13732,6 +17023,8 @@ if (require.main === module) {
   server.listen(PORT, () => {
     console.log(`✔ 亚马逊跟卖ERP Demo 已启动`);
     console.log(`  浏览器访问: http://127.0.0.1:${PORT}`);
+    /* ★ 2026-10-24: 恢复上次开启的共享端口(标记为 enabled 的) */
+    try { extraPortRestore(); } catch (e) { console.error('[ports] 恢复失败: ' + ((e && e.message) || e)) }
     console.log(`  商品: ${products.length} | 品牌: ${branddb.length} | 规则: ${rules.length}`);
     // 授权状态开机必打: 让"到底有没有受保护"一眼可见 (开发模式会明确警告)
     try {

@@ -1,4 +1,4 @@
-/* ===== 亚马逊跟卖ERP Demo — 纯黑/纯白双主题样式 ===== */
+﻿/* ===== 亚马逊跟卖ERP Demo — 纯黑/纯白双主题样式 ===== */
 :root {
   --bg: #000000;
   --fg: #ffffff;
@@ -523,3 +523,10 @@ pre.dump { white-space: pre-wrap; font-family: "Cascadia Code", Consolas, monosp
 .model-list-item button { border:none; background:none; color:var(--muted); cursor:pointer; font-size:12px; padding:2px 6px; }
 .model-list-item button:hover { color:var(--red); }
 
+
+/* ===== 知产查重页面 ===== */
+.badge.unknown { background: #8a6d3b; color: #fff; }        /* 无法判定 - 棕(数据源全失败) */
+.ip-srcs { display: inline-flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.ip-src { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); cursor: pointer; white-space: nowrap; }
+.ip-src.off { opacity: .45; cursor: not-allowed; }
+.ip-src input { margin: 0; }

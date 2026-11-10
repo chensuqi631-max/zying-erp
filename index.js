@@ -4,16 +4,23 @@
 import { ensureErp, isUp, license } from './lib/erp-launcher.js';
 
 const API = 'http://127.0.0.1:3088';
-/** 调 3088 系统接口 (GET/POST JSON) */
-async function sys(path, body) {
-  const r = await fetch(API + path, {
-    method: body ? 'POST' : 'GET',
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error((j && j.error) || ('系统请求失败 (HTTP ' + r.status + ')'));
-  return j;
+/** 调 3088 系统接口 (GET/POST JSON), 带超时 —— 采集类长请求可以传更长 timeoutMs */
+async function sys(path, body, timeoutMs = 30000) {
+  const ctl = timeoutMs > 0 ? new AbortController() : null;
+  const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : null;
+  try {
+    const r = await fetch(API + path, {
+      method: body ? 'POST' : 'GET',
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: ctl ? ctl.signal : undefined,
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((j && j.error) || ('系统请求失败 (HTTP ' + r.status + ')'));
+    return j;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** 构建工具对象 (等效 defineTool 返回结构: name/description/parameters(output schema)/output/render/execute) */
@@ -127,6 +134,42 @@ export function apply(ctx) {
       return { shopOk: r.shopOk, shopFail: r.shopFail, productCount: r.productCount, added: r.added, stopped: r.stopped || false };
     })),
     'zying follow-shop');
+
+  ctx.effect(() => ctx.tools.register(tool('zying_collect_status',
+    '查看采集进度与现场: 后端采集开关状态、商品库总量、最近 5 分钟新增数量与站点货币构成、最新 5 条入库记录。长耗时采集(跟卖并行)期间用它确认后台是否仍在继续, 避免把 HTTP 超时误当成"没采到"。',
+    {},
+    async () => {
+      const st = await sys('/api/collect/status', undefined, 8000);
+      const h = await sys('/api/health', undefined, 8000);
+      const p = await sys('/api/products?limit=500', undefined, 20000);
+      const items = p.items || [];
+      // 后端时间是 'YYYY-MM-DD HH:MM:SS' 本地时钟, 直接用字符串比较算 5 分钟窗口, 避开时区换算
+      const pad = (n) => String(n).padStart(2, '0');
+      const since = (() => {
+        const m = /(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(String((h && h.time) || ''));
+        if (!m) return null;
+        const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) - 5 * 60 * 1000);
+        return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()) +
+          ' ' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds());
+      })();
+      const recent = since ? items.filter((it) => it.collectedAt && String(it.collectedAt) >= since) : [];
+      const mix = {};
+      recent.forEach((it) => { const k = String(it.site) + '/' + String(it.currency); mix[k] = (mix[k] || 0) + 1; });
+      const latest = items.slice()
+        .sort((a, b) => String(b.collectedAt).localeCompare(String(a.collectedAt)))
+        .slice(0, 5)
+        .map((it) => ({ asin: it.asin, site: it.site, currency: it.currency, collectedAt: it.collectedAt, source: it.source }));
+      return {
+        stopRequested: !!(st && st.stopRequested),
+        total: p.total,
+        backendTime: (h && h.time) || null,
+        recentSince: since,
+        recent5min: recent.length,
+        recentSiteMix: mix,
+        latest,
+      };
+    })),
+    'zying collect-status');
 
   ctx.effect(() => ctx.tools.register(tool('zying_stop',
     '停止当前采集: 系统采集循环在当前步骤完成后提前退出, 已采数据保留入库。',

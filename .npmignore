@@ -1,0 +1,17 @@
+# 打包排除 —— 只发程序, 不发开发机的数据和文档
+# 注意: erp/tools/license-pub.pem 是授权校验用的公钥, 必须保留, 不要在这里排除
+
+# 开发机运行时数据 (machine.json 含设备指纹/机器注册表, 绝不能发给客户)
+erp/data/
+erp/*.log
+
+# 开发过程中的说明文档
+erp/*.md
+*.md.bak
+
+# 备份与临时产物
+erp/_backup*/
+_backup*/
+*.tgz
+*.bak
+.tmp*

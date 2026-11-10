@@ -82,6 +82,36 @@ function argsFor(opts) {
   return a;
 }
 
+/* ══════════ ★ 2026-10-20 身份校验(修"误杀采集浏览器") ══════════
+ * 背景: 本服务靠【端口上的 PID】认领浏览器(recoverState)。Windows 会复用 PID,
+ *   而原来的安全闸只校验"进程名是不是浏览器" —— 复用到【用户自己的采集浏览器(msedge, 9222)】
+ *   时这道闸是放行的, 于是一次 stop() 就会把用户的采集浏览器 taskkill /T /F 掉:
+ *   浏览器整个消失 → 采集看门狗立刻又拉起一个 → 用户看到"浏览器莫名其妙自己打开"。
+ * 现在: 认领和停止都必须【命令行里带着本服务的 profile 或端口】才算自己的, 否则拒绝并记账。 */
+function cmdlineOf(pid) {
+  return new Promise((resolve) => {
+    const ps = '(Get-CimInstance Win32_Process -Filter "ProcessId=' + Number(pid) + '" -ErrorAction SilentlyContinue).CommandLine';
+    execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 9000 }, (e, out) => {
+      resolve(e ? '' : String(out || '').trim());
+    });
+  });
+}
+/** 这个 PID 是不是【本服务】的浏览器: 命令行必须带我们的 user-data-dir 或调试端口 */
+async function isOurBrowser(pid, opts) {
+  if (!pid) return false;
+  const line = await cmdlineOf(pid);
+  if (!line) return false;                       // 读不到命令行 → 一律当"不是我们的"
+  const low = line.toLowerCase();
+  const prof = String((opts && opts.profile) || DEFAULT_PROFILE).toLowerCase();
+  const port = String((opts && opts.port) || DEFAULT_PORT);
+  const hitProfile = prof && low.indexOf(prof) >= 0;
+  const hitPort = low.indexOf('remote-debugging-port=' + port) >= 0;
+  return !!(hitProfile || hitPort);
+}
+function logRefuse(msg) {
+  try { fs.appendFileSync(path.join(DATA_DIR, 'crash.log'), '[' + new Date().toISOString() + '] ' + msg + '\n') } catch (e) {}
+}
+
 /** 从「谁在监听 port」反查 PID —— 状态文件丢了也能把浏览器找回来 */
 function pidOnPort(port) {
   return new Promise((resolve) => {
@@ -103,6 +133,14 @@ async function recoverState(port, modeHint) {
   if (cur && cur.pid) return cur;
   const pid = await pidOnPort(port);
   if (!pid) return cur || null;
+  /* ★ 2026-10-20: 端口上那个浏览器必须真是我们的(命令行带本服务 profile/端口)才认领。
+   *   否则别人(用户手动开的调试浏览器/别的程序)占着这个端口时, 我们会把它当成自己的浏览器,
+   *   后面一次 stop() 就把它杀掉。 */
+  const mine = await isOurBrowser(pid, { port: port, profile: (cur && cur.profile) || DEFAULT_PROFILE });
+  if (!mine) {
+    logRefuse('拒绝认领: 端口 ' + port + ' 上的 PID ' + pid + ' 命令行不含本服务 profile/端口(不是我们的浏览器)');
+    return cur || null;
+  }
   const st = {
     pid: pid, port: Number(port),
     mode: (cur && cur.mode) || modeHint || 'headless',
@@ -159,7 +197,7 @@ async function start(opts) {
   return { ok: false, error: '浏览器起来了但 CDP 端口没响应(可能被安全策略拦了)', pid: pid, port: port, args: args };
 }
 
-function killPid(pid) {
+function killPid(pid, expect) {
   return new Promise((resolve) => {
     if (!pid) return resolve(false);
     // ★ 2026-09-26 安全闸: 这个 pid 是从磁盘上的 browser-service.json 读回来的, 可能是【过期 PID】。
@@ -177,7 +215,15 @@ function killPid(pid) {
         try { fs.appendFileSync(path.join(DATA_DIR, 'crash.log'), '[' + new Date().toISOString() + '] 拒绝 kill: PID ' + pid + ' 现在是 ' + name + ' (不是浏览器, 疑似过期 PID 被回收)\n') } catch (e2) {}
         return resolve(false);
       }
-      execFile('taskkill', ['/PID', String(pid), '/T', '/F'], (e2) => resolve(!e2));
+      /* ★ 2026-10-20: 名字是 msedge 还远远不够 —— 必须是【本服务】的浏览器才允许杀。
+       *   否则 PID 被回收给用户的采集浏览器(同是 msedge)时会把它连带子树杀掉。 */
+      isOurBrowser(pid, expect).then((mine) => {
+        if (!mine) {
+          logRefuse('拒绝 kill: PID ' + pid + ' 命令行不含本服务 profile/端口(疑似 PID 被回收给了别的浏览器), 已跳过');
+          return resolve(false);
+        }
+        execFile('taskkill', ['/PID', String(pid), '/T', '/F'], (e2) => resolve(!e2));
+      }).catch(() => resolve(false));
     });
   });
 }
@@ -185,7 +231,7 @@ function killPid(pid) {
 async function stop() {
   const st = readState();
   const port = (st && st.port) || DEFAULT_PORT;
-  if (st && st.pid) await killPid(st.pid);
+  if (st && st.pid) await killPid(st.pid, { port: port, profile: (st && st.profile) || DEFAULT_PROFILE });
   // 兜底: 有些子进程不是我们直接拉起的, 按 profile 再扫一遍
   await new Promise((resolve) => {
     execFile('wmic', ['process', 'where', "name='msedge.exe'", 'get', 'ProcessId,CommandLine'], () => resolve());

@@ -470,6 +470,27 @@ const EXPR_READ_SHOP = `(() => {
   const body = document.body ? document.body.textContent : '';
   out.total = (body.match(/of\\s+(?:over\\s+)?([\\d,]+)\\s+results/i) || [])[1] || null;
   out.range = (body.match(/([\\d,]+\\s*-\\s*[\\d,]+\\s+(?:of|over)[^\\n]{0,14}?[\\d,]+)/i) || [])[0] || null;
+  /* ★ 2026-10-26 末页的【真实信号】—— 分页控件, 取代"本页卡片<10 就认定最后一页"的猜测。
+   *   为什么要换: 审计实测 525 页里 33 页读到 0 卡, 其中 9 次直接成了该店铺的终止页(后续页整片丢失);
+   *   而"懒加载只渲染 8~9 张"也会被旧规则当成末页。分页控件是亚马逊自己的权威信号。
+   *   hasNext: true=确还有下一页 / false=确认没有下一页 / null=没找到分页控件(未知, 退回二次确认) */
+  (function () {
+    const nx = document.querySelector('a.s-pagination-next, li.a-last a, a[aria-label="Next page"], a[aria-label*="下一页"]');
+    let dis = true;
+    if (nx) {
+      const cn = String(nx.className || '') + ' ' + String((nx.parentElement && nx.parentElement.className) || '');
+      dis = /s-pagination-disabled/.test(cn) || nx.getAttribute('aria-disabled') === 'true';
+    }
+    out.hasNext = nx ? !dis : null;
+    const sel = document.querySelector('.s-pagination-item.s-pagination-selected, li.s-pagination-selected');
+    out.pageNo = sel ? (parseInt(String(sel.textContent || '').replace(/[^\\d]/g, ''), 10) || null) : null;
+    const nums = [];
+    document.querySelectorAll('.s-pagination-item').forEach(function (n) {
+      const v = parseInt(String(n.textContent || '').replace(/[^\\d]/g, ''), 10);
+      if (v > 0) nums.push(v);
+    });
+    out.pageMax = nums.length ? Math.max.apply(null, nums) : null;
+  })();
   const kw = (location.href.match(/[?&]k=([^&]+)/) || [])[1];
   out.brandFilter = kw ? decodeURIComponent(kw.replace(/\\+/g, ' ')) : null;
 
@@ -521,7 +542,23 @@ const EXPR_READ_SHOP = `(() => {
     const flagInfo = panelMismatch ? null : (readSellerFlag(el) || (panelRoot ? readSellerFlag(panelRoot) : null));
 
     const titleEl = el.querySelector('h2 span, h2');
-    const priceEl = el.querySelector('.a-price .a-offscreen, .a-price-whole');
+    /* ★★ 2026-10-29 修【价格少小数点 → 34.99 被存成 3499】
+     *   实测(amazon.com.au): .a-price .a-offscreen 的文本是 "$3499" —— 没有小数点!
+     *   而 .a-price-whole="34" / .a-price-fraction="99" 才是完整信息。
+     *   旧写法直接读 offscreen 文本 → parseMoneyText("3499") → 3499(把分当成了元, 价格虚高 100 倍)。
+     *   现在: 优先用 whole + fraction 拼成 "34.99"(纯数字, 无分隔符歧义);
+     *         whole 缺失时才退回 offscreen 文本。 */
+    const priceTxt = (function () {
+      const wholeEl = el.querySelector('.a-price-whole');
+      const fracEl = el.querySelector('.a-price-fraction');
+      if (wholeEl) {
+        const w = String(wholeEl.textContent || '').replace(/[^0-9]/g, '');
+        const f = fracEl ? String(fracEl.textContent || '').replace(/[^0-9]/g, '') : '';
+        if (w) return f ? (w + '.' + f) : w;
+      }
+      const off = el.querySelector('.a-price .a-offscreen');
+      return off ? String(off.textContent || '').trim() : null;
+    })();
     const ratingEl = el.querySelector('.a-icon-alt, [aria-label*="out of 5"]');
     const reviewEl = el.querySelector('a[aria-label*="ratings"], .a-size-base.s-underline-text');
     const imgEl = el.querySelector('img.s-image');
@@ -529,7 +566,7 @@ const EXPR_READ_SHOP = `(() => {
     const rec = {
       asin,
       title: titleEl ? titleEl.textContent.trim().slice(0, 90) : null,
-      price: priceEl ? priceEl.textContent.trim() : null,
+      price: priceTxt,
       rating: ratingEl ? (ratingEl.getAttribute('aria-label') || ratingEl.textContent || '').trim().slice(0, 30) : null,
       reviews: reviewEl ? reviewEl.textContent.trim().slice(0, 20) : null,
       image: imgEl ? imgEl.getAttribute('src') : null,
@@ -889,6 +926,13 @@ async function waitCardsReady(sess, opts) {
       opts.log && opts.log('[多链接采集]     ⚠ 插件面板显示「登录」: ' + s.notLogged + '/' + s.cards
         + ' 张卡只有登录壳(品牌/排名 也缺) —— 请到采集浏览器里登录「智赢」插件; 采集继续, 不中断');
     }
+    /* ★ 2026-10-26 把"这页是怎么放行的"一并返回, 让调用方能区分
+     *   「真放行」和「等不到数据、超时硬放行」—— 后者该重导航而不是拿空字段继续跑。 */
+    if (s) {
+      s.blankRounds = blankStreak;
+      s.waitedMs = Date.now() - t0;
+      s.timeout = !(s.full >= need(s.cards)) && !(s.cards === 0);
+    }
     return s;
   };
   // ★ 修复 (2026-09): 原实现有两个致命缺陷, 导致批量采到的商品大面积没有排名 ——
@@ -1028,18 +1072,79 @@ async function readDetailRank(sess, asin, site, opts) {
  * opts.rankGate=false 关闭; opts.rankGateLimit=0 表示不限(每个缺排名的商品都去补, 每个约 12~15 秒)。
  * 只补排名字段 —— 品牌名不覆盖列表页从品牌链接取到的干净值(坑 33)。
  */
+/* ══════════════════════════════════════════════════════════════════════════
+ * ★ 2026-10-26 排名闸门熔断（新增 + 修正）
+ *
+ * 为什么要有熔断: 审计实测 candidates 4519 → tried 4519 → got 48（1.1%），
+ *   17 家店因此跑了 29,944s ≈ 8.3 小时；很多页 withShopRank=0 仍把每个商品挨个拉详情页，全白跑。
+ *
+ * ★ 为什么不能直接用「补到率 < 5%」熔断（本次修正的关键）:
+ *   详情页返回「明确没有根类目排名行」= not_listed，这是【有效答案】(这个品确实没进榜)，
+ *   不是失败。若一个类目的品本来就大多没进榜，got/tried 会天然接近 0 →
+ *   旧判据会把"详情页工作完全正常"误判成"详情页没用"，导致整站点永久放弃补排名。
+ *   所以这里拆成三种结果:
+ *     got       补到了排名
+ *     notListed 详情页明确告诉我们"未上榜"（有效响应）
+ *     failed    既没排名也没有 not_listed 结论（真失败: 导航失败/未登录/被拦/超时）
+ *
+ * 熔断条件（满足任一）:
+ *   ① failed / tried ≥ 0.9 且 tried ≥ 15   → 详情页根本读不到，继续跑纯浪费时间
+ *   ② 该站点累计进详情页耗时 ≥ rankGateBudgetMs（默认 6 分钟）→ 防单店拖到 25 分钟
+ *
+ * 状态放【模块级】: 编排层给各阶段传的是 opts 的副本，挂在 opts 上的状态每阶段都会被重置
+ *   （实测: 同一任务里"熔断"被反复触发又反复解除 → 等于没熔断）。换 taskId 或 2 小时无活动才重置。
+ * ══════════════════════════════════════════════════════════════════════════ */
+const RANK_GATE_STATE = { task: null, at: 0, bySite: {} };
+const RANK_GATE_TTL_MS = 2 * 3600 * 1000;      // 2 小时没活动就重置(没有 taskId 的采集模式不会永久记忆)
+const RANK_GATE_BUDGET_MS = 6 * 60 * 1000;     // 单站点进详情页的总时间预算
+
+function rankGateState(opts) {
+  const t = String((opts && (opts.taskId || opts.jobId || opts.runId)) || 'default');
+  const nowMs = Date.now();
+  if (RANK_GATE_STATE.task !== t || (nowMs - (RANK_GATE_STATE.at || 0)) > RANK_GATE_TTL_MS) {
+    RANK_GATE_STATE.task = t;
+    RANK_GATE_STATE.bySite = {};
+  }
+  RANK_GATE_STATE.at = nowMs;
+  return RANK_GATE_STATE;
+}
+
 async function gateRanksByDetail(sess, cards, site, opts) {
-  const stat = { candidates: 0, tried: 0, got: 0, still: 0 };
+  const stat = { candidates: 0, tried: 0, got: 0, notListed: 0, failed: 0, still: 0, skipped: 0, ms: 0 };
   if (!opts.rankGate) return stat;
   const missing = (cards || []).filter((c) => c && c.asin && !c.bsrShop && !c.bsrCat && !(Array.isArray(c.bsr) && c.bsr.length));
   stat.candidates = missing.length;
   if (!missing.length) return stat;
+
+  const gs = rankGateState(opts);
+  const siteSt = gs.bySite[site] || (gs.bySite[site] = { tried: 0, got: 0, notListed: 0, failed: 0, ms: 0, disabled: false, reason: null });
+
+  /* ① 已熔断: 直接记 skipped, 不再浪费 12~15 秒/个 */
+  if (siteSt.disabled) {
+    stat.skipped = missing.length;
+    opts.log && opts.log('[多链接采集]     ⏭ 排名闸门已熔断(' + site + '/' + siteSt.reason + '): 本页 ' + missing.length
+      + ' 个缺排名不再进详情页 (累计试 ' + siteSt.tried + ' · 补到 ' + siteSt.got + ' · 确认未上榜 ' + siteSt.notListed
+      + ' · 真失败 ' + siteSt.failed + ' · 耗时 ' + Math.round(siteSt.ms / 1000) + 's)');
+    return stat;
+  }
+
   const limit = Math.max(0, Number(opts.rankGateLimit) || 0) || missing.length;
+  const budget = Math.max(0, Number(opts.rankGateBudgetMs) || RANK_GATE_BUDGET_MS);
   for (const c of missing.slice(0, limit)) {
     if (stopWanted(opts)) break;
+    /* ② 时间预算: 该站点累计进详情页已超预算 → 本页剩下的不再试 */
+    if (budget > 0 && siteSt.ms >= budget) {
+      stat.skipped += (missing.slice(0, limit).length - stat.tried);
+      opts.log && opts.log('[多链接采集]     ⏳ 排名闸门时间预算用尽(' + site + '): 已 ' + Math.round(siteSt.ms / 1000)
+        + 's ≥ ' + Math.round(budget / 1000) + 's, 本页剩余 ' + (missing.slice(0, limit).length - stat.tried) + ' 个不再进详情页');
+      break;
+    }
     stat.tried++;
+    const t0 = Date.now();
     opts.bumpCollectProgress && opts.bumpCollectProgress({ step: '进详情页补排名 ' + c.asin + ' (' + stat.tried + '/' + Math.min(limit, missing.length) + ')' });
     const r = await readDetailRank(sess, c.asin, site, opts);
+    const cost = Date.now() - t0;
+    stat.ms += cost; siteSt.ms += cost;
     // ★ 三态一起带回来: 详情页面板"明确没有大排名"→ 标未上榜(不是没采到)
     if (r && r.rankParentState) {
       c.rankParentState = r.rankParentState;
@@ -1057,15 +1162,38 @@ async function gateRanksByDetail(sess, cards, site, opts) {
       stat.got++;
       opts.log && opts.log('[多链接采集]     ⤵ 详情页补到排名 ' + c.asin + ': 大(根类目)=' + (r.bsrShop || '-') + ' 小(子类目)=' + (r.bsrCat || '-'));
     } else if (r && r.rankParentState === 'not_listed') {
-      stat.still++;
+      /* ★ 有效答案: 面板已分析完、确实没有根类目排名行 —— 不算失败, 不计入熔断 */
+      stat.notListed++;
       opts.log && opts.log('[多链接采集]     ⤵ 详情页确认【未上榜】' + c.asin + ' (面板已分析完, 没有根类目排名行)' + (r.bsrCat ? ', 小排名=' + r.bsrCat : ''));
     } else {
-      stat.still++;
-      opts.log && opts.log('[多链接采集]     ⤵ 详情页也没读到排名(未采集到, 不等同未上榜) ' + c.asin);
+      stat.failed++;
+      opts.log && opts.log('[多链接采集]     ⤵ 详情页也没读到排名(未采集到, 不等同未上榜) ' + c.asin + ' · 耗时 ' + cost + 'ms');
+    }
+  }
+  stat.still = stat.notListed + stat.failed;      // 向后兼容: 调用方/report 仍看 still
+
+  siteSt.tried += stat.tried;
+  siteSt.got += stat.got;
+  siteSt.notListed += stat.notListed;
+  siteSt.failed += stat.failed;
+
+  /* ③ 判定是否熔断（只在"刚熔断"时打一条日志, 之后走上面的"已熔断"分支, 避免刷屏） */
+  if (!siteSt.disabled) {
+    if (siteSt.tried >= 15 && siteSt.failed / siteSt.tried >= 0.9) {
+      siteSt.disabled = true;
+      siteSt.reason = '详情页读不到';
+      opts.log && opts.log('[多链接采集]     ⛔ 排名闸门熔断(' + site + '): 累计进详情页 ' + siteSt.tried + ' 次, 真失败 '
+        + siteSt.failed + ' 个(' + Math.round((siteSt.failed * 100) / siteSt.tried)
+        + '%) ≥ 90% → 本次任务该站点不再进详情页(省时间; 未上榜 ' + siteSt.notListed + ' 个属正常, 不计入)');
+    } else if (budget > 0 && siteSt.ms >= budget) {
+      siteSt.disabled = true;
+      siteSt.reason = '超时间预算';
+      opts.log && opts.log('[多链接采集]     ⛔ 排名闸门熔断(' + site + '): 累计进详情页耗时 ' + Math.round(siteSt.ms / 1000)
+        + 's ≥ 预算 ' + Math.round(budget / 1000) + 's → 本次任务该站点不再进详情页');
     }
   }
   // 统计由调用方(编排)汇总到 report.rankGate —— 不能再往 opts 上挂对象:
-  // 编排层给各阶段传的是 opts 的副本, 挂上去的那份报告里看不到(实测 report.rankGate 恒为 0)。
+  //   编排层给各阶段传的是 opts 的副本, 挂上去的那份报告里看不到(实测 report.rankGate 恒为 0)。
   return stat;
 }
 
@@ -1074,25 +1202,59 @@ async function collectShopProducts(sess, sellerId, site, opts) {
   const base = 'https://www.amazon.' + opts.siteToHostSuffix(site) + '/s?ie=UTF8&marketplaceID=' + (mk || '') + '&me=' + sellerId;
   const products = [];
   const seen = new Set();
-  const gateSum = { candidates: 0, tried: 0, got: 0, still: 0 };   // 排名闸门统计(按页累加, 由编排汇总到报告)
+  const gateSum = { candidates: 0, tried: 0, got: 0, notListed: 0, failed: 0, still: 0, skipped: 0, ms: 0 };   // 排名闸门统计(按页累加, 由编排汇总到报告)
   const loginWarn = { cards: 0, notLogged: 0, pages: 0 };          // ★ 插件未登录(面板只有"登录"壳)统计: 只提示, 不停
   let totalText = null, rangeText = null, pagesDone = 0;
 
-  for (let page = 1; page <= opts.shopPages; page++) {
-    if (stopWanted(opts)) break;
-    const url = page === 1 ? base : base + '&page=' + page;
-    await sess.send('Page.navigate', { url });
-    await wait(opts, 12000);
-    // ★ 等插件把这一页的卡片渲染完（否则品牌/转换价读不到）
-    const ready = await waitCardsReady(sess, opts);
-    opts.log && opts.log('[多链接采集]   店铺 ' + sellerId + ' 第 ' + page + ' 页插件就绪: ' + JSON.stringify(ready));
-    // ★ 插件未登录: 只累计 + 记日志(在 waitCardsReady 里已打), 绝不停采集
-    // ★ 只有「一半以上卡片是登录壳」的页才算一次未登录提示(单张卡偶发登录壳不算, 避免误报)
-    if (ready && ready.notLogged >= Math.ceil((ready.cards || 0) / 2)) { loginWarn.cards += ready.cards || 0; loginWarn.notLogged += ready.notLogged; loginWarn.pages++; }
+  /* ★ 2026-10-26 条数闸门状态
+   *   审计证据: 525 条逐页统计里 33 页读到 0 卡, 其中 9 次成了该店铺的终止页
+   *   (如某店第 11 页 ready=null → 0 个 → 直接 break, 第 12 页起全丢)。
+   *   规则: 0 卡/读取失败 → 重新导航重试 ≤3 次; 仍 0 → 记一次 blank 并【继续下一页】;
+   *         只有【连续 2 页】0 卡/失败才判定该店铺结束。 */
+  let blankPages = 0, blankHits = 0, endReason = null, declaredTotal = null;
+  const MAX_TRY = 3;
 
-    const d = await evalExpr(sess, EXPR_READ_SHOP);
-    if (!d || d.err) break;
+  for (let page = 1; page <= opts.shopPages; page++) {
+    if (stopWanted(opts)) { endReason = 'stopped'; break; }
+    const url = page === 1 ? base : base + '&page=' + page;
+
+    /* ── ① 取页: 0 卡 / 读取失败 → 重新导航重试(不再当成"最后一页") ── */
+    let ready = null, d = null;
+    for (let attempt = 1; attempt <= MAX_TRY; attempt++) {
+      await sess.send('Page.navigate', { url });
+      await wait(opts, attempt === 1 ? 12000 : (8000 + attempt * 3000));
+      // ★ 等插件把这一页的卡片渲染完（否则品牌/转换价读不到）
+      ready = await waitCardsReady(sess, opts);
+      opts.log && opts.log('[多链接采集]   店铺 ' + sellerId + ' 第 ' + page + ' 页插件就绪'
+        + (attempt > 1 ? '(重试 ' + attempt + '/' + MAX_TRY + ')' : '') + ': ' + JSON.stringify(ready));
+      // ★ 只有「一半以上卡片是登录壳」的页才算一次未登录提示(单张卡偶发登录壳不算, 避免误报)
+      if (ready && ready.notLogged >= Math.ceil((ready.cards || 0) / 2)) { loginWarn.cards += ready.cards || 0; loginWarn.notLogged += ready.notLogged; loginWarn.pages++; }
+      d = await evalExpr(sess, EXPR_READ_SHOP);
+      if (d && !d.err && (d.cards || []).length > 0) break;
+      if (stopWanted(opts)) break;
+      opts.log && opts.log('[多链接采集]   店铺 ' + sellerId + ' 第 ' + page + ' 页读到 '
+        + ((d && d.cards) || []).length + ' 张卡(测量=' + (ready ? 'ok' : 'null') + '), 重试 ' + attempt + '/' + MAX_TRY);
+    }
+
+    /* ── ② 读失败 / 0 卡: 记 blank, 继续下一页; 连续 2 页才判结束 ── */
+    const gotCards = ((d && d.cards) || []).length;
+    if (!d || d.err) {
+      blankPages++; blankHits++; endReason = 'read-error';
+      opts.log && opts.log('[多链接采集]   ⚠ 店铺 ' + sellerId + ' 第 ' + page + ' 页读取失败(' + (d && d.err) + '), 跳过该页继续');
+      if (blankPages >= 2) { endReason = 'two-blank'; opts.log && opts.log('[多链接采集]   ⚠ 店铺 ' + sellerId + ' 连续 ' + blankPages + ' 页失败/0卡 → 判定结束'); break; }
+      continue;
+    }
+    if (gotCards === 0) {
+      blankPages++; blankHits++;
+      opts.log && opts.log('[多链接采集]   ⚠ 店铺 ' + sellerId + ' 第 ' + page + ' 页重试 ' + MAX_TRY
+        + ' 次仍 0 卡(测量=' + (ready ? 'ok' : 'null') + ') → 跳过该页继续下一页(不再当作最后一页)');
+      if (blankPages >= 2) { endReason = 'two-blank'; opts.log && opts.log('[多链接采集]   ⚠ 店铺 ' + sellerId + ' 连续 ' + blankPages + ' 页 0 卡 → 判定结束'); break; }
+      continue;
+    }
+    blankPages = 0;
+
     if (!totalText) { totalText = d.total; rangeText = d.range; }
+    if (declaredTotal == null) declaredTotal = parseInt(String(d.total || '').replace(/[^\d]/g, ''), 10) || null;
     pagesDone++;
     let n = 0;
     const pageCards = [];
@@ -1119,15 +1281,63 @@ async function collectShopProducts(sess, sellerId, site, opts) {
     }
     // ★ 排名闸门: 这一页里没拿到排名的商品, 逐个进详情页把排名读回来, 然后再继续下一页
     const gs = await gateRanksByDetail(sess, pageCards, site, opts);
-    gateSum.candidates += gs.candidates; gateSum.tried += gs.tried; gateSum.got += gs.got; gateSum.still += gs.still;
-    if (gs.tried) opts.log && opts.log('[多链接采集]   店铺 ' + sellerId + ' 第 ' + page + ' 页排名闸门: 缺 ' + gs.candidates + ' → 进详情页 ' + gs.tried + ' 个, 补到排名 ' + gs.got + ', 仍无排名 ' + gs.still);
+    gateSum.candidates += gs.candidates; gateSum.tried += gs.tried; gateSum.got += gs.got;
+    gateSum.notListed += gs.notListed || 0; gateSum.failed += gs.failed || 0;
+    gateSum.still += gs.still; gateSum.skipped += gs.skipped || 0; gateSum.ms += gs.ms || 0;
+    if (gs.tried) opts.log && opts.log('[多链接采集]   店铺 ' + sellerId + ' 第 ' + page + ' 页排名闸门: 缺 ' + gs.candidates
+      + ' → 进详情页 ' + gs.tried + ' 个, 补到排名 ' + gs.got + ', 确认未上榜 ' + (gs.notListed || 0) + ', 真失败 ' + (gs.failed || 0) + ', 跳过 ' + (gs.skipped || 0));
     opts.log && opts.log('[多链接采集]   店铺 ' + sellerId + ' 第 ' + page + ' 页: ' + d.cards.length + ' 个, 新增 ' + n);
     opts.bumpCollectProgress && opts.bumpCollectProgress({ step: '店铺商品 ' + sellerId, page, pages: opts.shopPages, items: products.length });
-    if (d.cards.length < 10) break;                    // 不足一页 = 最后一页
-    if (opts.maxItems && products.length >= opts.maxItems) break;
+
+    /* ── ③ 末页判定: 优先用分页控件的真实信号, 没有信号才退回二次确认 ── */
+    const hasNext = d.hasNext === true ? true : (d.hasNext === false ? false : null);
+    if (gotCards < 10) {
+      if (hasNext === true) {
+        opts.log && opts.log('[多链接采集]   店铺 ' + sellerId + ' 第 ' + page + ' 页只有 ' + gotCards + ' 张, 但分页显示还有下一页 → 继续(不判末页)');
+      } else if (hasNext === false) {
+        endReason = 'last-page(' + gotCards + ')';
+        opts.log && opts.log('[多链接采集]   店铺 ' + sellerId + ' 第 ' + page + ' 页只有 ' + gotCards + ' 张, 分页显示没有下一页 → 判定最后一页');
+        break;
+      } else {
+        // 没有分页信号(老版式/被插件改过) → 二次确认
+        let confirm = gotCards;
+        for (let k = 0; k < 2; k++) {
+          await wait(opts, 2500);
+          const d2 = await evalExpr(sess, EXPR_READ_SHOP);
+          const n2 = ((d2 && d2.cards) || []).length;
+          if (n2 > confirm) confirm = n2;
+          if (confirm >= 10) break;
+        }
+        if (confirm < 10) {
+          endReason = 'last-page(' + confirm + ')';
+          opts.log && opts.log('[多链接采集]   店铺 ' + sellerId + ' 第 ' + page + ' 页只有 ' + confirm + ' 张(无分页信号, 二次确认) → 判定最后一页');
+          break;
+        }
+        opts.log && opts.log('[多链接采集]   店铺 ' + sellerId + ' 第 ' + page + ' 页二次读补到 ' + confirm + ' 张(原本 ' + gotCards + ')');
+      }
+    } else if (hasNext === false) {
+      endReason = 'no-next';
+      opts.log && opts.log('[多链接采集]   店铺 ' + sellerId + ' 第 ' + page + ' 页分页显示没有下一页 → 结束(本页 ' + gotCards + ' 张)');
+      break;
+    }
+
+    if (opts.maxItems && products.length >= opts.maxItems) { endReason = 'max-items'; break; }
   }
   if (opts.maxItems) products.splice(opts.maxItems);
-  return { ok: products.length > 0, products, pages: pagesDone, total: totalText, range: rangeText, rankGate: gateSum, loginWarn: loginWarn };
+
+  /* ── ④ 结束原因 + 声明总数交叉校验(把"漏采"显性化, 而不是让人猜) ── */
+  const reasonFinal = endReason || (pagesDone >= opts.shopPages ? 'page-cap' : 'unknown');
+  const capped = pagesDone >= opts.shopPages;
+  const suspectTruncated = !capped && reasonFinal !== 'stopped' && reasonFinal !== 'max-items'
+    && !!declaredTotal && products.length < Math.floor(declaredTotal * 0.9);
+  opts.log && opts.log('[多链接采集]   店铺 ' + sellerId + ' 结束: ' + pagesDone + ' 页 / ' + products.length
+    + ' 个 · 结束原因=' + reasonFinal + (totalText ? (' · 页面声明=' + totalText + ' ' + (rangeText || '')) : '')
+    + (suspectTruncated ? ' · ⚠ suspect-truncated(声明 ' + declaredTotal + ' 实采 ' + products.length + ')' : ''));
+  return {
+    ok: products.length > 0, products, pages: pagesDone, total: totalText, range: rangeText,
+    rankGate: gateSum, loginWarn: loginWarn,
+    endReason: reasonFinal, declaredTotal: declaredTotal, suspectTruncated: suspectTruncated, blankPages: blankHits,
+  };
 }
 
 /**
@@ -1149,23 +1359,45 @@ async function collectBrandProducts(sess, brand, brandLink, site, opts) {
   const host = 'https://www.amazon.' + opts.siteToHostSuffix(site);
   const products = [];
   const seen = new Set();
-  const gateSum = { candidates: 0, tried: 0, got: 0, still: 0 };   // 排名闸门统计(按页累加)
+  const gateSum = { candidates: 0, tried: 0, got: 0, notListed: 0, failed: 0, still: 0, skipped: 0, ms: 0 };   // 排名闸门统计(按页累加)
   const mixedItems = [];                                          // ★ 剔除他牌明细(带直达链接)
   const loginWarn = { cards: 0, notLogged: 0, pages: 0 };          // ★ 插件未登录统计: 只提示, 不停
   let mixed = 0, pagesDone = 0;
+  /* ★ 2026-10-26 条数闸门(与店铺页同口径): 0 卡/读失败重试后再跳过, 末页优先看分页信号 */
+  let blankPages = 0, blankHits = 0, endReason = null, declaredTotal = null;
+  const MAX_TRY = 3;
 
   for (let page = 1; page <= opts.brandPages; page++) {
-    if (stopWanted(opts)) break;
-    await sess.send('Page.navigate', { url: page === 1 ? base : base + '&page=' + page });
-    await wait(opts, 13000);
-    // 品牌页同样要等插件渲染（品牌页的插件数据也在卡片里）
-    const ready = await waitCardsReady(sess, opts);
-    opts.log && opts.log('[多链接采集]   品牌 ' + brand + ' 第 ' + page + ' 页插件就绪: ' + JSON.stringify(ready));
-    // ★ 只有「一半以上卡片是登录壳」的页才算一次未登录提示(单张卡偶发登录壳不算, 避免误报)
-    if (ready && ready.notLogged >= Math.ceil((ready.cards || 0) / 2)) { loginWarn.cards += ready.cards || 0; loginWarn.notLogged += ready.notLogged; loginWarn.pages++; }
-
-    const d = await evalExpr(sess, EXPR_READ_SHOP);
-    if (!d || d.err) break;
+    if (stopWanted(opts)) { endReason = 'stopped'; break; }
+    const url = page === 1 ? base : base + '&page=' + page;
+    /* ── ① 取页: 0 卡 / 读失败 → 重导航重试(与店铺页同口径) ── */
+    let ready = null, d = null;
+    for (let attempt = 1; attempt <= MAX_TRY; attempt++) {
+      await sess.send('Page.navigate', { url });
+      await wait(opts, attempt === 1 ? 13000 : (8000 + attempt * 3000));
+      // 品牌页同样要等插件渲染（品牌页的插件数据也在卡片里）
+      ready = await waitCardsReady(sess, opts);
+      opts.log && opts.log('[多链接采集]   品牌 ' + brand + ' 第 ' + page + ' 页插件就绪'
+        + (attempt > 1 ? '(重试 ' + attempt + '/' + MAX_TRY + ')' : '') + ': ' + JSON.stringify(ready));
+      // ★ 只有「一半以上卡片是登录壳」的页才算一次未登录提示(单张卡偶发登录壳不算, 避免误报)
+      if (ready && ready.notLogged >= Math.ceil((ready.cards || 0) / 2)) { loginWarn.cards += ready.cards || 0; loginWarn.notLogged += ready.notLogged; loginWarn.pages++; }
+      d = await evalExpr(sess, EXPR_READ_SHOP);
+      if (d && !d.err && (d.cards || []).length > 0) break;
+      if (stopWanted(opts)) break;
+      opts.log && opts.log('[多链接采集]   品牌 ' + brand + ' 第 ' + page + ' 页读到 '
+        + ((d && d.cards) || []).length + ' 张卡, 重试 ' + attempt + '/' + MAX_TRY);
+    }
+    /* ── ② 读失败 / 0 卡: 记 blank 继续下一页, 连续 2 页才结束 ── */
+    const gotCards = ((d && d.cards) || []).length;
+    if (!d || d.err || gotCards === 0) {
+      blankPages++; blankHits++; endReason = (!d || d.err) ? 'read-error' : 'blank';
+      opts.log && opts.log('[多链接采集]   ⚠ 品牌 ' + brand + ' 第 ' + page + ' 页重试 ' + MAX_TRY
+        + ' 次仍 ' + (d && !d.err ? '0 卡' : ('读取失败(' + (d && d.err) + ')')) + ' → 跳过该页继续');
+      if (blankPages >= 2) { endReason = 'two-blank'; opts.log && opts.log('[多链接采集]   ⚠ 品牌 ' + brand + ' 连续 ' + blankPages + ' 页 0 卡/失败 → 判定结束'); break; }
+      continue;
+    }
+    blankPages = 0;
+    if (declaredTotal == null) declaredTotal = parseInt(String(d.total || '').replace(/[^\d]/g, ''), 10) || null;
     pagesDone++;
     // ★ 2026-09 「剔除他牌」改为采集过滤开关: 默认剔除(原行为); filter.dropOtherBrand==='0' 时把他牌也收下
     const keepOther = !!(opts.filter && (opts.filter.dropOtherBrand === '0' || opts.filter.dropOtherBrand === 0 || opts.filter.dropOtherBrand === false));
@@ -1210,15 +1442,61 @@ async function collectBrandProducts(sess, brand, brandLink, site, opts) {
     }
     // ★ 排名闸门: 品牌页缺排名的商品同样进详情页补到排名再继续(品牌页插件给排名的比例比店铺页还低)
     const gs = await gateRanksByDetail(sess, pageCards, site, opts);
-    gateSum.candidates += gs.candidates; gateSum.tried += gs.tried; gateSum.got += gs.got; gateSum.still += gs.still;
-    if (gs.tried) opts.log && opts.log('[多链接采集]   品牌 ' + brand + ' 第 ' + page + ' 页排名闸门: 缺 ' + gs.candidates + ' → 进详情页 ' + gs.tried + ' 个, 补到排名 ' + gs.got + ', 仍无排名 ' + gs.still);
+    gateSum.candidates += gs.candidates; gateSum.tried += gs.tried; gateSum.got += gs.got;
+    gateSum.notListed += gs.notListed || 0; gateSum.failed += gs.failed || 0;
+    gateSum.still += gs.still; gateSum.skipped += gs.skipped || 0; gateSum.ms += gs.ms || 0;
+    if (gs.tried) opts.log && opts.log('[多链接采集]   品牌 ' + brand + ' 第 ' + page + ' 页排名闸门: 缺 ' + gs.candidates
+      + ' → 进详情页 ' + gs.tried + ' 个, 补到排名 ' + gs.got + ', 确认未上榜 ' + (gs.notListed || 0) + ', 真失败 ' + (gs.failed || 0) + ', 跳过 ' + (gs.skipped || 0));
     opts.log && opts.log('[多链接采集]   品牌 ' + brand + ' 第 ' + page + ' 页: 真商品 ' + d.cards.length + ', 同品牌 ' + same.length + ', 混入 ' + (d.cards.length - same.length) + ', 新增 ' + n);
     opts.bumpCollectProgress && opts.bumpCollectProgress({ step: '品牌商品 ' + brand, page, pages: opts.brandPages, items: products.length });
-    if (d.cards.length < 10) break;
-    if (opts.maxItems && products.length >= opts.maxItems) break;
+
+    /* ── ③ 末页判定: 分页信号优先, 无信号才二次确认 ── */
+    const hasNext = d.hasNext === true ? true : (d.hasNext === false ? false : null);
+    if (gotCards < 10) {
+      if (hasNext === true) {
+        opts.log && opts.log('[多链接采集]   品牌 ' + brand + ' 第 ' + page + ' 页只有 ' + gotCards + ' 张, 但分页显示还有下一页 → 继续');
+      } else if (hasNext === false) {
+        endReason = 'last-page(' + gotCards + ')';
+        opts.log && opts.log('[多链接采集]   品牌 ' + brand + ' 第 ' + page + ' 页只有 ' + gotCards + ' 张, 分页显示没有下一页 → 判定最后一页');
+        break;
+      } else {
+        let confirm = gotCards;
+        for (let k = 0; k < 2; k++) {
+          await wait(opts, 2500);
+          const d2 = await evalExpr(sess, EXPR_READ_SHOP);
+          const n2 = ((d2 && d2.cards) || []).length;
+          if (n2 > confirm) confirm = n2;
+          if (confirm >= 10) break;
+        }
+        if (confirm < 10) {
+          endReason = 'last-page(' + confirm + ')';
+          opts.log && opts.log('[多链接采集]   品牌 ' + brand + ' 第 ' + page + ' 页只有 ' + confirm + ' 张(无分页信号, 二次确认) → 判定最后一页');
+          break;
+        }
+        opts.log && opts.log('[多链接采集]   品牌 ' + brand + ' 第 ' + page + ' 页二次读补到 ' + confirm + ' 张(原本 ' + gotCards + ')');
+      }
+    } else if (hasNext === false) {
+      endReason = 'no-next';
+      opts.log && opts.log('[多链接采集]   品牌 ' + brand + ' 第 ' + page + ' 页分页显示没有下一页 → 结束(本页 ' + gotCards + ' 张)');
+      break;
+    }
+
+    if (opts.maxItems && products.length >= opts.maxItems) { endReason = 'max-items'; break; }
   }
   if (opts.maxItems) products.splice(opts.maxItems);
-  return { ok: products.length > 0, products, pages: pagesDone, mixed, mixedItems, rankGate: gateSum, loginWarn: loginWarn };
+
+  const reasonFinal = endReason || (pagesDone >= opts.brandPages ? 'page-cap' : 'unknown');
+  const capped = pagesDone >= opts.brandPages;
+  const suspectTruncated = !capped && reasonFinal !== 'stopped' && reasonFinal !== 'max-items'
+    && !!declaredTotal && products.length + mixed < Math.floor(declaredTotal * 0.9);
+  opts.log && opts.log('[多链接采集]   品牌 ' + brand + ' 结束: ' + pagesDone + ' 页 / ' + products.length
+    + ' 个 · 结束原因=' + reasonFinal + (declaredTotal ? (' · 页面声明=' + declaredTotal) : '')
+    + (suspectTruncated ? ' · ⚠ suspect-truncated(声明 ' + declaredTotal + ' 实采 ' + products.length + ')' : ''));
+  return {
+    ok: products.length > 0, products, pages: pagesDone, mixed, mixedItems,
+    rankGate: gateSum, loginWarn: loginWarn,
+    endReason: reasonFinal, declaredTotal: declaredTotal, suspectTruncated: suspectTruncated, blankPages: blankHits,
+  };
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1416,7 +1694,9 @@ async function collectByLinks(urls, opts = {}) {
   const t0 = Date.now();
   const report = {
     // ★ 排名闸门统计: 店铺/品牌阶段各自返回自己的统计, 在这里统一汇总(不能靠改 opts —— 各阶段拿到的是副本)
-    rankGate: { candidates: 0, tried: 0, got: 0, still: 0 },
+    rankGate: { candidates: 0, tried: 0, got: 0, notListed: 0, failed: 0, still: 0, skipped: 0, ms: 0 },
+    // ★ 2026-10-26 条数闸门: 被"提前终止/疑似漏采"的单元清单(声明总数 vs 实采), 供报告与 GUI 标红
+    truncation: { suspect: 0, units: [] },
     // ★ 插件未登录统计(面板只画"登录"壳): 只提示, 绝不停采集
     pluginLogin: { cards: 0, notLogged: 0, pages: 0 },
     jobId: job.id,
@@ -1473,7 +1753,13 @@ async function collectByLinks(urls, opts = {}) {
     }
   } catch (e) {
     P.log && P.log('[多链接采集] ⚠ Edge 调试端口探测失败: ' + ((e && e.message) || e));
-    P.log && P.log('[多链接采集]    排查: ① 先完全退出所有 msedge.exe ② 再运行「启动采集浏览器.bat」 ③ 浏览器打开 http://127.0.0.1:9222/json/version 能返回 JSON 才算就绪');
+    /* ★ 2026-10-10 修正排查提示: 原来第一句是"先完全退出所有 msedge.exe" —— 实测这**不必要且误导**:
+     *   采集浏览器用的是独立的 profile 目录(%LOCALAPPDATA%\Microsoft\Edge\User),
+     *   而用普通入口打开的 Edge 用的是 Edge\User Data, 两者互不冲突, 不用关掉用户的日常 Edge。
+     *   只有"同一个 profile 目录已被普通 Edge 占用"时才必须先全关 —— 加一句点明。 */
+    P.log && P.log('[多链接采集]    排查: ① 运行「启动采集浏览器.bat」(它用独立 profile Edge\\User, 不用关你现在的 Edge)');
+    P.log && P.log('[多链接采集]          ② 浏览器打开 http://127.0.0.1:9222/json/version 能返回 JSON 才算就绪；');
+    P.log && P.log('[多链接采集]          ③ 若仍连不上, 说明 Edge\\User 这个目录已被普通 Edge 占用 → 那时才需要完全退出所有 msedge.exe 再启动');
   }
 
   // ══════════════════════════════════════════════════════════════════
@@ -1728,7 +2014,27 @@ async function collectByLinks(urls, opts = {}) {
   };
 
   /** 排名闸门统计累加(店铺/品牌阶段各自返回, 这里汇总进报告) */
-  const addGateStat = (g) => { if (!g) return; report.rankGate.candidates += g.candidates || 0; report.rankGate.tried += g.tried || 0; report.rankGate.got += g.got || 0; report.rankGate.still += g.still || 0; };
+  const addGateStat = (g) => {
+    if (!g) return;
+    const R = report.rankGate;
+    R.candidates += g.candidates || 0; R.tried += g.tried || 0; R.got += g.got || 0;
+    R.notListed += g.notListed || 0; R.failed += g.failed || 0;
+    R.still += g.still || 0; R.skipped += g.skipped || 0; R.ms += g.ms || 0;
+  };
+  /** ★ 2026-10-26 条数闸门: 记录"疑似漏采"的单元(声明总数 vs 实采), 报告里显性列出 */
+  const addTruncStat = (kind, name, d) => {
+    if (!d || !d.suspectTruncated) return;
+    report.truncation.suspect++;
+    if (report.truncation.units.length < 50) {
+      report.truncation.units.push({
+        kind, name,
+        collected: (d.products || []).length,
+        declared: d.declaredTotal || null,
+        pages: d.pages || 0,
+        endReason: d.endReason || null,
+      });
+    }
+  };
   // ★ 插件未登录: 汇总(店铺/品牌阶段各自统计) → report.pluginLogin → 报告与提示
   const addLoginStat = (w) => {
     if (!w || !w.notLogged) return;
@@ -1760,7 +2066,7 @@ async function collectByLinks(urls, opts = {}) {
         added = Number(r && r.added != null ? r.added : r) || 0;
         addedAsins = (r && Array.isArray(r.addedAsins)) ? r.addedAsins : [];
       }
-      return { ok: true, landingUrl: got.landingUrl, total: d.total, pages: d.pages, collected: d.products.length, kept, skipped: d.products.length - kept.length, added, addedAsins, rankGate: d.rankGate, loginWarn: d.loginWarn };
+      return { ok: true, landingUrl: got.landingUrl, total: d.total, pages: d.pages, collected: d.products.length, kept, skipped: d.products.length - kept.length, added, addedAsins, rankGate: d.rankGate, loginWarn: d.loginWarn, endReason: d.endReason || null, declaredTotal: d.declaredTotal || null, suspectTruncated: !!d.suspectTruncated };
     });
 
     if (out.captcha) { pauseFor('captcha', '店铺 ' + s.sellerId, null); return 'stop'; }
@@ -1773,6 +2079,7 @@ async function collectByLinks(urls, opts = {}) {
       }, out.attempts || 1);
       report.shopProducts.push(...(out.kept || []));
       addGateStat(out.rankGate);                          // ★ 排名闸门: 店铺阶段统计汇总到整轮
+      addTruncStat('shop', (s.name || s.sellerId), { suspectTruncated: out.suspectTruncated, products: out.kept, declaredTotal: out.declaredTotal, pages: out.pages, endReason: out.endReason });   // ★ 条数闸门: 疑似漏采登记
       addLoginStat(out.loginWarn);                        // ★ 插件未登录: 店铺阶段汇总(只提示, 不停采集)
       L.addLog(job, '✔ 店铺 ' + (s.name || s.sellerId) + ': 商品 ' + (out.collected || 0) + ' → 通过 ' + ((out.kept || []).length) + ' → 入库 ' + (out.added || 0)
         + (out.rankGate && out.rankGate.got ? ' (详情页补排名 ' + out.rankGate.got + ')' : ''));
@@ -1809,7 +2116,7 @@ async function collectByLinks(urls, opts = {}) {
         added = Number(r && r.added != null ? r.added : r) || 0;
         addedAsins = (r && Array.isArray(r.addedAsins)) ? r.addedAsins : [];
       }
-      return { ok: true, collected: d.products.length, mixed: d.mixed || 0, mixedItems: d.mixedItems || [], rows, added, addedAsins, rankGate: d.rankGate, loginWarn: d.loginWarn };
+      return { ok: true, collected: d.products.length, mixed: d.mixed || 0, mixedItems: d.mixedItems || [], rows, added, addedAsins, rankGate: d.rankGate, loginWarn: d.loginWarn, endReason: d.endReason || null, declaredTotal: d.declaredTotal || null, suspectTruncated: !!d.suspectTruncated };
     });
 
     if (out.captcha) { pauseFor('captcha', '品牌 ' + b.brand, null); return 'stop'; }
@@ -1828,6 +2135,7 @@ async function collectByLinks(urls, opts = {}) {
         });
       }
       addGateStat(out.rankGate);                          // ★ 排名闸门: 品牌阶段统计汇总
+      addTruncStat('brand', b.brand, { suspectTruncated: out.suspectTruncated, products: new Array(out.collected || 0), declaredTotal: out.declaredTotal, pages: null, endReason: out.endReason });   // ★ 条数闸门: 疑似漏采登记
       addLoginStat(out.loginWarn);                        // ★ 插件未登录: 品牌阶段汇总(只提示, 不停采集)
       L.addLog(job, '✔ 品牌 ' + b.brand + ': 同品牌 ' + (out.collected || 0) + ' 个 (混入他牌 ' + (out.mixed || 0) + ') → 入库 ' + (out.added || 0)
         + (out.rankGate && out.rankGate.got ? ' (详情页补排名 ' + out.rankGate.got + ')' : ''));
@@ -1844,9 +2152,29 @@ async function collectByLinks(urls, opts = {}) {
     // ── 阶段 1: 链接 → 卖家(按批推进; 批内 pool.size 个 worker 并行) ─────────
     const full = L.buildBatches(job);
     const batches = full && full.length ? full : job.batches;
+    /* ★★ 2026-10-10 修【批次状态自检】(用户报障: 43 条链接 → 卖家 0 个, 批次 1/3 显示"成功"):
+     *   实测 job-2026-10-10-22-51-15-f4ck: CDP 连不上 → 批次 1 的 startedAt→finishedAt 只隔 1 毫秒,
+     *   43 条全 pending, 但批次 1 被标成 done → 任务卡显示「批次 1/3 成功」, 而它一条都没跑。
+     *   最危险的后果: 续跑时 `if (batch.status === 'done') continue` 会【整批跳过】→ 那 20 条被静默丢掉。
+     *   这里以【条目状态】为准做一次自检: 标着 done 但里面还有未完成条目的批次, 一律降级为 interrupted
+     *   (续跑就会重跑它, 里面已 done 的条目照样跳过 —— 既不丢数据也不重复导航)。 */
+    for (const b of batches) {
+      if (b.status !== 'done') continue;
+      const sl = job.links.slice(b.from - 1, b.to);
+      const left = sl.filter((l) => l.status !== 'done' && l.status !== 'skipped').length;
+      if (left) {
+        b.status = 'interrupted';
+        b.left = left;
+        b.err = '批次状态自检: 里面还有 ' + left + '/' + sl.length + ' 条没跑完 → 续跑会重跑本批';
+        P.log && P.log('[多链接采集] ⚠ 批次 ' + b.index + ' 标着 done 但还有 ' + left + ' 条未完成 → 已纠正为 interrupted');
+      }
+    }
     for (let bi = 0; bi < batches.length; bi++) {
       const batch = batches[bi];
-      if (pool.abortedNow()) break;
+      /* ★ 2026-10-10 修: 暂停中的任务不要再进批次 —— 原来只判 pool.abortedNow()(=全局熔断/用户点停止),
+       *   而"CDP 连不上 → pauseFor 把 job.status 置成 paused"并不算熔断, 于是循环照进、批次被标 running,
+       *   再被下面【无条件】标成 done。加上 job.status === 'paused' 这一条, 暂停后一个批次都不会再动。 */
+      if (pool.abortedNow() || job.status === 'paused') break;
       if (batch.status === 'done') continue;                 // 续跑: 已完成的批直接跳过
       batch.status = 'running';
       if (!batch.startedAt) batch.startedAt = new Date().toISOString();
@@ -1858,7 +2186,20 @@ async function collectByLinks(urls, opts = {}) {
         P.log && P.log('[多链接采集] 批 ' + batch.index + '/' + batches.length + ': 待跑 ' + todo.length + ' 条链接, 并行 ' + pool.size + ' 个标签页');
         await runUnits('链接', todo, (Lk) => String(Lk.url).slice(0, 60), runOneLink, 0.5);
       }
-      if (batch.status === 'running') { batch.status = 'done'; batch.finishedAt = new Date().toISOString(); }
+      /* ★ 2026-10-10 修: 只有"这批真的没有待办残留"才算 done —— 否则标 interrupted。
+       *   (原来是 `if (batch.status === 'running') batch.status = 'done'` 无条件标 done, 一次 CDP 失败
+       *    就会把整批没跑过的批次记成"成功", 续跑又整批跳过 → 数据静默丢失。) */
+      if (batch.status === 'running') {
+        const left = slice.filter((l) => l.status !== 'done' && l.status !== 'skipped').length;
+        if (left) {
+          batch.status = 'interrupted';
+          batch.left = left;
+          batch.err = '本批 ' + left + '/' + slice.length + ' 条没跑完(' + (job.pauseReason || '任务中断') + ') —— 续跑会重跑本批, 已完成的不重复';
+        } else {
+          batch.status = 'done';
+        }
+        batch.finishedAt = new Date().toISOString();
+      }
       ck('batch');                                           // ★ 每批结束强制落盘 + 刷进度
       if (job.status === 'paused' || pool.abortedNow()) break;
       // ★ 批间隔(要求 6): 跟卖并行族就是"每批跑完留 3s"(见 cdpFollowShopBatchParallel 注释
@@ -1873,7 +2214,8 @@ async function collectByLinks(urls, opts = {}) {
     }
 
     // ── 阶段 2: 店铺(并行; done/skipped 零导航跳过) ──────────────────────
-    if (!pool.abortedNow()) {
+    /* ★ 2026-10-10: 同批次循环 —— 任务已暂停时不要再开新阶段(否则又是一批"看起来跑过"的空阶段) */
+    if (!pool.abortedNow() && job.status !== 'paused') {
       const all = job.sellers;
       const limited = P.maxShops > 0 ? all.slice(0, P.maxShops) : all;
       if (P.maxShops > 0) for (const s of all.slice(P.maxShops)) {
@@ -1894,7 +2236,7 @@ async function collectByLinks(urls, opts = {}) {
     }
 
     // ── 阶段 3: 品牌(并行; 品牌清单在阶段 2 里登记完毕才会开跑) ────────────
-    if (!pool.abortedNow() && P.collectBrands) {
+    if (!pool.abortedNow() && job.status !== 'paused' && P.collectBrands) {
       const todoBrands = job.brands.filter((b) => b.status !== 'done' && b.status !== 'skipped');
       if (todoBrands.length) P.log && P.log('[多链接采集] 阶段 3: 待采品牌 ' + todoBrands.length + ' 个, 并行 ' + pool.size + ' 个标签页');
       await runUnits('品牌', todoBrands, (b) => b.brand, runOneBrand, 1);

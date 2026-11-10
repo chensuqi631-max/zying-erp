@@ -309,6 +309,7 @@ const ICONS = {
   collect: '<path d="M12 3v12"/><path d="m7 8 5-5 5 5"/><path d="M4 13v5a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-5"/>',
   product: '<path d="M21 8.5 12 3 3 8.5v7L12 21l9-5.5z"/><path d="M3 8.5 12 14l9-5.5"/><path d="M12 14v7"/>',
   compliance: '<path d="M12 3 5 6v5c0 4.5 3 8.5 7 10 4-1.5 7-5.5 7-10V6z"/><path d="m9 12 2 2 4-4"/>',
+  ipcheck: '<path d="M12 3 5 6v5c0 4.5 3 8.5 7 10 4-1.5 7-5.5 7-10V6z"/><circle cx="12" cy="10.5" r="2.6"/><path d="m14 12.5 2.2 2.2"/>',
   claims: '<path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/>',
   reprice: '<path d="M12 2v20"/><path d="M5 6h10a3 3 0 0 1 0 6H9a3 3 0 0 0 0 6h10"/>',
   flywheel: '<path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/>',
@@ -339,6 +340,7 @@ const PAGES = {
   collect: { title: '商品采集', desc: '6 种采集方式小模块 + 采集过滤(与自定义筛选同条件, 可保存规则), 全程CDP', icon: 'collect' },
   product: { title: '商品管理', desc: '采集到的商品数据: 列表/筛选/详情/批量操作', icon: 'product' },
   compliance: { title: '合规检测', desc: 'RAG 合规检测: 品牌库/专利库/规则库检索, 品牌监控与风险预警', icon: 'compliance' },
+  ipcheck: { title: '知产查重', desc: '上架风控: 品牌名/商品链接 → 按目标站点辖区查官方商标库(WIPO·EUIPO·USPTO), 判能不能上', icon: 'ipcheck' },
   claims: { title: '批量刊登', desc: '批量认领与刊登: 草稿箱编辑, 多店铺批量发布, 失败重发', icon: 'claims' },
   reprice: { title: '智能调价', desc: '15分钟自动跟价抢购物车, 保底价+差额, 策略自优化', icon: 'reprice' },
   flywheel: { title: '数据飞轮', desc: '合规/定价/选品/话术四轮驱动, 系统越用越聪明', icon: 'flywheel' },
@@ -348,6 +350,7 @@ const PAGES = {
   notify: { title: '消息通知', desc: '飞书/企微集成: 异常通知, 日报推送, 远程指令', icon: 'notify' },
   listing: { title: '上架记录', desc: '插件从 Amazon 详情页采集的上架清单 (与商品管理库物理隔离); 上品工具 ifast.top 可直接读取', icon: 'claims' },
   archive: { title: '选品归档', desc: '把最终选出来的品连同当时的承受价/利润率存成快照: 可检索 / 可去重 / 可导出文件', icon: 'file' },
+  selection: { title: '蓝海选品', desc: '榜单/搜索页 → 一次读出评论·品牌·重量·自营 → 五维评分 + 候选品 → 导出/入库', icon: 'grid' },
 };
 
 function navigate(page) {
@@ -355,7 +358,7 @@ function navigate(page) {
   const meta = PAGES[page];
   $('#pageTitle').innerHTML = (meta.icon ? ic(meta.icon, 17) + ' ' : '') + meta.title;
   $('#pageDesc').textContent = meta.desc;
-  const render = { workbench: renderWorkbench, collect: renderCollect, product: renderProduct, compliance: renderCompliance, claims: renderClaims, reprice: renderReprice, flywheel: renderFlywheel, agent: renderAgent, knowledge: renderKnowledge, logistics: renderLogistics, notify: renderNotify, listing: renderListing, archive: renderArchive }[page];
+  const render = { workbench: renderWorkbench, collect: renderCollect, product: renderProduct, compliance: renderCompliance, ipcheck: renderIpCheck, claims: renderClaims, reprice: renderReprice, flywheel: renderFlywheel, agent: renderAgent, knowledge: renderKnowledge, logistics: renderLogistics, notify: renderNotify, listing: renderListing, archive: renderArchive, selection: renderSelection }[page];
   render();
 }
 
@@ -1793,7 +1796,19 @@ async function renderProduct() {
     page = 1; writePmList({ page: 1, size: pageSize });    // 用户改了站点筛选 → 回第 1 页并记住
     reload();
   });
-  document.addEventListener('click', () => $('#fSitePanel').classList.remove('open'));
+  /* ★ 2026-11-10 修复: 这里原来每次渲染都往 document 挂一个新的 click 监听, 且回调里直接
+   *   $('#fSitePanel').classList.remove('open') —— 离开商品管理后该节点已不存在,
+   *   于是之后【每次点击任意位置】都抛 "Cannot read properties of null (reading 'classList')",
+   *   而且回访商品管理还会不断叠加监听器。改成全局只挂一次 + 空值保护。 */
+  if (!window.__zySitePanelCloser) {
+    window.__zySitePanelCloser = true;
+    document.addEventListener('click', () => {
+      ['fSitePanel', 'cfSitePanel'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.classList.remove('open');
+      });
+    });
+  }
   // 翻页（★ 用户操作 → 立刻落盘, 这是"保持当前页"的落盘点)
   $('#cPagePrev').addEventListener('click', () => { if (page > 1) { page--; writePmList({ page, size: pageSize }); renderList(items, false); } });
   $('#cPageNext').addEventListener('click', () => {
@@ -2032,7 +2047,7 @@ async function renderCollect() {
   $('#cfCustomSites').addEventListener('input', () => { updateCfActive(); updateCfSiteTrigger(); });
   $('#cfSiteClear').addEventListener('click', () => { document.querySelectorAll('#cfSitePanel .cfSiteCb').forEach((c) => { c.checked = false; }); updateCfSiteTrigger(); updateCfActive(); });
   $('#cfSiteApply').addEventListener('click', () => { $('#cfSitePanel').classList.remove('open'); updateCfActive(); });
-  document.addEventListener('click', () => $('#cfSitePanel').classList.remove('open'));
+  // (站点筛选面板的全局关闭监听已在上方统一挂载一次, 这里不再重复注册)
   $('#cfBadgesNot').addEventListener('input', updateCfActive);
   $('#cfHasRankOnly').addEventListener('change', updateCfActive);
   ['cfFulfill', 'cfShopAplus', 'cfBrandShop', 'cfBrandStore', 'cfRankRange', 'cfPriceRange', 'cfRatingRange', 'cfReviewsRange', 'cfSalesRange', 'cfTmRange', 'cfNewDaysRange', 'cfIs1688', 'cfBrandStatus', 'cfTmCountries', 'cfQ', 'cfCat1', 'cfCat2'].forEach((id) => {
@@ -2688,7 +2703,9 @@ async function renderCompliance() {
           <div class="card-title"> RAG 合规检测</div>
           <div class="card-sub">品牌数据库 ${branddb.total} 条 · 专利库 · 平台规则库 → 混合检索 → 风险结论(带引用)</div>
           <div class="toolbar">
+            <input id="compKw" class="input" style="width:170px" placeholder="筛选 ASIN/品牌/标题">
             <select id="compAsin" class="select" style="flex:1"></select>
+            <span id="compKwHint" class="muted" style="font-size:11px"></span>
             <button id="compCheck" class="btn primary">🔍 开始检测</button>
           </div>
           <div id="compResult" class="section-gap"></div>
@@ -2721,7 +2738,30 @@ async function renderCompliance() {
     </div>
   `;
   const sel = $('#compAsin');
-  prod.items.forEach((p) => { const o = document.createElement('option'); o.value = p.asin; o.textContent = `${p.asin} · ${p.brand} · ${p.title.slice(0, 40)}`; sel.appendChild(o); });
+  /* ★ 2026-11-10 修复: 原来把全部商品 (实测 8802 个) 全塞进一个原生 select —— 每个 option 带标题,
+   *   一页就是 62 万字符的选项文本, 下拉框卡到没法用。改成"关键词筛选 + 最多 200 个候选"。 */
+  const fillCompAsin = (kw) => {
+    const q = String(kw || '').trim().toLowerCase();
+    const list = q
+      ? prod.items.filter((p) => (String(p.asin) + ' ' + String(p.brand || '') + ' ' + String(p.title || '')).toLowerCase().includes(q))
+      : prod.items;
+    const top = list.slice(0, 200);
+    sel.innerHTML = '';
+    for (const p of top) {
+      const o = document.createElement('option');
+      o.value = p.asin;
+      o.textContent = `${p.asin} · ${p.brand || '-'} · ${String(p.title || '').slice(0, 40)}`;
+      sel.appendChild(o);
+    }
+    const hint = document.getElementById('compKwHint');
+    if (hint) hint.textContent = q ? `匹配 ${list.length} 条, 显示前 ${top.length}` : `共 ${prod.items.length} 条, 显示前 ${top.length} (可输入关键词缩小)`;
+  };
+  fillCompAsin('');
+  const kwEl = $('#compKw');
+  if (kwEl) {
+    let t = null;
+    kwEl.addEventListener('input', () => { clearTimeout(t); t = setTimeout(() => fillCompAsin(kwEl.value), 200); });
+  }
   complianceProduct = prod.items[0];
 
   const showResult = (r) => {
@@ -2751,11 +2791,369 @@ async function renderCompliance() {
   $('#corrNot').addEventListener('click', () => correct('未备案'));
 }
 
+/* ===== 知产查重 (上架风控: 商标 / 外观设计) ===== */
+/* 数据源: WIPO 全球品牌库(含 GB/AU/马德里) · EUIPO 欧盟商标 · EUIPO 共同体外观 · USPTO 美国 */
+let ipMeta = null;          // /api/ip/providers 结果
+let ipBatchTimer = null;    // 批量查重轮询
+const IP_LEVEL_BADGE = {
+  high: ['danger', '❌ 高危'], medium: ['medium', '⚠️ 中风险'], low: ['low', 'ℹ️ 低风险'],
+  none: ['blue', '✅ 无冲突'], unknown: ['unknown', '⚠️ 无法判定'],
+};
+const ipLevelBadge = (lv) => {
+  const [cls, text] = IP_LEVEL_BADGE[lv] || ['gray', lv || '—'];
+  return `<span class="badge ${cls}">${text}</span>`;
+};
+
+async function renderIpCheck() {
+  const content = $('#content');
+  if (ipBatchTimer) { clearInterval(ipBatchTimer); ipBatchTimer = null; }
+
+  let meta, ov;
+  try {
+    meta = await API('/api/ip/providers');
+    ipMeta = meta;
+  } catch (e) {
+    content.innerHTML = `<div class="card"><div class="card-title">知产查重</div>
+      <div class="card-sub">读取数据源失败: ${esc(e.message)}</div></div>`;
+    return;
+  }
+  ov = await API('/api/ip/overview').catch(() => null);
+
+  const sites = meta.sites || [];
+  const providers = meta.providers || [];
+  const defaults = meta.defaultSources || [];
+  const siteOptions = (sel) => sites.map((s) =>
+    `<option value="${s.id}"${s.id === sel ? ' selected' : ''}>${s.flag} ${s.name}</option>`).join('');
+  const srcChecks = (onlyKinds) => providers
+    .filter((p) => onlyKinds.indexOf(p.kind) >= 0)
+    .map((p) => `<label class="ip-src${p.ready ? '' : ' off'}" title="${esc(p.note || '')}">
+        <input type="checkbox" class="ip-src-cb" value="${p.id}"${defaults.indexOf(p.id) >= 0 ? ' checked' : ''}${p.ready ? '' : ' disabled'}>
+        ${esc(p.short)}${p.ready ? '' : ' (未接入)'}
+      </label>`).join('');
+
+  content.innerHTML = `
+    <div class="card">
+      <div class="card-title">🛡 知产查重 · 上架风控</div>
+      <div class="card-sub">
+        用「品牌名」去官方商标库查有没有人在你要上的那个站点注册过 —— 有就先别上。
+        判定口径: 只看<b>目标站点所在辖区</b>的商标（上德国站看 DE+欧盟，上英国站只看 GB，别国有商标不影响你）。
+      </div>
+      <div class="toolbar">
+        <span class="pill">商品库 ${ov ? ov.total.toLocaleString() : '—'} 个</span>
+        <span class="pill">已查 ${ov ? ov.checked.toLocaleString() : '—'}</span>
+        <span class="pill">未查 ${ov ? ov.unchecked.toLocaleString() : '—'}</span>
+        ${ov && ov.byLevel && Object.keys(ov.byLevel).length ? Object.keys(ov.byLevel).map((k) => `<span class="badge ${(IP_LEVEL_BADGE[k] || ['gray'])[0]}">${k} ${ov.byLevel[k]}</span>`).join('') : ''}
+        <span class="muted">缓存 ${ov && ov.cache ? ov.cache.total : 0} 条 · TTL ${ov && ov.cache ? ov.cache.ttlDays : 7} 天</span>
+        <button id="ipClearCache" class="btn small" style="margin-left:auto">清缓存</button>
+      </div>
+    </div>
+
+    <div class="grid cols-2 section-gap">
+      <div>
+        <div class="card">
+          <div class="card-title">🏬 店铺/列表链接查重 <span class="muted" style="font-weight:400">列表页 → 采站点+品牌 → 逐个查商标</span></div>
+          <div class="card-sub">
+            每行一个 Amazon 店铺/商品列表链接（如 <code>amazon.de/s?me=A5WKWV7CFW0MZ&amp;marketplaceID=A1PA6795UKMFR9</code>），也支持单个商品链接 <code>/dp/ASIN</code>。
+            站点从域名自动识别；品牌取自列表卡片与智赢插件面板，拿不到的先查商品库，仍没有的再开临时标签页读详情页。
+          </div>
+          <textarea id="ipLinks" class="input" rows="5" placeholder="https://www.amazon.de/s?me=A5WKWV7CFW0MZ&amp;marketplaceID=A1PA6795UKMFR9&#10;https://www.amazon.co.uk/s?me=A21HVBR9S9KTYG&amp;marketplaceID=A1F83G8C2ARO7P" style="width:100%;font-family:ui-monospace,Consolas,monospace;resize:vertical"></textarea>
+          <div class="toolbar" style="margin-top:12px">
+            <label class="muted" style="display:inline-flex;gap:6px;align-items:center">页数
+              <input id="ipListPages" class="input" type="number" min="0" max="60" placeholder="留空=全部" title="采集前 N 页；留空或 0 = 一直翻到最后一页" style="width:110px">
+            </label>
+            <span class="muted">数据源</span>
+            <span class="ip-srcs" id="ipLinkSrcs">${srcChecks(['trademark', 'design'])}</span>
+            <button id="ipLinkRun" class="btn primary">开始采集并查商标</button>
+            <button id="ipLinkStop" class="btn" disabled>停止</button>
+            <button id="ipLinkApply" class="btn" title="把结论写回商品库里对应的商品">同时写回商品库</button>
+          </div>
+          <div id="ipLinkMsg" class="muted"></div>
+          <div id="ipLinkResult" class="section-gap"></div>
+        </div>
+
+        <div class="card section-gap">
+          <div class="card-title">🔍 关键词 / 品牌直接查</div>
+          <div class="card-sub">不采集商品，只拿一个名字查商标 —— 选品前先探路用。</div>
+          <div class="toolbar">
+            <input id="ipTerm" class="input" placeholder="品牌名 / 关键词，如 Anker" style="flex:1;min-width:180px">
+            <select id="ipTermSite" class="select">${siteOptions('amazon.co.uk')}</select>
+            <button id="ipTermRun" class="btn primary">查</button>
+          </div>
+          <div class="toolbar">
+            <span class="muted">数据源</span>
+            <span class="ip-srcs" id="ipTermSrcs">${srcChecks(['trademark', 'design'])}</span>
+          </div>
+          <div id="ipTermResult" class="section-gap"></div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <div class="card-title">📦 商品库批量查重</div>
+          <div class="card-sub">按品牌名去重后逐个查（同一个品牌只查一次），结论可写回商品库。串行执行，别急着关页面。</div>
+          <div class="toolbar">
+            <select id="ipBatchSite" class="select">${siteOptions('amazon.co.uk')}</select>
+            <select id="ipBatchField" class="select">
+              <option value="brand">按品牌名查</option>
+              <option value="title">按标题查</option>
+            </select>
+            <input id="ipBatchLimit" class="input" type="number" min="1" max="200" value="30" style="width:90px" title="最多查多少个关键词">
+            <label class="ip-src"><input type="checkbox" id="ipBatchOnlyUnchecked" checked> 只查没查过的</label>
+            <button id="ipBatchRun" class="btn primary">开始</button>
+            <button id="ipBatchStop" class="btn">停止</button>
+          </div>
+          <div id="ipBatchProgress" class="section-gap"></div>
+        </div>
+
+        <div class="card section-gap">
+          <div class="card-title">🔌 数据源状态</div>
+          <div class="card-sub">点「测试」现查一个已知有商标的词，确认真能返回数据（不要只看配置里写着 ready）。</div>
+          <div class="toolbar">
+            <input id="ipTestTerm" class="input" value="Anker" style="width:150px">
+            <select id="ipTestSite" class="select">${siteOptions('amazon.co.uk')}</select>
+            <button id="ipTestRun" class="btn small">测试</button>
+          </div>
+          <div id="ipTestResult" class="muted"></div>
+          <table style="margin-top:12px">
+            <thead><tr><th>数据源</th><th>范围</th><th>状态</th><th>说明</th></tr></thead>
+            <tbody>${providers.map((p) => `<tr>
+              <td><b>${esc(p.short)}</b><div class="muted">${esc(p.name)}</div></td>
+              <td class="muted">${esc(p.scope)}</td>
+              <td>${p.ready ? '<span class="badge blue">已接入</span>' : '<span class="badge gray">未接入</span>'}</td>
+              <td class="muted" style="max-width:280px">${esc(p.note || '')}</td>
+            </tr>`).join('')}</tbody>
+          </table>
+          <div class="muted" style="margin-top:8px">
+            欧盟 27 国: ${(meta.euMembers || []).join(' ')} —— 欧盟商标(EUTM)一次性覆盖这些国家；
+            英国脱欧后欧盟商标不再覆盖 GB，所以英国站只查 GB + 马德里指定 GB。
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  const getSources = (sel) => $$('#' + sel + ' .ip-src-cb').filter((c) => c.checked).map((c) => c.value);
+
+  /* ---------- 结论渲染 ---------- */
+  const renderRisk = (r) => {
+    const items = (r.items || []).filter((h) => h.inMarket !== false);
+    const alive = items.filter((h) => h.statusGroup === 'alive').slice(0, 12);
+    const others = items.filter((h) => h.statusGroup !== 'alive');
+    const srcLine = (r.sources || []).map((s) => s.ok
+      ? `<span class="pill">${esc(s.sourceName)} ${s.returned}/${s.total}${s.cached ? ' 缓存' : ''}</span>`
+      : `<span class="badge danger" title="${esc(s.error || '')}">${esc(s.sourceName)} 失败</span>`).join(' ');
+    return `
+      <div class="card" style="border-color:${r.risk.level === 'high' ? 'var(--red)' : r.risk.level === 'medium' ? 'var(--yellow)' : r.risk.level === 'unknown' ? '#8a6d3b' : 'var(--card-border)'}">
+        <div class="card-title">${ipLevelBadge(r.risk.level)} <span class="muted" style="font-weight:400">风险分 ${r.risk.score} · ${r.total} 条命中 · ${r.tookMs}ms</span></div>
+        <div class="card-sub">${r.market ? esc(r.market.label) : '未指定站点（按全球口径）'}</div>
+        <ul class="source-list">${(r.risk.reasons || []).map((x) => `<li>${esc(x)}</li>`).join('')}</ul>
+        <div style="margin-top:8px">${srcLine}</div>
+        ${alive.length ? `<table style="margin-top:10px">
+          <thead><tr><th>状态</th><th>商标</th><th>局</th><th>权利人</th><th>尼斯类</th><th>注册日</th></tr></thead>
+          <tbody>${alive.map((h) => `<tr>
+            <td>${h.statusGroup === 'alive' ? '<span class="badge danger">有效</span>' : h.statusGroup === 'pending' ? '<span class="badge medium">审查中</span>' : '<span class="badge gray">失效</span>'}</td>
+            <td><b>${esc(h.title || '(图形)')}</b>${h.images && h.images[0] ? ` <a href="${esc(h.detailUrl || h.images[0])}" target="_blank"><img src="${esc(h.images[0])}" style="height:26px;vertical-align:middle;border-radius:4px"></a>` : ''}</td>
+            <td class="muted">${esc(h.officeName || h.office)}</td>
+            <td class="muted" style="max-width:200px">${esc(h.owner || '')}</td>
+            <td class="muted">${(h.nice || []).join('/') || '—'}</td>
+            <td class="muted">${esc(h.registeredAt || h.filed || '')}</td>
+          </tr>`).join('')}</tbody></table>` : ''}
+        ${others.length ? `<details style="margin-top:8px"><summary class="muted">另有 ${others.length} 条失效/审查中记录</summary>
+          <ul class="source-list">${others.slice(0, 20).map((h) => `<li>${esc(h.title || '(图形)')} · ${esc(h.officeName || h.office)} · ${esc(h.status || '')}</li>`).join('')}</ul></details>` : ''}
+      </div>`;
+  };
+
+  /* ---------- 店铺/列表链接查重 (后台任务 + 轮询) ---------- */
+  const renderListJob = (job) => {
+    if (!job) { $('#ipLinkResult').innerHTML = ''; return; }
+    const stage = { collect: '① 采集列表', check: '② 查商标', done: '✔ 完成' }[job.stage] || job.stage || '';
+    const lists = (job.lists || []).map((L) => `<div class="muted" style="font-size:12px">${esc(L.site || '?')} · ${L.pages || 0} 页 · 商品 ${L.products || 0} · 品牌 ${L.brands || 0}${L.noBrand ? ` · 无品牌 ${L.noBrand}` : ''}${L.filledFromLib ? ` · 库补 ${L.filledFromLib}` : ''}${L.filledFromDetail ? ` · 详情补 ${L.filledFromDetail}` : ''}${L.note ? ' · ' + esc(L.note) : ''}${L.stopped ? ' · 已停止' : ''}</div>`).join('');
+    const rows = (job.results || []).slice().reverse().map((x) => `
+      <tr>
+        <td>${ipLevelBadge(x.level)}</td>
+        <td><b>${esc(x.brand)}</b><div class="muted">${esc(x.siteName || x.site || '')}</div></td>
+        <td class="muted">${(x.asins || []).length}</td>
+        <td class="muted">${x.total || 0} 命中 / ${x.trademarkCount || 0} 有效</td>
+        <td class="muted" style="max-width:320px">${esc(x.advice || '')}${(x.items || []).length ? '<div class="muted" style="font-size:11.5px">' + x.items.slice(0, 3).map((h) => '· ' + esc(h.title || '(无名称)') + ' · ' + esc(h.officeName || h.office || '') + (h.owner ? ' · ' + esc(h.owner) : '')).join('<br>') + '</div>' : ''}</td>
+      </tr>`).join('');
+    $('#ipLinkMsg').innerHTML = `${job.running ? '⏳ ' : '✔ '}${esc(stage)} · 商品 ${job.productCount || 0} · 品牌 ${job.brandCount || 0} · 已查 ${(job.results || []).length}/${job.brandCount || 0} · 页数 ${job.pages || 0}` +
+      `<br><span class="muted" style="font-size:12px">${job.current ? '当前: ' + esc(job.current) : ''}</span>` +
+      `<br>${['high', 'medium', 'low', 'none', 'unknown'].map((k) => `${ipLevelBadge(k)} ${(job.summary && job.summary[k]) || 0}`).join(' · ')}` +
+      (job.summary && job.summary.failed ? ` · <span class="badge gray">失败 ${job.summary.failed}</span>` : '');
+    $('#ipLinkStop').disabled = !job.running;
+    $('#ipLinkResult').innerHTML = `
+      <div class="card">
+        <div class="card-title">${job.running ? '⏳ 运行中' : '✔ 已结束'} <span class="muted" style="font-weight:400">${esc(job.id || '')}${job.apply ? ' · 已写回商品库' : ''}</span></div>
+        ${lists}
+        ${rows ? `<table style="margin-top:10px"><thead><tr><th>结论</th><th>品牌 / 站点</th><th>商品</th><th>命中</th><th>说明</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted">还没有品牌结论。</div>'}
+        ${(job.errors && job.errors.length) ? `<div class="muted" style="margin-top:8px;color:var(--yellow)">失败 ${job.errors.length} 条: ${job.errors.slice(0, 6).map((e) => esc((e.brand || e.asin || e.url || '?') + ' → ' + (e.error || ''))).join(' · ')}</div>` : ''}
+      </div>`;
+  };
+  let ipListTimer = null;
+  const pollListJob = async () => {
+    try {
+      const r = await API('/api/ip/list-job');
+      if (!r.job) { if (ipListTimer) { clearInterval(ipListTimer); ipListTimer = null; } return; }
+      renderListJob(r.job);
+      if (!r.job.running) { if (ipListTimer) { clearInterval(ipListTimer); ipListTimer = null; } $('#ipLinkRun').disabled = false; }
+    } catch (e) { /* 轮询失败不打断 */ }
+  };
+  $('#ipLinkRun').addEventListener('click', async () => {
+    const urls = $('#ipLinks').value.split(/[\r\n]+/).map((s) => s.trim()).filter(Boolean);
+    if (!urls.length) return zyAlert('请先填写至少一个店铺/商品列表链接');
+    const btn = $('#ipLinkRun');
+    const apply = btn.dataset.apply === '1';
+    btn.disabled = true;
+    $('#ipLinkMsg').textContent = '已提交，正在采集列表…';
+    $('#ipLinkResult').innerHTML = '';
+    try {
+      const r = await API('/api/ip/list-check', {
+        method: 'POST',
+        body: JSON.stringify({
+          urls,
+          pages: ($('#ipListPages').value || '').trim(),
+          sources: getSources('ipLinkSrcs'),
+          apply,
+          limit: 30,
+        }),
+      });
+      renderListJob(r.job);
+      if (ipListTimer) clearInterval(ipListTimer);
+      ipListTimer = setInterval(pollListJob, 2500);
+    } catch (e) {
+      btn.disabled = false;
+      $('#ipLinkMsg').innerHTML = `<span class="badge danger">启动失败</span> ${esc(e.message)}`;
+    }
+  });
+  $('#ipLinkStop').addEventListener('click', async () => {
+    try { await API('/api/ip/list-stop', { method: 'POST' }); $('#ipLinkMsg').textContent = '已请求停止（当前页/当前品牌查完就停）'; }
+    catch (e) { zyAlert(e.message); }
+  });
+  $('#ipLinkApply').addEventListener('click', () => {
+    const b = $('#ipLinkRun');
+    const on = b.dataset.apply === '1';
+    b.dataset.apply = on ? '0' : '1';
+    $('#ipLinkApply').classList.toggle('primary', !on);
+    $('#ipLinkApply').textContent = on ? '同时写回商品库' : '✔ 会写回商品库';
+  });
+  // 进页面时若后台已有任务, 直接显示
+  pollListJob();
+  if (!ipListTimer) ipListTimer = setInterval(pollListJob, 5000);
+  /* ---------- 关键词查重 ---------- */
+  $('#ipTermRun').addEventListener('click', async () => {
+    const term = $('#ipTerm').value.trim();
+    if (!term) return zyAlert('请填写品牌名或关键词');
+    const btn = $('#ipTermRun');
+    btn.disabled = true;
+    $('#ipTermResult').innerHTML = '<div class="muted">查询中…</div>';
+    try {
+      const q = new URLSearchParams({ q: term, sites: $('#ipTermSite').value, sources: getSources('ipTermSrcs').join(','), limit: '30' });
+      const r = await API('/api/ip/search?' + q.toString());
+      $('#ipTermResult').innerHTML = renderRisk(r);
+    } catch (e) {
+      $('#ipTermResult').innerHTML = `<div class="card"><div class="card-title"><span class="badge danger">查询失败</span></div><div class="card-sub">${esc(e.message)}</div></div>`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  /* ---------- 商品库批量 ---------- */
+  const pollBatch = async () => {
+    try {
+      const b = await API('/api/ip/batch');
+      const el = $('#ipBatchProgress');
+      if (!b || !b.batch) { el.innerHTML = '<div class="muted">还没有批量任务。</div>'; if (ipBatchTimer) { clearInterval(ipBatchTimer); ipBatchTimer = null; } return; }
+      const t = b.batch;
+      const pct = t.total ? Math.round((t.done / t.total) * 100) : 0;
+      el.innerHTML = `
+        <div class="card">
+          <div class="card-title">${t.running ? '⏳ 进行中' : '✔ 已结束'} <span class="muted" style="font-weight:400">${t.done}/${t.total} · ${t.market || ''} · ${esc(t.field === 'title' ? '按标题' : '按品牌')}</span></div>
+          <div class="card-sub">${t.current ? '正在查: ' + esc(t.current) : (t.finishedAt ? '完成于 ' + esc(t.finishedAt) : '')}</div>
+          <div style="height:6px;background:var(--card-hover);border-radius:999px;overflow:hidden"><div style="height:100%;width:${pct}%;background:var(--accent);transition:width .3s"></div></div>
+          <div class="toolbar" style="margin-top:10px">
+            <span class="badge danger">高危 ${t.summary.high || 0}</span>
+            <span class="badge medium">中风险 ${t.summary.medium || 0}</span>
+            <span class="badge low">低风险 ${t.summary.low || 0}</span>
+            <span class="badge blue">无冲突 ${t.summary.none || 0}</span>
+            ${t.summary.unknown ? `<span class="badge unknown">无法判定 ${t.summary.unknown}</span>` : ''}
+            ${t.errors && t.errors.length ? `<span class="badge gray">出错 ${t.errors.length}</span>` : ''}
+          </div>
+          ${(t.results || []).length ? `<table style="margin-top:8px">
+            <thead><tr><th>关键词</th><th>结论</th><th>命中</th><th>受影响 ASIN</th></tr></thead>
+            <tbody>${t.results.slice().reverse().slice(0, 25).map((x) => `<tr>
+              <td><b>${esc(x.term)}</b></td>
+              <td>${ipLevelBadge(x.risk.level)}</td>
+              <td class="muted">${x.total || 0}</td>
+              <td class="muted" style="max-width:240px">${(x.asins || []).slice(0, 6).join(', ')}${(x.asins || []).length > 6 ? ` …+${x.asins.length - 6}` : ''}</td>
+            </tr>`).join('')}</tbody></table>` : ''}
+        </div>`;
+      if (!t.running && ipBatchTimer) { clearInterval(ipBatchTimer); ipBatchTimer = null; }
+    } catch (e) {
+      if (ipBatchTimer) { clearInterval(ipBatchTimer); ipBatchTimer = null; }
+    }
+  };
+  $('#ipBatchRun').addEventListener('click', async () => {
+    const btn = $('#ipBatchRun');
+    btn.disabled = true;
+    try {
+      const r = await API('/api/ip/batch', {
+        method: 'POST',
+        body: JSON.stringify({
+          sites: [$('#ipBatchSite').value],
+          sources: defaults.length ? undefined : undefined,
+          field: $('#ipBatchField').value,
+          limit: Number($('#ipBatchLimit').value) || 30,
+          onlyUnchecked: $('#ipBatchOnlyUnchecked').checked,
+          apply: true,
+        }),
+      });
+      await pollBatch();
+      if (ipBatchTimer) clearInterval(ipBatchTimer);
+      ipBatchTimer = setInterval(pollBatch, 2500);
+    } catch (e) {
+      $('#ipBatchProgress').innerHTML = `<div class="card"><div class="card-title"><span class="badge danger">启动失败</span></div><div class="card-sub">${esc(e.message)}</div></div>`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  $('#ipBatchStop').addEventListener('click', async () => {
+    try { await API('/api/ip/batch/stop', { method: 'POST' }); await pollBatch(); } catch (e) { zyAlert(e.message); }
+  });
+
+  /* ---------- 数据源自测 / 清缓存 ---------- */
+  $('#ipTestRun').addEventListener('click', async () => {
+    const term = $('#ipTestTerm').value.trim() || 'Anker';
+    $('#ipTestResult').innerHTML = '测试中…（每个源约 2~4 秒）';
+    try {
+      const q = new URLSearchParams({ q: term, sites: $('#ipTestSite').value, limit: '10' });
+      const t0 = Date.now();
+      const r = await API('/api/ip/risk?' + q.toString());
+      const lines = (r.sources || []).map((s) => s.ok
+        ? `✅ ${esc(s.sourceName)}: ${s.returned}/${s.total}${s.cached ? ' (缓存)' : ''}`
+        : `❌ ${esc(s.sourceName)}: ${esc(s.error || '失败')}`).join(' &nbsp;·&nbsp; ');
+      $('#ipTestResult').innerHTML = `${lines}<br>结论 ${ipLevelBadge(r.risk.level)} · 耗时 ${Date.now() - t0}ms`;
+    } catch (e) {
+      $('#ipTestResult').innerHTML = `<span class="badge danger">测试失败</span> ${esc(e.message)}`;
+    }
+  });
+  $('#ipClearCache').addEventListener('click', async () => {
+    try { const r = await API('/api/ip/cache/clear', { method: 'POST' }); renderIpCheck(); }
+    catch (e) { zyAlert(e.message); }
+  });
+
+  // 进页面就把当前批量任务状态拉出来（可能正在后台跑）
+  pollBatch();
+  if (!ipBatchTimer) ipBatchTimer = setInterval(pollBatch, 4000);
+}
+
 /* ===== 批量刊登 ===== */
 async function renderClaims() {
   const content = $('#content');
   const prod = await API('/api/products');
   const lowRisk = prod.items.filter((p) => p.aiRiskLevel === 'low' && p.fulfill === 'FBM');
+  /* ★ 2026-11-10 修复: 原来把 lowRisk 全量渲染成表格 (实测 8802 行 / 76 万字符 innerText),
+   *   打开这一页等于让浏览器造 8800 行 DOM —— 卡顿且没有必要。改成先渲染 200 行 + 按需加载。 */
+  let shown = 200;
   content.innerHTML = `
     <div class="notice">流程: 采集列表 → 一键筛选(FBM+未查到备案+BG标=无) → 批量认领 → 草稿箱编辑 → 批量发布</div>
     <div class="grid cols-2">
@@ -2765,13 +3163,9 @@ async function renderClaims() {
           <div class="card-sub">已按「未查到备案 + FBM + 无BG标」自动筛选, 共 ${lowRisk.length} 条</div>
           <div style="max-height:380px;overflow-y:auto"><table style="min-width:700px">
             <thead><tr><th></th><th>ASIN</th><th>品牌</th><th>商品</th><th>价格</th><th>建议价</th><th>月销</th></tr></thead>
-            <tbody>${lowRisk.map((p) => `<tr>
-              <td><input type="checkbox" class="claim-cb" value="${esc(p.asin)}"></td>
-              <td class="mono">${esc(p.asin)}</td><td>${esc(p.brand)}</td>
-              <td style="max-width:200px">${esc(p.title.slice(0, 50))}</td>
-              <td>${fmtMoney(p.price, p.currency)}</td><td class="muted">${fmtMoney(p.aiSuggestPrice, p.currency)}</td><td>${fmtNum(p.monthlySales)}</td>
-            </tr>`).join('') || '<tr><td colspan="7" class="empty">无可认领商品</td></tr>'}</tbody>
+            <tbody id="claimRows"></tbody>
           </table></div>
+          <div class="section-gap" id="claimMoreWrap"></div>
           <div class="toolbar section-gap">
             <button id="claimSel" class="btn primary" title="打开所选商品的所有链接: 商品页 / 品牌页 / 卖家页 / 1688 同款 (逐个在新标签页打开)">🔗 打开所选链接</button>
             <button id="claimAll" class="btn">认领全部</button>
@@ -2792,6 +3186,27 @@ async function renderClaims() {
       </div>
     </div>
   `;
+
+  /* 分批渲染可认领商品 (首屏 200 条, 每次 +300) */
+  const renderClaimRows = () => {
+    const rows = lowRisk.slice(0, shown);
+    $('#claimRows').innerHTML = rows.map((p) => `<tr>
+      <td><input type="checkbox" class="claim-cb" value="${esc(p.asin)}"></td>
+      <td class="mono">${esc(p.asin)}</td><td>${esc(p.brand)}</td>
+      <td style="max-width:200px">${esc(String(p.title || '').slice(0, 50))}</td>
+      <td>${fmtMoney(p.price, p.currency)}</td><td class="muted">${fmtMoney(p.aiSuggestPrice, p.currency)}</td><td>${fmtNum(p.monthlySales)}</td>
+    </tr>`).join('') || '<tr><td colspan="7" class="empty">无可认领商品</td></tr>';
+    const wrap = $('#claimMoreWrap');
+    if (!wrap) return;
+    if (shown < lowRisk.length) {
+      wrap.innerHTML = `<button id="claimMore" class="btn">显示更多 (+300) — 已显示 ${Math.min(shown, lowRisk.length)}/${lowRisk.length}</button>`;
+      const more = $('#claimMore');
+      if (more) more.addEventListener('click', () => { shown += 300; renderClaimRows(); });
+    } else {
+      wrap.innerHTML = lowRisk.length > 200 ? `<span class="muted">已显示全部 ${lowRisk.length} 条</span>` : '';
+    }
+  };
+  renderClaimRows();
 
   const loadClaims = async () => {
     const data = await API('/api/claims');
@@ -2950,14 +3365,39 @@ async function renderAgent() {
       <div class="card-title"> 选品评估 (Agent 演示)</div>
       <div class="card-sub">输入 ASIN → 选品评估师结合合规检测结果输出可行性评估</div>
       <div class="toolbar">
+        <input id="agKw" class="input" style="width:170px" placeholder="筛选 ASIN/品牌/标题">
         <select id="agAsin" class="select" style="flex:1"></select>
+        <span id="agKwHint" class="muted" style="font-size:11px"></span>
         <button id="agAssess" class="btn primary">评估</button>
       </div>
       <div id="agResult" class="section-gap"></div>
     </div>
   `;
   const sel = $('#agAsin');
-  prod.items.forEach((p) => { const o = document.createElement('option'); o.value = p.asin; o.textContent = `${p.asin} · ${p.brand} · ${p.title.slice(0, 40)}`; sel.appendChild(o); });
+  /* ★ 2026-11-10 修复: 同合规页 —— 8802 个商品全塞进原生 select (62 万字符选项文本)。
+   *   改成关键词筛选 + 最多 200 个候选。 */
+  const fillAgAsin = (kw) => {
+    const q = String(kw || '').trim().toLowerCase();
+    const list = q
+      ? prod.items.filter((p) => (String(p.asin) + ' ' + String(p.brand || '') + ' ' + String(p.title || '')).toLowerCase().includes(q))
+      : prod.items;
+    const top = list.slice(0, 200);
+    sel.innerHTML = '';
+    for (const p of top) {
+      const o = document.createElement('option');
+      o.value = p.asin;
+      o.textContent = `${p.asin} · ${p.brand || '-'} · ${String(p.title || '').slice(0, 40)}`;
+      sel.appendChild(o);
+    }
+    const hint = document.getElementById('agKwHint');
+    if (hint) hint.textContent = q ? `匹配 ${list.length} 条, 显示 ${top.length}` : `共 ${prod.items.length} 条, 显示前 ${top.length}`;
+  };
+  fillAgAsin('');
+  const agKwEl = $('#agKw');
+  if (agKwEl) {
+    let t2 = null;
+    agKwEl.addEventListener('input', () => { clearTimeout(t2); t2 = setTimeout(() => fillAgAsin(agKwEl.value), 200); });
+  }
   $('#agAssess').addEventListener('click', async () => {
     const r = await API('/api/agent/assess', { method: 'POST', body: JSON.stringify({ asin: sel.value }) });
     const color = r.risk === 'high' ? 'var(--red)' : r.risk === 'medium' ? 'var(--yellow)' : 'var(--green)';
@@ -3043,6 +3483,7 @@ async function renderListing() {
       <div class="card-title">📋 记录列表
         <span style="margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
           <input id="lsQ" class="input" placeholder="🔍 ASIN / 标题 / 品牌 / 父ASIN" style="width:220px">
+          <select id="lsShop" class="input" style="width:168px" title="按店铺筛选 —— 多店铺隔离: 每个店铺的记录分开存。默认「当前店铺」= 上架器最近登录的那个店铺(插件登录什么店铺就用什么数据)"></select>
           <select id="lsResult" class="input" style="width:142px" title="按上传结果筛选(只有这一种状态数据)">
             <option value="">全部上传结果</option>
             <option value="ok">✅ 成功</option>
@@ -3108,10 +3549,14 @@ async function renderListing() {
       (res === 'failed' && (x.failReason || last.reason) ? ' <span class="muted" title="' + esc(x.failReason || last.reason) + '">ⓘ</span>' : '') +
       (us.length ? ' <a href="javascript:void(0)" class="ls-up" data-i="' + esc(x._i) + '" title="展开每次尝试的明细">🕘' + us.length + '</a>' : '');
   };
-  /** 单次尝试的结果只可能是: 成功(真提交过) / 失败 / 未提交(填了没提交, 不算上传结果) */
-  const attemptBadge = (u) => u.ok === false
-    ? '<span class="badge danger">失败</span>'
-    : (u.submitted === true ? '<span class="badge low">成功</span>' : '<span class="badge" title="填了表但没提交 —— 不是上传结果">未提交</span>');
+  /** 单次尝试的结果: 成功(真提交过) / 已上架(商品在本店铺已上架) / 失败 / 被拦下 / 未提交 */
+  const attemptBadge = (u) => u.preflight === true
+    ? '<span class="badge medium" title="提交前就被拦下(商品已存在/探活没过) —— 一个字节都没发出去, 不是上传结果, 状态不受影响">被拦下</span>'
+    : (u.alreadyListed === true
+      ? '<span class="badge low" title="该商品在本店铺已上架' + (u.noChange ? '(本次要写的内容与线上一致 → 未产生写入)' : '(本次按你的数据更新了这条)') + '">已上架</span>'
+      : (u.ok === false
+        ? '<span class="badge danger">失败</span>'
+        : (u.submitted === true ? '<span class="badge low">成功</span>' : '<span class="badge" title="填了表但没提交 —— 不是上传结果">未提交</span>')));
   /** 展开的"每次尝试"明细(上架记录只做记录 → 这里就是把记录摊开看) */
   const uploadHistoryHtml = (x) => {
     const us = x.uploads || [];
@@ -3130,8 +3575,27 @@ async function renderListing() {
   };
 
   const load = async () => {
-    const q = $('#lsQ').value.trim(), res = $('#lsResult').value;
-    const r = await API('/api/listing/records?limit=500' + (q ? '&q=' + encodeURIComponent(q) : '') + (res ? '&upload=' + encodeURIComponent(res) : ''));
+    const q = $('#lsQ').value.trim(), res = $('#lsResult').value, shop = $('#lsShop').value;
+    /* ★ 2026-10-07 多店铺隔离(网页端补齐): 传 shop → 后端按店铺隔离返回。
+     *   shop 为空 = 后端默认(当前店铺) —— 与上架器"登录什么店铺就用什么数据"同一口径;
+     *   shop=* 看全部(总览/排障), shop=none 看未分类(老数据/商品库来源)。 */
+    const r = await API('/api/listing/records?limit=500' + (q ? '&q=' + encodeURIComponent(q) : '') + (res ? '&upload=' + encodeURIComponent(res) : '') + (shop ? '&shop=' + encodeURIComponent(shop) : ''));
+    /* 店铺下拉的选项来自后端【全局】统计(byShop, 不受当前筛选影响); 用户已选的值要保住,
+     * 否则每次刷新都跳回默认(实测踩过: 选了"全部店铺"一刷新就只剩当前店铺的)。 */
+    const shopEl = $('#lsShop');
+    if (shopEl) {
+      const keep = shopEl.value, byShop = r.byShop || {}, un = byShop['未分类'] || 0;
+      const names = Object.keys(byShop).filter((s) => s !== '未分类').sort();
+      const sig = String(r.currentShop || '') + '|' + names.join(',') + '|' + un;
+      if (shopEl.dataset.sig !== sig) {
+        shopEl.dataset.sig = sig;
+        shopEl.innerHTML = '<option value="">当前店铺' + (r.currentShop ? ('（' + esc(r.currentShop) + '）') : '（未识别）') + '</option>' +
+          '<option value="*">全部店铺</option>' +
+          names.map((s) => '<option value="' + esc(s) + '">🏪 ' + esc(s) + '（' + esc(byShop[s] || 0) + '）</option>').join('') +
+          (un ? '<option value="none">未分类（' + esc(un) + '）</option>' : '');
+        if (keep === '*' || keep === 'none' || names.indexOf(keep) >= 0) shopEl.value = keep;
+      }
+    }
     rows = r.items || [];
     const s = r.stats || {}, up = s.uploads || {}, br = s.byResult || {};
     $('#lsStats').innerHTML = '<div style="display:flex;gap:12px;flex-wrap:wrap">' +
@@ -3144,6 +3608,15 @@ async function renderListing() {
       ((up.topFailReasons || []).length
         ? '<div class="muted" style="margin-top:8px">失败原因 Top: ' +
           up.topFailReasons.map((f) => '<b style="color:#ff8080">' + esc(f.count) + '×</b> ' + esc(f.reason)).join(' · ') + '</div>'
+        : '') +
+      /* ★ 2026-10-07 多店铺隔离: 上面那些统计是【全部店铺】的口径(后端 listingStats 是全量),
+       *   而列表按店铺筛选 —— 不说明白会出现"列表 6 条 / 概览总数 8"看起来像对不上。
+       *   这里把店铺分布和"当前筛选"交代清楚, 口径不含糊。 */
+      (Object.keys(r.byShop || {}).length
+        ? '<div class="muted" style="margin-top:8px">店铺分布(全部): ' + Object.keys(r.byShop).sort((a, b) => r.byShop[b] - r.byShop[a])
+          .map((x) => '<b>' + esc(x) + '</b> ' + esc(r.byShop[x]) + ' 条').join(' · ') +
+          ' · 当前筛选 <b>' + esc(shop === '' ? ('当前店铺（' + (r.currentShop || '未识别') + '）') : (shop === '*' ? '全部店铺' : (shop === 'none' ? '未分类' : shop))) +
+          '</b> → 命中 ' + esc((r.total != null ? r.total : rows.length)) + ' 条(上面的概览是全店铺口径)</div>'
         : '');
 
     if (!rows.length) {
@@ -3152,9 +3625,9 @@ async function renderListing() {
       return;
     }
     rows.forEach((x, i) => { x._i = i; });
-    $('#lsList').innerHTML = '<div style="overflow:auto;max-height:520px"><table style="min-width:1340px">' +
+    $('#lsList').innerHTML = '<div style="overflow:auto;max-height:520px"><table style="min-width:1440px">' +
       '<thead><tr><th style="width:30px"><input type="checkbox" id="lsAll"></th>' +
-      '<th>ASIN</th><th>父ASIN</th><th>站点</th><th>品牌</th><th>标题</th><th>价格</th><th>子体</th>' +
+      '<th>ASIN</th><th>父ASIN</th><th>店铺</th><th>站点</th><th>品牌</th><th>标题</th><th>价格</th><th>子体</th>' +
       '<th>月销</th><th>大排名</th><th>小排名</th><th>配送</th><th>上传结果</th><th>次数</th><th>采集时间</th><th></th></tr></thead><tbody>' +
       rows.map((x, i) => {
         const p = x.panel || {}, v = x.variant || {}, kids = v.children || [];
@@ -3164,6 +3637,8 @@ async function renderListing() {
           '<td><input type="checkbox" class="ls-cb" data-id="' + esc(x.id) + '"></td>' +
           '<td><b>' + esc(x.asin) + '</b></td>' +
           '<td>' + esc(x.parentAsin || '—') + '</td>' +
+          /* ★ 店铺列(多店铺隔离): 记录没归属(老数据/商品库来源) → 显示「未分类」, 不编造 */
+          '<td style="white-space:nowrap">' + (x.shop ? esc(x.shop) : '<span class="muted">未分类</span>') + '</td>' +
           '<td>' + esc((x.site || '').toUpperCase()) + '</td>' +
           '<td>' + esc(x.brand || '') + '</td>' +
           '<td style="max-width:260px">' + esc(String(x.title || '').slice(0, 60)) + '</td>' +
@@ -3178,8 +3653,8 @@ async function renderListing() {
           '<td style="white-space:nowrap">' + esc(String(x.savedAt || '').slice(5, 16)) + '</td>' +
           '<td><button class="btn small ls-del" data-id="' + esc(x.id) + '">删</button></td>' +
           '</tr>' +
-          (us.length ? '<tr class="ls-ups" id="lsUps' + i + '" style="display:none"><td></td><td colspan="15">' + uploadHistoryHtml(x) + '</td></tr>' : '') +
-          '<tr class="ls-kids" id="lsKids' + i + '" style="display:none"><td></td><td colspan="15">' +
+          (us.length ? '<tr class="ls-ups" id="lsUps' + i + '" style="display:none"><td></td><td colspan="16">' + uploadHistoryHtml(x) + '</td></tr>' : '') +
+          '<tr class="ls-kids" id="lsKids' + i + '" style="display:none"><td></td><td colspan="16">' +
           (kids.length
             ? '<div style="max-height:260px;overflow:auto"><table style="min-width:720px"><thead><tr><th>子体 ASIN</th>' +
               (v.dims || []).map((d) => '<th>' + esc(d.nameCn || d.name) + '</th>').join('') +
@@ -3228,6 +3703,12 @@ async function renderListing() {
   $('#lsReload').addEventListener('click', load);
   $('#lsQ').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
   $('#lsResult').addEventListener('change', load);
+  /* ★ 2026-10-07 店铺筛选: 换店铺 → 清空勾选(跨店铺的勾选没有意义) + 重载列表; 上传记录卡片开着就一起刷新 */
+  $('#lsShop').addEventListener('change', () => {
+    sel.clear();
+    load();
+    if ($('#lsLogCard') && $('#lsLogCard').style.display !== 'none') loadLog();
+  });
   /* ★ 2026-09-27 上架器只做记录/显示/导出 —— 动作类按钮默认收起, 需要时展开 */
   $('#lsMoreBtn').addEventListener('click', () => {
     const box = $('#lsMore'), on = box.style.display === 'none';
@@ -3315,18 +3796,22 @@ async function renderListing() {
   let logRows = [];
   const loadLog = async () => {
     const f = $('#lsLogFilter').value;
+    /* ★ 上传流水跟「店铺」筛选走同一口径 —— 否则上面按店铺筛、下面流水还是当前店铺, 两处对不上。
+     *   不传 shop = 后端默认(当前店铺), 与上架器"登录什么店铺就用什么数据"一致。 */
+    const lshop = $('#lsShop') ? $('#lsShop').value : '';
     $('#lsLogInfo').textContent = '⏳ 读取中…';
     let r;
-    try { r = await API('/api/listing/uploads?limit=300' + (f ? '&result=' + encodeURIComponent(f) : '')); }
+    try { r = await API('/api/listing/uploads?limit=300' + (f ? '&result=' + encodeURIComponent(f) : '') + (lshop ? '&shop=' + encodeURIComponent(lshop) : '')); }
     catch (e) { $('#lsLogInfo').textContent = '✗ ' + e.message; return; }
     logRows = r.items || [];
     const st = (r.stats && r.stats.uploads) || {};
     $('#lsLog').innerHTML = logRows.length
-      ? '<div style="overflow:auto;max-height:420px"><table style="min-width:1080px"><thead><tr>' +
-        '<th>时间</th><th>商品</th><th>站点</th><th>第几次</th><th>结果</th><th>填表</th><th>失败字段</th><th>原因(ifast 原话)</th><th>当前状态</th></tr></thead><tbody>' +
+      ? '<div style="overflow:auto;max-height:420px"><table style="min-width:1180px"><thead><tr>' +
+        '<th>时间</th><th>商品</th><th>店铺</th><th>站点</th><th>第几次</th><th>结果</th><th>填表</th><th>失败字段</th><th>原因(ifast 原话)</th><th>当前状态</th></tr></thead><tbody>' +
         logRows.map((u) => '<tr>' +
           '<td style="white-space:nowrap">' + esc(String(u.at || '')) + '</td>' +
           '<td><b>' + esc(u.asin) + '</b><div class="muted" style="max-width:220px">' + esc(String(u.title || '').slice(0, 34)) + '</div></td>' +
+          '<td style="white-space:nowrap">' + (u.shop ? esc(u.shop) : '<span class="muted">未分类</span>') + '</td>' +
           '<td>' + esc(String(u.site || '').toUpperCase()) + '</td>' +
           '<td>#' + esc(u.attempt || '') + '</td>' +
           '<td>' + attemptBadge(u) + '</td>' +
@@ -3352,10 +3837,10 @@ async function renderListing() {
   $('#lsLogCsv').addEventListener('click', async () => {
     if (!logRows.length) { await loadLog(); }
     if (!logRows.length) { $('#lsLogInfo').textContent = '✗ 没有可导出的上传记录'; return; }
-    const head = ['时间', 'ASIN', '站点', '标题', '第几次', '结果', '填表成功项', '填表失败项', '失败字段', '原因', '当前状态', '累计失败次数'];
+    const head = ['时间', 'ASIN', '店铺', '站点', '标题', '第几次', '结果', '填表成功项', '填表失败项', '失败字段', '原因', '当前状态', '累计失败次数'];
     const q = (v) => { const s = v == null ? '' : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s };
-    const csv = [head.join(',')].concat(logRows.map((u) => [u.at, u.asin, u.site, u.title, u.attempt,
-      u.ok === false ? '失败' : (u.submitted === true ? '成功' : '未提交'),
+    const csv = [head.join(',')].concat(logRows.map((u) => [u.at, u.asin, u.shop || '未分类', u.site, u.title, u.attempt,
+      u.preflight === true ? '被拦下' : (u.alreadyListed === true ? '已上架' : (u.ok === false ? '失败' : (u.submitted === true ? '成功' : '未提交'))),
       u.fieldsOk, u.fieldsBad, (u.badFields || []).join('; '), u.reason,
       u.nowStatus, u.failCount].map(q).join(','))).join('\n');
     const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' });
@@ -3373,6 +3858,259 @@ async function renderListing() {
  *   因为这些都是我们最终选出来的品，具有模板或者借鉴意义，方便后续根据这些品来找相应的品」。
  * 本页只做三件事: 归档(存快照) / 检索 / 导出文件 —— 不采集、不上架、不改商品库。
  */
+/* ===== 蓝海选品 (selection): 贴榜单/搜索页 URL → 一键扫描评分 ===== */
+const SEL_KEY = 'zying-selection-url';
+let SEL_STATE = { groups: [], byType: [], candidates: [], items: [], coverage: null, catName: '', site: '', at: '', sort: 'pick', kw: '', minPick: 0, sel: new Set(), ip: {}, cache: null, panel: null };
+
+async function renderSelection() {
+  const content = $('#content');
+  const lastUrl = localStorage.getItem(SEL_KEY) || 'https://www.amazon.co.uk/gp/bestsellers/sports/';
+  content.innerHTML = `
+    <div class="notice">🎯 <b>蓝海选品</b> —— 贴一个 Amazon <b>榜单页/搜索页</b> URL, 一次扫描同时读出:
+      标题·价格·评分·<b>评论数</b>·<b>品牌</b>·<b>重量</b>·变体·卖家(含 Amazon 自营)·跟卖数·A+, 然后按
+      <b>五维(市场/增长/竞争/壁垒/利润)</b> 给类目打分, 并挑出「上榜但评论少 / 卖得动但评分低」的候选。
+      只读不写商品库 —— 看中的勾上再「加入商品库」, 之后去商品管理走「一键补采」补详情。</div>
+
+    <div class="card">
+      <div class="card-title">① 扫描</div>
+      <div class="section-gap" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+        <div class="filter-item" style="flex:1;min-width:420px"><label>Amazon 列表/榜单 URL</label>
+          <input id="selUrl" class="input" style="width:100%" value="${esc(lastUrl)}"
+            placeholder="https://www.amazon.co.uk/gp/bestsellers/sports/ 或 /s?k=flashlight"></div>
+        <div class="filter-item"><label>翻页</label>
+          <select id="selPages" class="input" style="width:80px">
+            <option value="1">1 页</option><option value="2" selected>2 页</option>
+            <option value="3">3 页</option><option value="5">5 页</option>
+          </select></div>
+        <div class="filter-item"><label>等插件(毫秒)</label>
+          <input id="selWait" class="input" type="number" style="width:96px" value="12000" min="3000" max="40000" step="1000"
+            title="智赢插件要时间分析面板(品牌/重量/卖家); 榜单页第一次可给 15000"></div>
+        <div class="filter-item"><label>候选价带</label>
+          <input id="selPmin" class="input" type="number" style="width:70px" value="10" title="价带下限(站点本币)">
+          <span class="muted">–</span>
+          <input id="selPmax" class="input" type="number" style="width:70px" value="45" title="价带上限"></div>
+        <button id="selRun" class="btn btn-primary">🚀 开始扫描</button>
+        <span id="selMsg" class="muted"></span>
+      </div>
+      <div class="muted" style="margin-top:6px">扫描会占用 ERP 那个浏览器标签页约 20–60 秒 (翻页越多越久); 期间别手动操作那个标签。</div>
+    </div>
+
+    <div id="selResult"></div>`;
+
+  $('#selUrl').addEventListener('change', (e) => localStorage.setItem(SEL_KEY, e.target.value.trim()));
+  $('#selRun').addEventListener('click', runSelectionScan);
+
+  // 已有结果 → 直接回显 (刷新/切页不丢)
+  try {
+    const r = await API('/api/select/last');
+    if (r && r.ok) {
+      Object.assign(SEL_STATE, {
+        groups: r.groups || [], byType: r.byType || [], candidates: r.candidates || [],
+        coverage: r.coverage, catName: r.catName || '', site: r.site || '', at: r.at || '',
+        sort: 'pick', kw: '', minPick: 0, sel: new Set(),
+      });
+      $('#selUrl').value = r.url || $('#selUrl').value;
+      renderSelectionResult();
+      $('#selMsg').textContent = '已回显最近一次扫描 (' + (r.at || '') + ')';
+    }
+  } catch (e) { /* 没有历史结果, 正常 */ }
+}
+
+async function runSelectionScan() {
+  const url = $('#selUrl').value.trim();
+  if (!/^https:\/\/(www\.)?amazon\./.test(url)) { showModal({ title: 'URL 不对', body: '请填完整 https://www.amazon.xxx/... 列表页或榜单页地址' }); return; }
+  localStorage.setItem(SEL_KEY, url);
+  const btn = $('#selRun'), msg = $('#selMsg');
+  btn.disabled = true;
+  const t0 = Date.now();
+  const tick = setInterval(() => { msg.textContent = '扫描中… ' + Math.round((Date.now() - t0) / 1000) + 's (翻页 + 等插件分析)'; }, 1000);
+  msg.textContent = '扫描中…';
+  try {
+    const r = await API('/api/select/scan', {
+      method: 'POST',
+      body: JSON.stringify({
+        url: url,
+        maxPages: Number($('#selPages').value) || 1,
+        waitPluginMs: Number($('#selWait').value) || 12000,
+        priceMin: Number($('#selPmin').value) || 10,
+        priceMax: Number($('#selPmax').value) || 45,
+      }),
+    });
+    Object.assign(SEL_STATE, {
+      groups: r.groups || [], byType: r.byType || [], candidates: r.candidates || [], items: r.items || [],
+      coverage: r.coverage, catName: r.catName || '', site: r.site || '', at: r.at || '',
+      sort: 'pick', kw: '', minPick: 0, sel: new Set(), ip: {}, cache: r.cache || null, panel: r.panel || null,
+    });
+    renderSelectionResult();
+    msg.textContent = '完成: ' + (r.items || []).length + ' 条, 候选 ' + (r.candidates || []).length + ' 个, 用时 ' + Math.round((Date.now() - t0) / 1000) + 's';
+  } catch (e) {
+    msg.textContent = '';
+    showModal({ title: '扫描失败', body: String(e.message || e) + '<br><br><span class="muted">常见原因: ① ERP 浏览器没切到本机 Edge (浏览器面板 → 切到用户浏览器) ② 那个标签页被验证码拦了 ③ 插件没注入(未登录)</span>' });
+  } finally {
+    clearInterval(tick);
+    btn.disabled = false;
+  }
+}
+
+function renderSelectionResult() {
+  const box = $('#selResult');
+  const S = SEL_STATE;
+  const cov = S.coverage;
+  if (!cov) { box.innerHTML = ''; return; }
+  const covRow = [
+    ['价格', cov.price], ['评分', cov.rating], ['评论', cov.reviews], ['品牌', cov.brand],
+    ['重量', cov.weight], ['细分类', cov.ptype],
+  ].map(([k, v]) => {
+    const pctv = cov.total ? Math.round(v / cov.total * 100) : 0;
+    const cls = pctv >= 80 ? 'ok' : pctv >= 40 ? 'warn' : 'bad';
+    return `<span class="muted" style="margin-right:10px">${k} <b class="${cls}">${v}/${cov.total}</b> (${pctv}%)</span>`;
+  }).join('');
+
+  const grpRows = S.groups.map((g) => `<tr>
+    <td><b>${esc(g.label)}</b></td><td class="num">${g.n}</td><td class="num">${fmtMoney(g.medPrice, 'GBP')}</td>
+    <td class="num">${fmtNum(g.medRev)}</td><td class="num ${g.light >= 0.15 ? 'ok' : ''}">${g.light == null ? '-' : Math.round(g.light * 100) + '%'}</td>
+    <td class="num ${g.amazonShare >= 0.4 ? 'bad' : ''}">${g.amazonShare == null ? '-' : Math.round(g.amazonShare * 100) + '%'}</td>
+    <td class="num">${g.top3Share == null ? '-' : Math.round(g.top3Share * 100) + '%'}</td>
+    <td class="num">${g.medWeightG == null ? '-' : g.medWeightG + 'g'}</td>
+    <td class="num"><b>${g.score == null ? '-' : g.score}</b></td>
+    <td class="muted" style="font-size:11px">${g.parts ? Object.entries(g.parts).map(([k, v]) => k + ':' + (v == null ? '—' : v)).join(' ') : ''}</td>
+  </tr>`).join('');
+
+  const typeRows = (S.byType || []).slice(0, 8).map((g) => `<tr>
+    <td>${esc(g.label)}</td><td class="num">${g.n}</td><td class="num">${fmtMoney(g.medPrice, 'GBP')}</td>
+    <td class="num">${fmtNum(g.medRev)}</td><td class="num">${g.light == null ? '-' : Math.round(g.light * 100) + '%'}</td>
+    <td class="num">${g.top3Share == null ? '-' : Math.round(g.top3Share * 100) + '%'}</td>
+    <td class="num"><b>${g.score == null ? '-' : g.score}</b></td></tr>`).join('');
+
+  box.innerHTML = `
+    <div class="card">
+      <div class="card-title">② 数据体检 <span class="muted" style="margin-left:auto;font-weight:400">${esc(S.catName)} · ${esc(S.site)} · ${esc(S.at)}</span></div>
+      <div class="section-gap">${covRow}</div>
+      <div class="muted" style="margin-top:4px">覆盖度决定结论能不能用: 评论/品牌低于 60% 时, 五维里的「竞争/增长」只能算参考。
+        榜单页没面板的商品会缺品牌/重量 —— 想补全就勾上它们「加入商品库」后走「一键补采」。</div>
+      ${(S.panel || S.cache) ? `<div class="muted" style="margin-top:6px">
+        插件面板: 就绪 <b>${S.panel ? (S.panel.filled + '/' + S.panel.panels) : '?'}</b>${S.panel && S.panel.waitedMs ? ' (等待 ' + Math.round(S.panel.waitedMs / 1000) + 's)' : ''}
+        · 面板缓存复用 <b>${S.cache ? (S.cache.usedForThisScan || 0) : 0}</b> 条 / 本次新存 <b>${S.cache ? (S.cache.rememberedNow || 0) : 0}</b> 条 (缓存共 ${S.cache ? (S.cache.totalAsins || 0) : 0} 个 ASIN)
+        —— 同一个品扫过第二次就不用再等面板</div>` : ''}
+    </div>
+
+    <div class="card">
+      <div class="card-title">③ 类目五维 <span class="muted" style="margin-left:auto;font-weight:400">市场20 增长25 竞争20 壁垒20 利润15 · 缺项按已得满分折成百分制</span></div>
+      <table class="table"><thead><tr>
+        <th>类目</th><th class="num">样本</th><th class="num">中位价</th><th class="num">评论中位</th>
+        <th class="num" title="评论<200 的商品占比 —— 越高说明新品越能挤进榜">新品可挤</th>
+        <th class="num" title="Amazon 自营占比 —— 越高越难抢">自营</th>
+        <th class="num" title="Top3 品牌占样本比例 —— 越低越分散">Top3品牌</th>
+        <th class="num">中位重量</th><th class="num">五维分</th><th>分项</th>
+      </tr></thead><tbody>${grpRows || '<tr><td colspan="10" class="muted">样本不足 8 条, 不给结论</td></tr>'}</tbody></table>
+      ${typeRows ? `<div class="muted" style="margin:10px 0 4px"><b>细分类</b> (插件「商品类型」, 样本≥8)</div>
+        <table class="table"><thead><tr><th>细分类</th><th class="num">样本</th><th class="num">中位价</th>
+        <th class="num">评论中位</th><th class="num">新品可挤</th><th class="num">Top3品牌</th><th class="num">五维分</th></tr></thead>
+        <tbody>${typeRows}</tbody></table>` : ''}
+    </div>
+
+    <div class="card">
+      <div class="card-title">④ 候选品
+        <span style="margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-weight:400">
+          <input id="selKw" class="input" style="width:150px" placeholder="过滤标题/品牌" value="${esc(S.kw)}">
+          <select id="selSort" class="input" style="width:132px">
+            <option value="pick" ${S.sort === 'pick' ? 'selected' : ''}>按候选分</option>
+            <option value="reviews" ${S.sort === 'reviews' ? 'selected' : ''}>按评论数↑</option>
+            <option value="price" ${S.sort === 'price' ? 'selected' : ''}>按价格↑</option>
+            <option value="weight" ${S.sort === 'weight' ? 'selected' : ''}>按重量↑</option>
+            <option value="rank" ${S.sort === 'rank' ? 'selected' : ''}>按榜单排名↑</option>
+          </select>
+          <button id="selIp" class="btn">🔎 商标查重 (选中)</button>
+          <button id="selToProd" class="btn">＋ 加入商品库 (选中)</button>
+          <a class="btn" href="/api/select/export?type=candidates" style="text-decoration:none">⬇ 候选CSV</a>
+          <a class="btn" href="/api/select/export?type=all" style="text-decoration:none">⬇ 全部CSV</a>
+        </span></div>
+      <div id="selCandTable" class="section-gap"></div>
+    </div>`;
+
+  const refresh = () => { renderSelectionCandTable(); };
+  $('#selKw').addEventListener('input', (e) => { S.kw = e.target.value.trim().toLowerCase(); refresh(); });
+  $('#selSort').addEventListener('change', (e) => { S.sort = e.target.value; refresh(); });
+  $('#selIp').addEventListener('click', async () => {
+    let asins = [...S.sel];
+    if (!asins.length) asins = (S.candidates || []).slice(0, 12).map((c) => c.asin);
+    if (!asins.length) { showModal({ title: '没有可查的', body: '先勾选候选品 (不勾就查当前前 12 个)' }); return; }
+    const btn = $('#selIp'); btn.disabled = true; btn.textContent = '查询中…';
+    try {
+      const r = await API('/api/select/ip-check', { method: 'POST', body: JSON.stringify({ asins, site: S.site }) });
+      const map = {};
+      for (const x of r.results || []) map[x.asin] = x;
+      S.ip = { ...S.ip, ...map };
+      const hi = (r.results || []).filter((x) => x.risk === 'high').length;
+      refresh();
+      showModal({ title: '商标查重完成', body: `查了 ${asins.length} 个品牌: <b class="bad">高风险 ${hi}</b> / 中 ${(r.results || []).filter((x) => x.risk === 'medium').length} / 低 ${(r.results || []).filter((x) => x.risk === 'low').length}` + ((r.results || []).some((x) => x.error) ? '<br><span class="muted">部分查不了: ' + (r.results || []).filter((x) => x.error).map((x) => x.asin.slice(-4) + ' ' + x.error).slice(0, 3).join('; ') + '</span>' : '') });
+    } catch (e) { showModal({ title: '查重失败', body: String(e.message || e) }); }
+    finally { btn.disabled = false; btn.textContent = '🔎 商标查重 (选中)'; }
+  });
+  $('#selToProd').addEventListener('click', async () => {
+    const asins = [...S.sel];
+    if (!asins.length) { showModal({ title: '没选品', body: '先在候选表里勾选要入库的商品' }); return; }
+    try {
+      const r = await API('/api/select/to-products', { method: 'POST', body: JSON.stringify({ asins }) });
+      showModal({ title: '已入库', body: '新增 <b>' + r.added + '</b> 个 (商品库共 ' + r.total + ' 条)。<br><br>下一步: 去「商品管理」勾选这些品 → 「一键补采」补详情页(价格/月销/BSR/A+)。' });
+      S.sel = new Set(); refresh();
+    } catch (e) { showModal({ title: '入库失败', body: String(e.message || e) }); }
+  });
+  refresh();
+}
+
+function renderSelectionCandTable() {
+  const S = SEL_STATE;
+  let rows = (S.candidates || []).slice();
+  if (S.kw) rows = rows.filter((c) => (String(c.title || '') + ' ' + String(c.brand || '')).toLowerCase().includes(S.kw));
+  const sorters = {
+    pick: (a, b) => b.pick - a.pick,
+    reviews: (a, b) => (a.reviews || 0) - (b.reviews || 0),
+    price: (a, b) => (a.price || 0) - (b.price || 0),
+    weight: (a, b) => (a.weightG || 9e9) - (b.weightG || 9e9),
+    rank: (a, b) => (a.rank || 9e9) - (b.rank || 9e9),
+  };
+  rows.sort(sorters[S.sort] || sorters.pick);
+  const head = `<thead><tr><th style="width:26px"></th><th class="num">分</th><th>类目/细分类</th><th class="num">排名</th>
+    <th class="num">价</th><th class="num">评分</th><th class="num">评论</th><th class="num">重量</th>
+    <th>品牌</th><th>商标</th><th>命中卡片</th><th>标题</th></tr></thead>`;
+  const ipBadge = (c) => {
+    const r = S.ip[c.asin];
+    if (!r) return '<span class="muted">-</span>';
+    if (r.error) return `<span class="muted" title="${esc(r.error)}">?</span>`;
+    if (r.risk === 'high') return `<span class="bad" title="命中 ${r.hits} 条, 其中有效 ${r.alive} 条">高${r.alive || ''}</span>`;
+    if (r.risk === 'medium') return `<span class="warn" title="命中 ${r.hits} 条 (未见有效注册)">中</span>`;
+    return '<span class="ok">低</span>';
+  };
+  if (!rows.length) {
+    $('#selCandTable').innerHTML = `<table class="table">${head}<tbody><tr><td colspan="12" class="muted">没有候选。
+      候选只留「评论<300 且上榜前60」或「评分≤4.2 且上榜前30」的品 —— 这个页面本身可能太成熟(老品盘踞), 换榜单或加页数再试。</td></tr></tbody></table>`;
+    return;
+  }
+  const body = rows.map((c) => `<tr>
+    <td><input type="checkbox" class="sel-ck" data-asin="${esc(c.asin)}" ${S.sel.has(c.asin) ? 'checked' : ''}></td>
+    <td class="num"><b>${c.pick}</b></td>
+    <td>${esc(c.catName || '')}${c.ptype ? '<br><span class="muted" style="font-size:11px">' + esc(c.ptype) + '</span>' : ''}</td>
+    <td class="num">${c.rank ? '#' + c.rank : '-'}</td>
+    <td class="num">${fmtMoney(c.price, 'GBP')}</td>
+    <td class="num ${c.rating && c.rating <= 4.2 ? 'warn' : ''}">${c.rating == null ? '-' : c.rating}</td>
+    <td class="num">${fmtNum(c.reviews)}</td>
+    <td class="num">${c.weightG == null ? '-' : c.weightG + 'g'}</td>
+    <td>${esc(c.brand || '-')}${c.amazonSeller ? ' <span class="bad">AMZ</span>' : ''}</td>
+    <td>${ipBadge(c)}</td>
+    <td style="font-size:11px">${(c.cards || []).map((x) => '<span class="tag">' + esc(x) + '</span>').join(' ')}</td>
+    <td style="max-width:320px;font-size:11.5px">${esc(String(c.title || '').slice(0, 90))}
+      <a href="https://www.amazon.${c.site === 'uk' ? 'co.uk' : (c.site || 'com')}/dp/${esc(c.asin)}" target="_blank" rel="noopener" style="margin-left:4px">↗</a></td>
+  </tr>`).join('');
+  $('#selCandTable').innerHTML = `<table class="table">${head}<tbody>${body}</tbody></table>
+    <div class="muted" style="margin-top:6px">共 ${rows.length} 个候选 · 卡片含义:
+      低竞争上榜=排名靠前但评论<300 / 热销低评分=卖得动但评分≤4.2 / 价带合适 / 轻小件≤500g / 无自营 / 冷启动=评论<10(已扣10分, 需人工核)</div>`;
+  $$('.sel-ck').forEach((ck) => ck.addEventListener('change', (e) => {
+    const a = e.target.dataset.asin;
+    if (e.target.checked) SEL_STATE.sel.add(a); else SEL_STATE.sel.delete(a);
+  }));
+}
+
 async function renderArchive() {
   const content = $('#content');
   const d = new Date(), p2 = (n) => String(n).padStart(2, '0');
@@ -3447,6 +4185,7 @@ async function renderArchive() {
         </span>
       </div>
       <div class="section-gap" id="arFilters" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+        <div class="filter-item"><label>店铺</label><select id="arShop" class="input" style="width:168px" title="按店铺筛归档 —— 多店铺隔离: 归档条目带店铺, 店铺之间不会互相覆盖(同 ASIN 在不同店铺是两条)"></select></div>
         <div class="filter-item"><label>类目</label><select id="arCat1" class="input" style="width:150px"><option value="">全部类目</option></select></div>
         <div class="filter-item"><label>利润 ≥</label><input id="arMarginMin" class="input" type="number" step="0.05" style="width:80px" placeholder="如 0.3"></div>
         <div class="filter-item"><label>月销 ≥</label><input id="arSalesMin" class="input" type="number" style="width:80px" placeholder="如 300"></div>
@@ -3479,7 +4218,7 @@ async function renderArchive() {
   const Q = (o) => Object.keys(o).filter((k) => o[k] !== '' && o[k] != null).map((k) => k + '=' + encodeURIComponent(String(o[k]))).join('&');
   const fv = (id) => { const el = $('#' + id); return el && String(el.value).trim() ? String(el.value).trim() : '' };
   const filterQs = () => Q({
-    dedup: $('#arDedup').value, q: fv('arQ'), site: fv('arStatSite'), cat1: fv('arCat1'), tag: fv('arTag'),
+    dedup: $('#arDedup').value, q: fv('arQ'), site: fv('arStatSite'), shop: fv('arShop'), cat1: fv('arCat1'), tag: fv('arTag'),
     marginMin: fv('arMarginMin'), salesMin: fv('arSalesMin'), rankMax: fv('arRankMax'),
     priceMin: fv('arPriceMin'), priceMax: fv('arPriceMax'), batchId: curBatch,
   });
@@ -3490,6 +4229,9 @@ async function renderArchive() {
     add('排名≤', fv('arRankMax'));
     if (fv('arPriceMin') || fv('arPriceMax')) parts.push('价格 ' + (fv('arPriceMin') || '0') + '~' + (fv('arPriceMax') || '∞'));
     add('标签', fv('arTag')); add('站点', String(fv('arStatSite')).toUpperCase()); add('搜索', fv('arQ'));
+    /* ★ 店铺筛选的文案要说人话: * = 全部, none = 未分类, 其余就是店铺名 */
+    const sh = fv('arShop');
+    if (sh) add('店铺', sh === '*' ? '全部店铺' : (sh === 'none' ? '未分类' : sh));
     return parts.length ? '当前筛选: ' + parts.join(' · ') : '未加筛选';
   };
 
@@ -3502,14 +4244,35 @@ async function renderArchive() {
     : (it.bearMargin != null ? '<span class="muted">设定 ' + (it.bearMargin * 100).toFixed(0) + '%</span>' : '<span class="muted">—</span>');
 
   const loadHead = async () => {
+    /* ★ 2026-10-07 多店铺隔离(网页端补齐): 归档默认看【全部店铺】(归档是"库", 不是"这轮要上的清单"),
+     *   但必须能按店铺看/筛 —— 选项来自后端 byShop(全局统计), 并保住用户已选的值。 */
     const r = await API('/api/archive/list');
     const s = r.stats || {};
+    const byShop = r.byShop || {};
+    const shopEl = $('#arShop');
+    if (shopEl) {
+      const keep = shopEl.value;
+      const names = Object.keys(byShop).filter((x) => x !== '未分类').sort();
+      const un = byShop['未分类'] || 0;
+      const sig = names.join(',') + '|' + un;
+      if (shopEl.dataset.sig !== sig) {
+        shopEl.dataset.sig = sig;
+        shopEl.innerHTML = '<option value="*">全部店铺</option>' +
+          names.map((x) => '<option value="' + esc(x) + '">🏪 ' + esc(x) + '（' + esc(byShop[x] || 0) + '）</option>').join('') +
+          (un ? '<option value="none">未分类（' + esc(un) + '）</option>' : '');
+        if (keep && (keep === 'none' || keep === '*' || names.indexOf(keep) >= 0)) shopEl.value = keep;
+      }
+    }
+    const shopLine = Object.keys(byShop).length
+      ? '<div class="muted" style="margin-top:8px">店铺分布: ' + Object.keys(byShop).sort((a, b) => byShop[b] - byShop[a])
+        .map((x) => '<b>' + esc(x) + '</b> ' + esc(byShop[x]) + ' 条').join(' · ') + '</div>'
+      : '';
     $('#arStats').innerHTML = '<div style="display:flex;gap:12px;flex-wrap:wrap">' +
       [['批次数', s.batches || 0], ['归档条目', s.items || 0], ['去重后唯一品', s.unique || 0],
        ['最近归档', s.lastArchivedAt ? String(s.lastArchivedAt).slice(5, 16) : '—'],
        ['站点', Object.keys(s.bySite || {}).join('/') || '—']]
         .map((kv) => '<div class="filter-item" style="min-width:118px"><label>' + kv[0] + '</label>' +
-          '<div style="font-size:19px;font-weight:700">' + esc(kv[1]) + '</div></div>').join('') + '</div>';
+          '<div style="font-size:19px;font-weight:700">' + esc(kv[1]) + '</div></div>').join('') + '</div>' + shopLine;
 
     const bs = r.batches || [];
     $('#arBatches').innerHTML = bs.length
@@ -3649,10 +4412,12 @@ async function renderArchive() {
     $('#arSelInfo').textContent = '命中 ' + r.total + ' 条' + (r.total > items.length ? ' (只显示前 ' + items.length + ' 条, 导出是全部)' : '') +
       (curBatch ? ' · 只看批次 ' + curBatch : '') + (curBatch ? ' —— 再点一次「只看这批」可取消' : '');
     if (!items.length) { $('#arList').innerHTML = '<div class="empty">没有匹配的归档商品</div>'; return; }
-    $('#arList').innerHTML = '<div style="overflow:auto;max-height:560px"><table style="min-width:1420px"><thead><tr>' +
-      '<th>站点</th><th>ASIN</th><th>品牌</th><th>标题</th><th>售价</th><th>承受价</th><th>利润率</th>' +
+    $('#arList').innerHTML = '<div style="overflow:auto;max-height:560px"><table style="min-width:1520px"><thead><tr>' +
+      '<th>店铺</th><th>站点</th><th>ASIN</th><th>品牌</th><th>标题</th><th>售价</th><th>承受价</th><th>利润率</th>' +
       '<th>月销</th><th>大排名</th><th>变体</th><th>标签</th><th>状态</th><th>归档时间</th><th>链接</th></tr></thead><tbody>' +
       items.map((it) => '<tr>' +
+        /* ★ 店铺列(多店铺隔离): 归档条目带 shop; 商品库来源/老数据没有归属 → 「未分类」(不编造) */
+        '<td style="white-space:nowrap">' + (it.shop ? esc(it.shop) : '<span class="muted">未分类</span>') + '</td>' +
         '<td>' + esc(String(it.site || '').toUpperCase()) + '</td>' +
         '<td><b>' + esc(it.asin) + '</b>' + (it.dup ? ' <span class="badge medium" title="以前也归档过' + esc(it.firstArchivedAt || '') + '">重</span>' : '') + '</td>' +
         '<td>' + esc(it.brand || '') + '</td>' +
@@ -3734,13 +4499,14 @@ async function renderArchive() {
   /* ★ 筛选条: 应用/重置 + 下拉即时生效(数字框回车或点「应用筛选」) */
   const applyFilters = () => { loadItems(); loadStats(); };
   $('#arApply').addEventListener('click', applyFilters);
-  ['arCat1', 'arTag', 'arMarginMin', 'arSalesMin', 'arRankMax', 'arPriceMin', 'arPriceMax'].forEach((id) => {
+  ['arCat1', 'arTag', 'arMarginMin', 'arSalesMin', 'arRankMax', 'arPriceMin', 'arPriceMax', 'arShop'].forEach((id) => {
     const el = $('#' + id);
     if (el) el.addEventListener('change', applyFilters);
     if (el) el.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyFilters(); });
   });
   $('#arResetFilter').addEventListener('click', () => {
     ['arCat1', 'arTag', 'arMarginMin', 'arSalesMin', 'arRankMax', 'arPriceMin', 'arPriceMax', 'arStatSite'].forEach((id) => { const el = $('#' + id); if (el) el.value = ''; });
+    const sh = $('#arShop'); if (sh) sh.value = '*';      // 店铺回到"全部店铺"(归档是库, 默认看全)
     const q = $('#arQ'); if (q) q.value = '';
     applyFilters();
   });
