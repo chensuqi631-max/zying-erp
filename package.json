@@ -1,6 +1,6 @@
 {
   "name": "zying-erp",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "智赢ERP 搞薯条：亚马逊选品/跟卖分析（采集 · 商品库 · 统一筛选 · FBA/FBM/自营利润测算 · 找货源以图搜图 · 导出Excel）— DeepSeek Harness 插件",
   "keywords": [
     "dsh-plugin",

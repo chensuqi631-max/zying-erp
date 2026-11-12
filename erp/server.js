@@ -19,6 +19,10 @@ const ROOT = __dirname;
 const DATA = process.env.ZYING_DATA ? path.resolve(process.env.ZYING_DATA) : path.join(ROOT, 'data');
 const PUBLIC = path.join(ROOT, 'public');
 const PORT = parseInt(process.argv[2] || '3088', 10);
+/* ★ 2026-11-12 安全修复（市场评审指出）: 默认只监听本机回环, 不再监听所有网卡。
+ *   原来 listen(PORT) 不带 host → 局域网内任何设备都能连; 而文档写的是 127.0.0.1。
+ *   要给平板/另一台电脑用, 显式设 ZYING_HOST=0.0.0.0 (这时请自行评估局域网暴露风险)。 */
+const HOST = String(process.env.ZYING_HOST || '127.0.0.1').trim() || '127.0.0.1';
 
 /* ===== 落盘策略: 攒批次 + 去抖 + 轮转备份 =====================================
  * 原来 save() 是"写一次盘 = 拷贝一份整库备份 + 写一次全量 JSON":
@@ -2243,7 +2247,11 @@ function correctCompliance(product, userVerdict) {
 }
 
 // ===== 真实采集 (fetch 抓 amazon 页面 + 智赢 API 补全, 失败降级历史数据) =====
-const ZYING_TOKEN = process.env.ZYING_TOKEN || 'MM8bsEamq2WZsswHw5Hgx3hbr8Kjhn0Kr3sHhf1Uf0hjInRhF18EKMkvONK0xrczk5WneCMCSZ6FtjfzNbrE0dfnpc1588PW6nn3LN8odtpzbl1AGa9eHJ5tVtwJYJ6Gi';
+/* ★ 2026-11-12 安全修复（市场评审 fkysly 指出）: 这里原来把智赢服务令牌写成了默认值,
+ *   而本文件已公开发布到 GitHub —— 等于把账号令牌公开了。
+ *   现在只从环境变量读取; 没配就走"无令牌"分支（相关补采直接跳过, 不报错也不偷用别人的）。
+ *   如果你之前用的是自己账号的令牌, 请去智赢后台轮换掉那个旧的。 */
+const ZYING_TOKEN = String(process.env.ZYING_TOKEN || '').trim();
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const SITE_DOMAIN = { uk: 'co.uk', us: 'com', de: 'de', fr: 'fr', it: 'it', es: 'es', jp: 'co.jp', ca: 'ca', in: 'in', mx: 'com.mx', au: 'com.au', nl: 'nl', pl: 'pl', se: 'se', sa: 'sa', sg: 'sg', br: 'com.br', tr: 'com.tr' };
 
@@ -9689,7 +9697,8 @@ async function realCollect(opts = {}) {
     let sales = null, trademarkCount = hist.trademarkCount != null ? hist.trademarkCount : 0, shipByAmazon = hist.fba === 'FBA' ? true : hist.fba === 'FBM' ? false : null;
 
     // 尝试智赢 API (限流 1.2s), 失败静默降级
-    try {
+    // ★ 没配 ZYING_TOKEN 就整段跳过: 不再内置默认令牌, 也不发无效请求
+    if (ZYING_TOKEN) try {
       await new Promise((r) => setTimeout(r, 1200));
       const d = await fetchPostJson(`https://amazon.zying.net/api/zbig/MoreAboutAsin/${site}`, [{ Asin: it.asin, Brand: brand, Categories: [category], FirstCategory: category, BSR: String(it.rank) }], { 'ext_version': '5.1.6', 'token': ZYING_TOKEN, 'timestamp': String(Math.floor(Date.now() / 1000)), 'appclient': '3', 'version': 'v1.1', 'signature': '' });
       const dd = d && d.data ? d.data : d;
@@ -9698,7 +9707,7 @@ async function realCollect(opts = {}) {
       trademarkCount = rec.BrandSourceDetails ? rec.BrandSourceDetails.length : trademarkCount;
     } catch {}
 
-    try {
+    if (ZYING_TOKEN) try {
       await new Promise((r) => setTimeout(r, 1200));
       const d = await fetchPostJson(`https://amazon.zying.net/api/zbig/MoreAboutAsin/v3/${site}`, [{ Asin: it.asin, Brand: brand, Categories: [category], FirstCategory: category, BSR: String(it.rank) }], { 'ext_version': '5.1.6', 'token': ZYING_TOKEN, 'timestamp': String(Math.floor(Date.now() / 1000)), 'appclient': '3', 'version': 'v1.1', 'signature': '' });
       const dd = d && d.data ? d.data : d;
@@ -10729,7 +10738,14 @@ const opHandler = (req, res) => {
     let j = {};
     try { if (body) j = JSON.parse(body); } catch {}
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    /* ★ 2026-11-12 安全修复（市场评审指出）: 原来无条件回 Access-Control-Allow-Origin: *,
+     *   配合监听所有网卡, 任何网页都能直接向本机后端发请求并读数据。
+     *   现在只对回环来源放行 —— DSH 界面在不同端口(如 57561), 所以仍需放行 127.0.0.1/localhost 的任意端口。 */
+    const reqOrigin = String((req.headers && req.headers.origin) || '');
+    if (/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(reqOrigin)) {
+      res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+      res.setHeader('Vary', 'Origin');
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     const send = (code, data) => {
@@ -16885,7 +16901,7 @@ function extraPortGuard(port, token) {
       if (mm && mm[1] === token) { req.url = mm[2] || '/'; return opHandler(req, res) }
       const hdr = String((req.headers && req.headers['x-zy-token']) || '');
       if (hdr && hdr === token) return opHandler(req, res);
-      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' });
+      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
       return res.end(JSON.stringify({ ok: false, error: '缺少共享口令 —— 请用弹窗里给出的完整地址(形如 http://IP:端口/zy/口令)', port: port }));
     } catch (e) { try { res.writeHead(500); res.end('{"ok":false}') } catch (e2) {} }
   };
@@ -17020,8 +17036,9 @@ if (require.main === module) {
       });
     } catch (e) { /* Windows 部分信号不支持 */ }
   }
-  server.listen(PORT, () => {
+  server.listen(PORT, HOST, () => {
     console.log(`✔ 亚马逊跟卖ERP Demo 已启动`);
+    console.log(`  监听: ${HOST}:${PORT}` + (HOST === '127.0.0.1' ? '（仅本机；局域网共享请设 ZYING_HOST=0.0.0.0）' : '（局域网可访问）'));
     console.log(`  浏览器访问: http://127.0.0.1:${PORT}`);
     /* ★ 2026-10-24: 恢复上次开启的共享端口(标记为 enabled 的) */
     try { extraPortRestore(); } catch (e) { console.error('[ports] 恢复失败: ' + ((e && e.message) || e)) }
