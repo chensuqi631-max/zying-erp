@@ -37,7 +37,27 @@ const PUBKEY_FILE = path.join(ROOT, 'tools', 'license-pub.pem'); // 随产品分
 // ---------- 设备指纹 ----------
 // 用"稳定但换机就变"的硬件信息做指纹: 主机名 + 平台 + CPU 型号 + 首个物理网卡 MAC
 // 注意: 不做唯一性哈希则同一型号机器会撞; 加主机名与网卡即可区分
-function deviceFingerprint() {
+/* ★ 2026-11-13 修: 指纹原来取"第一个非内部网卡 MAC" —— 换 Wi-Fi/手机热点/VPN 就会变,
+ *   实测本机从 B833D41F8D436EEF 变成 DC714B5C5E81066E(连手机热点后), 授权直接失效。
+ *   现在主指纹改用【Windows MachineGuid】(跟网络无关), 并把旧的 MAC 指纹保留为"别名",
+ *   这样历史授权仍能通过验证(verify 时对 aliases 取交集)。 */
+let _fpCache = null;
+function stableMachineId() {
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync('reg query "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid', { encoding: 'utf8', timeout: 4000, windowsHide: true });
+    const m = String(out).match(/MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]{20,})/);
+    if (m) return 'mg:' + m[1].toLowerCase();
+  } catch (e) {}
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync('wmic csproduct get uuid', { encoding: 'utf8', timeout: 4000, windowsHide: true });
+    const m = String(out).match(/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/);
+    if (m) return 'uuid:' + m[0].toLowerCase();
+  } catch (e) {}
+  return '';
+}
+function legacyMacFingerprint() {
   const nets = os.networkInterfaces();
   let mac = '';
   for (const k of Object.keys(nets)) {
@@ -49,6 +69,17 @@ function deviceFingerprint() {
   const raw = [os.hostname(), os.platform(), os.arch(), (os.cpus()[0] || {}).model || '', mac].join('|');
   return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16).toUpperCase();
 }
+/** 返回本机所有可接受的指纹: [主指纹(稳定), 旧 MAC 指纹(兼容历史授权)] */
+function fingerprints() {
+  if (_fpCache) return _fpCache.slice();
+  const base = [os.hostname(), os.platform(), os.arch(), (os.cpus()[0] || {}).model || '', String(os.totalmem())].join('|');
+  const mid = stableMachineId();
+  const primary = crypto.createHash('sha256').update(base + '|' + mid).digest('hex').slice(0, 16).toUpperCase();
+  const legacy = legacyMacFingerprint();
+  _fpCache = primary === legacy ? [primary] : [primary, legacy];
+  return _fpCache.slice();
+}
+function deviceFingerprint() { return fingerprints()[0]; }
 
 // ---------- 工具 ----------
 const b64 = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -91,9 +122,10 @@ function verifyLicenseText(text) {
     if (Date.now() > exp.getTime()) return { ok: false, reason: 'expired', msg: '授权已到期 (' + payload.exp + ')', payload };
   }
   // 设备绑定 (payload.devices 为空/不存在 = 不绑定设备)
-  const fp = deviceFingerprint();
-  if (Array.isArray(payload.devices) && payload.devices.length && payload.devices.indexOf(fp) < 0) {
-    return { ok: false, reason: 'device-mismatch', msg: '授权未包含本机 (本机指纹 ' + fp + ', 授权机器数 ' + payload.devices.length + ')', payload, fingerprint: fp };
+  const fps = fingerprints();
+  const fp = fps[0];
+  if (Array.isArray(payload.devices) && payload.devices.length && !payload.devices.some((d) => fps.indexOf(String(d).toUpperCase()) >= 0)) {
+    return { ok: false, reason: 'device-mismatch', msg: '授权未包含本机 (本机指纹 ' + fps.join(' / ') + ', 授权机器数 ' + payload.devices.length + ')', payload, fingerprint: fp, fingerprints: fps };
   }
   return { ok: true, reason: 'ok', payload, fingerprint: fp };
 }
@@ -145,4 +177,4 @@ function hasFeature(name) {
   return v.payload.features.indexOf(name) >= 0 || v.payload.features.indexOf('all') >= 0;
 }
 
-module.exports = { deviceFingerprint, verifyLicenseText, licenseStatus, hasFeature, enforceEnabled, LICENSE_FILE, LICENSE_CANDIDATES, existingLicenseFile, CONFIG_FILE, PUBKEY_FILE, DATA };
+module.exports = { deviceFingerprint, fingerprints, legacyMacFingerprint, verifyLicenseText, licenseStatus, hasFeature, enforceEnabled, LICENSE_FILE, LICENSE_CANDIDATES, existingLicenseFile, CONFIG_FILE, PUBKEY_FILE, DATA };

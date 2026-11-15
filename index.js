@@ -52,6 +52,48 @@ export const name = 'zying-collect';
 export const inject = ['tools'];
 
 export function apply(ctx) {
+  /* ─── 同源代理：浏览器 → /api/zying-proxy → 本机 ERP(3088) ───
+   * 为什么必须这样：DSH 的 Web 页面以 dsh-app:// 安全协议加载，
+   * 页面里直接 fetch('http://127.0.0.1:3088') 会被浏览器按【混合内容】拦掉
+   * （报 Failed to fetch，请求根本到不了 3088 —— 实测服务端请求日志为空）。
+   * 官方插件同样用 connection.fetch.register 走同源，这里照做。
+   */
+  try { ctx.inject(['connection'], (scope) => {
+    const connection = scope.get('connection');
+    if (!connection || !connection.fetch || typeof connection.fetch.register !== 'function') return;
+    scope.effect(() => connection.fetch.register({
+      path: '/api/zying-proxy',
+      methods: ['POST'],
+      requestBody: 'buffered',
+      async fetch(request) {
+        const json = (status, payload) => new Response(JSON.stringify(payload), {
+          status, headers: { 'content-type': 'application/json' },
+        });
+        if (request.method !== 'POST') return json(405, { ok: false, error: '只支持 POST' });
+        let body;
+        try { body = await request.json(); } catch (e) { return json(400, { ok: false, error: '请求体不是合法 JSON' }); }
+        const p = String((body && body.path) || '');
+        if (!p.startsWith('/api/')) return json(400, { ok: false, error: 'path 必须以 /api/ 开头' });
+        const method = String((body && body.method) || 'GET').toUpperCase();
+        try {
+          if (!(await isUp(1200))) await ensureErp().catch(() => null);
+          const opt = { method, headers: {} };
+          if (body && body.body !== undefined && body.body !== null && method !== 'GET') {
+            opt.headers['content-type'] = 'application/json';
+            opt.body = typeof body.body === 'string' ? body.body : JSON.stringify(body.body);
+          }
+          const r = await fetch(API + p, opt);
+          const t = await r.text();
+          let js = null, jsonError = null;
+          try { js = t ? JSON.parse(t) : null; } catch (e) { jsonError = String((e && e.message) || e); }
+          return json(200, { ok: r.ok, status: r.status, json: js, text: t, jsonError });
+        } catch (e) {
+          return json(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) });
+        }
+      },
+    }), 'zying-erp: 同源代理 /api/zying-proxy');
+  }); } catch (e) { /* 宿主不支持 connection.fetch 时静默降级（客户端会走直连兜底） */ }
+
   // 自动拉起本地后端: 市场一键安装的用户装完插件、重启 DSH 就能直接用
   // (已在运行则什么都不做, 不会干扰手动启动的开发环境)
   ensureErp(ctx).catch((e) => console.log('[zying-erp] 自动启动失败: ' + (e && e.message)));
@@ -62,7 +104,7 @@ export function apply(ctx) {
     async () => {
       const up = await isUp(1500);
       if (!up) return { online: false, note: '本地后端没在运行。插件启动时已尝试自动拉起; 若仍不在, 可在插件目录手动执行: node erp/server.js 3088' };
-      const p = await sys('/api/products');
+      const p = await sys('/api/products?limit=1&slim=1');   // ★ 只要 total, 别拉全库(40MB 会压垮宿主 RPC)
       const lic = await license();
       return {
         online: true, total: p.total, time: new Date().toISOString(),
@@ -116,6 +158,116 @@ export function apply(ctx) {
       return { site: r.site, total: r.total, preFiltered: r.preFiltered, skippedByList: r.skippedByList, enriched: r.enriched, productCount: r.productCount, added: r.added };
     })),
     'zying list-filtered');
+
+  ctx.effect(() => ctx.tools.register(tool('zying_collect_url',
+    '【默认采集方式】给一个 Amazon 列表页/品牌页 URL：先用本地无头浏览器翻页读出全部 ASIN（不依赖智赢插件、不弹窗），' +
+    '再用本地签名的数据接口批量取数入库（品牌·BSR·价格·上架日·月销·卖点·尺寸·备案等）。' +
+    '比页面采集快 3~8 倍且可后台跑；评分/评论/A+/图集接口没有，需另用商品管理「补采」。',
+    {
+      url: { type: 'string', required: true, description: 'Amazon 列表页 URL（搜索/类目/品牌店铺页）' },
+      maxPages: { type: 'number', description: '无头浏览器翻几页找品（1-10，默认 2）' },
+      maxItems: { type: 'number', description: '最多取多少个 ASIN（默认 120）' },
+      limit: { type: 'number', description: '实际采集入库上限（默认与 maxItems 相同）' },
+      withTitle: { type: 'boolean', description: '是否补标题/主图（默认 true，只补缺）' },
+      wait: { type: 'boolean', description: '是否等采完再返回（默认 false）' },
+    },
+    async (a) => {
+      const started = await sys('/api/collect/direct', {
+        url: a.url, maxPages: a.maxPages || 2, maxItems: a.maxItems || 120,
+        mode: 'given', limit: a.limit || 0, withTitle: a.withTitle !== false,
+      }, 180000);
+      if (!started || !started.ok) return started;
+      if (!a.wait) return { started: true, found: started.found, job: started.job, tip: '用 GET /api/collect/direct/status 看进度' };
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const st = await sys('/api/collect/direct/status', undefined, 20000);
+        if (!st || !st.running) return { found: started.found, result: st };
+      }
+    })),
+    'zying collect-url');
+
+  ctx.effect(() => ctx.tools.register(tool('zying_collect_direct',
+    '直连采集(推荐): 不经过浏览器/智赢插件, 直接用本地签名的数据接口按 ASIN 批量取商品数据并写库。' +
+    '可补/更新 品牌·制造商·BSR(两级)·BuyBox价·运费·FBA·卖家·跟卖数·上架日·月销·变体·五点·品牌备案·尺寸重量。' +
+    '速度约 150~500ms/条(接口限流时会慢), 长任务后台跑; 用 zying_collect_status 看进度。' +
+    '不返回 评分/评论/A+/图集(接口没有, 需页面补采)。',
+    {
+      asins: { type: 'array', description: 'ASIN 数组 (10位)。不传则按 mode 从库里挑' },
+      mode: { type: 'string', enum: ['given', 'missing', 'all'], description: 'given=只采给定 ASIN; missing=按 needs 挑库里缺字段的; all=该站点全部' },
+      needs: { type: 'array', description: 'mode=missing 时缺哪些就采: brand / bsr / firstAvailable / title / price / bullets' },
+      site: { type: 'string', description: '站点 (de/uk/us/fr/es/it/jp/ca/au…), 默认 de' },
+      limit: { type: 'number', description: '本次最多处理多少条 (0=不限)' },
+      withTitle: { type: 'boolean', description: '是否顺便补标题/主图 (默认 true, 只补缺)' },
+      wait: { type: 'boolean', description: '是否等跑完再返回 (默认 false, 立即返回任务信息)' },
+    },
+    async (a) => {
+      const started = await sys('/api/collect/direct', {
+        asins: a.asins || undefined,
+        mode: a.mode || (a.asins && a.asins.length ? 'given' : 'missing'),
+        needs: a.needs || undefined,
+        site: a.site || 'de',
+        limit: a.limit || 0,
+        withTitle: a.withTitle !== false,
+      }, 60000);
+      if (!started || !started.ok) return started;
+      if (!a.wait) return { started: true, job: started.job, tip: '用 zying_collect_status 或 GET /api/collect/direct/status 看进度' };
+      const t0 = Date.now();
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const st = await sys('/api/collect/direct/status', undefined, 20000);
+        if (!st || !st.running) return st;
+        if (Date.now() - t0 > 30 * 60 * 1000) return { timeout: true, last: st };
+      }
+    })),
+    'zying collect-direct');
+
+  ctx.effect(() => ctx.tools.register(tool('zying_ifast_status',
+    'ifast.top 直连状态：返回登录态是否有效、跟卖方案（sellingId）列表、站点（siteId）列表。上架前先跑这个确认。',
+    {},
+    async () => {
+      const r = await sys('/api/ifast/status', undefined, 40000);
+      return { ok: r.ok, cookieSet: r.cookieSet, shops: r.shops, sites: r.sites, error: r.error || null };
+    })),
+    'zying ifast-status');
+
+  ctx.effect(() => ctx.tools.register(tool('zying_ifast_list',
+    'ifast 在架商品查询：可按 ASIN / 站点 / 跟卖方案筛，返回 itemStatus（0待上传 10检查 20成功 30失败 40暂停）。用于查重与上架结果回查。',
+    {
+      asinSearch: { type: 'string', description: '按 ASIN 精确查' },
+      siteId: { type: 'string', description: '站点 id（如 69132=DE，来自 zying_ifast_status）' },
+      sellingId: { type: 'string', description: '跟卖方案 id' },
+      page: { type: 'number', description: '页码，默认 1' },
+      limit: { type: 'number', description: '每页条数，默认 20' },
+    },
+    async (a) => {
+      const r = await sys('/api/ifast/items', { asinSearch: a.asinSearch || '', siteId: a.siteId || '', sellingId: a.sellingId || '', page: a.page || 1, limit: a.limit || 20 }, 60000);
+      return { ok: r.ok, total: r.total, items: (r.items || []).map((x) => ({ id: x.id, asin: x.asin, country: x.country, siteId: x.siteId, sellingId: x.sellingId, itemStatus: x.itemStatus, initPrice: x.initPrice, lowerPrice: x.lowerPrice, onOff: x.onOff })), error: r.error || null };
+    })),
+    'zying ifast-list');
+
+  ctx.effect(() => ctx.tools.register(tool('zying_ifast_add',
+    '上架到 ifast.top：批量/多变体一次提交（同站点已存在会自动跳过），可选 autoUpload=true 立即提交到亚马逊。' +
+    '站点/跟卖方案先用 zying_ifast_status 查 id。',
+    {
+      site: { type: 'string', description: '站点字母 DE/UK/FR/IT/ES/AU（也可传 siteId）' },
+      siteId: { type: 'string', description: '站点 id（优先于 site）' },
+      sellingName: { type: 'string', description: '跟卖方案名，如 全天跟卖 / 午夜（也可传 sellingId）' },
+      sellingId: { type: 'string', description: '跟卖方案 id' },
+      stock: { type: 'number', description: '库存，默认 100' },
+      leadDays: { type: 'number', description: '备货周期天数，默认 5' },
+      onOff: { type: 'number', description: '上架开关 1/0，默认 1' },
+      autoUpload: { type: 'boolean', description: '提交后立即 item_upload.json 提交亚马逊' },
+      items: { type: 'array', description: '[{asin, initPrice, lowerPrice, title?, brand?, image?}]' },
+    },
+    async (a) => {
+      const r = await sys('/api/ifast/add', {
+        site: a.site || '', siteId: a.siteId || '', sellingName: a.sellingName || '', sellingId: a.sellingId || '',
+        stock: a.stock == null ? 100 : a.stock, leadDays: a.leadDays == null ? 5 : a.leadDays,
+        onOff: a.onOff == null ? 1 : a.onOff, autoUpload: a.autoUpload === true, items: a.items || [],
+      }, 180000);
+      return r;
+    })),
+    'zying ifast-add');
 
   ctx.effect(() => ctx.tools.register(tool('zying_follow_shop',
     '商品跟卖并行采集: 输入商品 URL/ASIN, 从 aod 实时提取全部跟卖卖家, 并行采集各卖家店铺商品入库 (全程 CDP, 耗时较长)。返回店铺成功/失败数/采集商品数。',

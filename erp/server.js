@@ -144,6 +144,12 @@ const productInsight = require('./product-insight.js');
 /* ★ 2026-10-03 新增: 智赢插件 API 通道 —— 复用插件自己的签名请求层, 直接拿结构化 JSON,
  *   取代"开页面读 DOM"(8~13s/商品 → 实测 43ms/商品)。详见 _dev-tools\ZYING-API-逆向成果.md */
 const zyApi = require('./zying-api.js');
+const zyStandalone = require('./zy-standalone.js');
+const headlessFinder = require('./headless-finder.js');
+const zyAccounts = require('./zy-accounts.js');
+const ifastClient = require('./ifast-client.js');
+const zyFreight = require('./zy-freight.js');
+const variantColor = require('./variant-color.js');   // 变体颜色识别   // 智赢实时运价（逆向 RPC）   // ifast.top 直连（上架系统）   // 智赢账号密码统一保管（AES-256-GCM）   // 无头浏览器找品（只拿 ASIN，不依赖智赢插件）   // 智赢数据源直连通道（逆向 5.2.0 签名）
 
 /* 批量知产查重的作业状态(内存态, 重启即清) —— 查重是"一串串行外部请求",
  * 一次批量几十分钟, 不能让 HTTP 连接挂着等, 所以学采集那样做成"后台跑 + 轮询进度"。 */
@@ -1686,7 +1692,7 @@ function archiveItemFromProduct(x) {
  *   · 键带店铺(archiveKeyOf) → 店铺之间不会互相覆盖
  *   · blocked 的不写归档: 拦截 = 没上架 */
 const ARCHIVE_LISTING_BATCH_ID = 'listing-live';
-function archiveAddListing(r) {
+function archiveAddListing(r, opts) {
   if (!r || !r.asin || !r.site) return null;
   if (isBlockedRow(r)) return null;
   if ((r.status || '') !== 'listed') return null;
@@ -1717,8 +1723,10 @@ function archiveAddListing(r) {
     b.bySite[k] = (b.bySite[k] || 0) + 1;
   }
   b.count = b.keys.length;
-  archiveTrim();
-  save('selection-archive.json', selectionArchive, true);
+  if (!(opts && opts.noSave)) {
+    archiveTrim();
+    save('selection-archive.json', selectionArchive, true);
+  }
   return { key: it.key, shop: it.shop, site: it.site, asin: it.asin, at, batchId: b.batchId, first: !prev, times: selectionArchive.items[it.key].times };
 }
 /** 按 shop → site 二级分组(ERP 客户端的归档页就用这个渲染) */
@@ -2298,7 +2306,6 @@ const HISTORY = loadHistory();
 //   也可运行时用 POST /api/browser/switch 强制指定。
 const browserSvc = require('./browser-service.js');
 const CDP_PORT_USER = 9222;                 // 用户的采集浏览器
-const SHELL_CDP_PORT = 9334;                  // ★ 2026-09-28 桌面浏览器壳(Electron)的 CDP 端口 —— 采集可以直接跑在它里面
 let cdpPortOverride = null;                 // 'user' | 具体端口号 | null(自动)
 let browserSvcLastErr = null;               // 本地浏览器最近一次启动/停止的错误(给界面看)
 /* 「服务器」页用的活动流水(环形缓冲, 最多 300 条): 浏览器起停/切换、采集起止都记一条 */
@@ -2327,7 +2334,6 @@ function setBrowserPrefMode(m) {
 async function activeCdpPort() {
   if (process.env.ZYING_CDP_PORT) return Number(process.env.ZYING_CDP_PORT);
   if (cdpPortOverride === 'user') return CDP_PORT_USER;
-  if (cdpPortOverride === 'shell') return SHELL_CDP_PORT;   // ★ 采集跑在桌面浏览器壳里
   if (typeof cdpPortOverride === 'number') return cdpPortOverride;
   try {
     const st = await browserSvc.status();
@@ -2392,49 +2398,6 @@ async function ensureCollectBrowser(reason) {
   try { return await collectBootBusy; } finally { collectBootBusy = null; }
 }
 
-/* ★ 2026-09-28 桌面浏览器壳的启停(给 status?action=shell 复用; /api/browser/shell 那套逻辑不变)
- *   注意必须清掉 ELECTRON_RUN_AS_NODE: DSH 环境里带着它, 不清掉 electron.exe 会被当普通 node 跑,
- *   不报错但窗口永远不出来(实测踩过)。 */
-/* ★ 2026-09-28 换机器友好: 壳目录可配置 —— 环境变量 ZYING_SHELL_DIR > 数据目录 paths.json 的 shellDir > 默认值 */
-function shellDirOf() {
-  const fromEnv = String(process.env.ZYING_SHELL_DIR || '').trim();
-  if (fromEnv) return fromEnv;
-  try { const cfg = load('paths.json', {}) || {}; if (cfg.shellDir) return String(cfg.shellDir); } catch (e) {}
-  return 'D:\\智赢erp\\zying-browser-shell';
-}
-function shellProbe() {
-  return new Promise((resolve) => {
-    const rq = http.request({ host: '127.0.0.1', port: SHELL_CDP_PORT, path: '/json/version', method: 'GET', timeout: 2000 }, (rs) => {
-      let d = ''; rs.on('data', (c) => d += c);
-      rs.on('end', () => { try { resolve(JSON.parse(d)) } catch (e) { resolve(null) } });
-    });
-    rq.on('error', () => resolve(null));
-    rq.on('timeout', () => { rq.destroy(); resolve(null) });
-    rq.end();
-  });
-}
-async function shellEnsureStart() {
-  const dir = shellDirOf();
-  const exe = path.join(dir, 'node_modules', 'electron', 'dist', 'electron.exe');
-  if (!fs.existsSync(exe)) { browserSvcLastErr = '没找到 Electron: ' + exe; return null; }
-  if (await shellProbe()) return SHELL_CDP_PORT;
-  const ps = 'Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue;' +
-    ' Start-Process -FilePath ' + JSON.stringify(exe) + ' -ArgumentList @(' + JSON.stringify(dir) + ')' +
-    ' -WorkingDirectory ' + JSON.stringify(dir) + ' -PassThru | Select-Object -ExpandProperty Id';
-  await new Promise((resolve) => {
-    require('child_process').execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 25000 }, () => resolve());
-  });
-  for (let i = 0; i < 40; i++) { await new Promise((r) => setTimeout(r, 500)); if (await shellProbe()) return SHELL_CDP_PORT; }
-  browserSvcLastErr = '浏览器壳起来了但 CDP 9334 没响应';
-  return null;
-}
-function shellEnsureStop() {
-  const ps = "$p = Get-CimInstance Win32_Process -Filter \"Name='electron.exe'\" | Where-Object { $_.CommandLine -like '*zying-browser-shell*' };" +
-    ' foreach ($x in $p) { taskkill /PID $($x.ProcessId) /T /F | Out-Null }; ($p | Measure-Object).Count';
-  return new Promise((resolve) => {
-    require('child_process').execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 20000 }, (e, out) => resolve(e ? -1 : parseInt(String(out).trim(), 10) || 0));
-  });
-}
 const CDP_SITE_CODE = { 'co.uk': 'uk', com: 'us', de: 'de', fr: 'fr', it: 'it', es: 'es', 'co.jp': 'jp', ca: 'ca', in: 'in', 'com.au': 'au', 'com.mx': 'mx', 'com.br': 'br', nl: 'nl', se: 'se', pl: 'pl' };
 // 站点代码 → amazon 域名后缀 (含自定义站点: au/mx/br/nl/se/pl/tr/ae/sa/sg 等)
 function siteToHostSuffix(site) {
@@ -3960,6 +3923,302 @@ function apiJobPublic() {  if (!zyApiJob) return { running: false, total: 0 };
 /* ══════════════════════════════════════════════════════════════════════════
  * BG 检测（Brand Gating）辅助函数 —— 接口语义见 /api/bg/check 路由处的大段注释
  * ══════════════════════════════════════════════════════════════════════════ */
+let bgScanJob = null;
+function bgScanJobPublic() {
+  if (!bgScanJob) return { running: false, total: 0 };
+  const j = bgScanJob;
+  return {
+    running: j.running, startedAt: j.startedAt, finishedAt: j.finishedAt || null,
+    aid: j.aid, abbr: j.abbr || null, accountName: j.accountName || null, mode: j.mode,
+    total: j.total, done: j.done, failed: j.failed, stat: j.stat || {},
+    samples: j.samples || [], channel: j.channel || 'standalone',
+    stopped: j.stopped, error: j.error, lastError: j.lastError || null, gapMs: j.gapMs,
+  };
+}
+/* ══════════════════════════════════════════════════════════════════════
+ * 直连采集（2026-11-14）
+ *   不经过浏览器 / 智赢插件：本地签名直调智赢数据接口，拿商品数据写库。
+ *   字段口径完全复用 mergeZyApiRecord（与「API 采集」写出来的数据一致）。
+ *   速度：v2 每批 20 条；标题（simple）每批 3 条且只在缺标题时补。
+ * ══════════════════════════════════════════════════════════════════════ */
+let directJob = null;
+
+/* ══════════ ★ 2026-11-15 HTTP 采集通道（彻底不依赖页面渲染）══════════
+ * 背景: 无头浏览器里 /dp/ 商品页的渲染进程会卡死（Runtime.evaluate / Page.navigate 超时），
+ *   导致 aod/跟卖/品牌/多链接 四种"页面驱动"采集全部失败。
+ * 方案: 全部改用「cookie + HTTP」：
+ *   · 卖家列表  → 智赢数据源 offers[].sellerId（接口自带，无需页面）
+ *   · 店铺商品  → https://www.amazon.<站点>/s?me=<sellerId>&page=N 的 HTML 里解析 data-asin
+ *   · 品牌商品  → /s?k=<brand>&page=N 同理
+ *   · 商品数据  → 原有 zyStandalone.moreAboutAsin（接口批量）
+ */
+const HC_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0';
+const HC_LANG = { de: 'de-DE,de;q=0.9', uk: 'en-GB,en;q=0.9', fr: 'fr-FR,fr;q=0.9', it: 'it-IT,it;q=0.9', es: 'es-ES,es;q=0.9', au: 'en-AU,en;q=0.9', us: 'en-US,en;q=0.9', ca: 'en-CA,en;q=0.9', jp: 'ja-JP,ja;q=0.9' };
+async function hcFetch(site, pathOrUrl) {
+  const st = String(site || 'de').toLowerCase();
+  const host = 'www.amazon.' + siteToHostSuffix(st);
+  const url = /^https?:\/\//.test(String(pathOrUrl)) ? String(pathOrUrl) : ('https://' + host + String(pathOrUrl));
+  const ck = await getAmazonCookieHeader(st, false);
+  const r = await fetch(url, {
+    headers: {
+      'user-agent': HC_UA, cookie: ck.header,
+      'accept-language': HC_LANG[st] || 'en-US,en;q=0.9',
+      accept: 'text/html,application/xhtml+xml',
+    },
+  });
+  const html = await r.text();
+  return { status: r.status, html: html, url: url };
+}
+function hcAsins(html) {
+  const out = []; const seen = new Set();
+  const re = /data-asin="([A-Z0-9]{10})"/g; let m;
+  while ((m = re.exec(String(html || '')))) { if (!seen.has(m[1])) { seen.add(m[1]); out.push(m[1]); } }
+  return out;
+}
+/** 某个商品的全部跟卖卖家（数据源 offers，不碰页面） */
+async function hcSellersOf(asin, site) {
+  const asinU = String(asin || '').toUpperCase();
+  /* 用 raw 接口: 映射后的记录只保留 sellerId/offers 计数，raw 里才有 Offers[].SellerId 全量卖家 */
+  const r = await zyStandalone.moreAboutAsinRaw([asinU], String(site || 'de').toLowerCase(), { gapMs: 120, retries: 2, timeoutMs: 25000 })
+    .catch(() => ({ data: {} }));
+  const rec = (r && r.data && r.data[asinU]) || {};
+  const offers = rec.Offers || rec.offers || [];
+  const out = []; const seen = new Set();
+  const AMZ_IDS = /^(ATVPDKIKX0DER|A3P5ROKL5A1OLE|A1AT7YVPFBWXBL|A1F83G8C2ARO7P|A13V1IB3VIYZZH|A1PA6795UKMFR9|APJ6JRA9NG5V4|A1RKKUPIHCS9HS)$/;
+  for (const o of offers) {
+    const id = String((o && (o.SellerId || o.sellerId)) || '').trim();
+    if (!id || seen.has(id)) continue;
+    if (AMZ_IDS.test(id)) continue;
+    const nm = String(o.SellerName || o.sellerName || '');
+    if (/amazon/i.test(nm)) continue;
+    seen.add(id);
+    out.push({ sellerId: id, name: nm || null, buyBox: !!(o.IsBuyBoxWinner || o.buyBox) });
+  }
+  return out;
+}
+async function hcShopAsins(sellerId, site, pages, maxItems) {
+  const set = new Set();
+  const lp = Math.max(1, Math.min(10, Number(pages) || 1));
+  for (let p2 = 1; p2 <= lp; p2++) {
+    const r = await hcFetch(site, '/s?me=' + encodeURIComponent(sellerId) + '&page=' + p2);
+    if (r.status !== 200) break;
+    const got = hcAsins(r.html);
+    if (!got.length) break;
+    for (const a of got) set.add(a);
+    if (maxItems && set.size >= maxItems) break;
+    await new Promise((r2) => setTimeout(r2, 350));
+  }
+  const arr = [...set];
+  return maxItems ? arr.slice(0, maxItems) : arr;
+}
+async function hcBrandAsins(brand, site, pages, maxItems) {
+  const set = new Set();
+  const lp = Math.max(1, Math.min(10, Number(pages) || 1));
+  for (let p2 = 1; p2 <= lp; p2++) {
+    const r = await hcFetch(site, '/s?k=' + encodeURIComponent(String(brand)) + '&page=' + p2);
+    if (r.status !== 200) break;
+    const got = hcAsins(r.html);
+    if (!got.length) break;
+    for (const a of got) set.add(a);
+    if (maxItems && set.size >= maxItems) break;
+    await new Promise((r2) => setTimeout(r2, 350));
+  }
+  const arr = [...set];
+  return maxItems ? arr.slice(0, maxItems) : arr;
+}
+/** 批量入库（复用直连采集的字段合并逻辑） */
+async function hcSaveAsins(asins, site, opts) {
+  const o = opts || {};
+  const out = { created: 0, updated: 0, unchanged: 0, failed: 0, items: [] };
+  const byAsin = new Map(products.map((x, i) => [x.asin, i]));
+  const needTitle = [];
+  for (let i = 0; i < asins.length; i += 20) {
+    const chunk = asins.slice(i, i + 20);
+    const rawRes = await zyStandalone.moreAboutAsinRaw(chunk, site, { gapMs: 250, retries: 2, timeoutMs: 25000 }).catch(() => ({ data: {}, failedAsins: chunk }));
+    const rawMap = rawRes.data || {};
+    for (const asin of chunk) {
+      const rec = rawMap[asin];
+      if (!rec) { out.failed++; continue; }
+      const idx = byAsin.get(asin);
+      const isNew = idx == null;
+      const it = isNew ? { asin: asin, site: site, source: o.source || 'http-collect', createdAt: now() } : products[idx];
+      const snap = {};
+      for (const k of Object.keys(DC_TRACK)) snap[k] = it[k];
+      try {
+        mergeZyApiRecord(it, rec);
+        const offers = Array.isArray(it.offers) ? it.offers : [];
+        const bb = offers.find((x) => x.buyBox) || offers[0] || null;
+        if (bb && bb.listing != null && bb.listing > 0) {
+          it.price = bb.listing;
+          if (!dcText(it.currency) && bb.currency) it.currency = dcText(bb.currency, 8);
+        }
+        if (isNew) it.title = dcText(it.title, 500);
+        if (o.withTitle !== false && !dcText(it.title)) needTitle.push(asin);
+        const merged = applyRankFields(it);
+        products[isNew ? products.length : idx] = merged;
+        if (isNew) { byAsin.set(asin, products.length - 1); out.created++; }
+        else out.updated++;
+        out.items.push({ asin: asin, brand: merged.brand || null, price: merged.price == null ? null : merged.price });
+      } catch (e) { out.failed++; }
+    }
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  if (o.withTitle !== false && needTitle.length) {
+    for (let i = 0; i < needTitle.length; i += 3) {
+      const part = needTitle.slice(i, i + 3);
+      const ti = await zyStandalone.titlesImages(part, site).catch(() => ({}));
+      for (const [asin, v] of Object.entries(ti)) {
+        const idx = byAsin.get(asin);
+        if (idx == null) continue;
+        const it = products[idx];
+        const title = dcText(v && v.title, 500);
+        if (title && !dcText(it.title)) it.title = title;
+        const img = dcText(v && v.image, 500);
+        if (img && !it.mainImage) { it.mainImage = img; if (!it.image) it.image = img; }
+      }
+      await new Promise((r) => setTimeout(r, 80));
+    }
+  }
+  save('products.json', products);
+  return out;
+}
+/** 四种页面驱动的采集方式 → 统一改走 HTTP */
+async function hcCollectMode(mode, j) {
+  const site = String(j.site || 'de').toLowerCase();
+  const maxItems = Math.max(0, Number(j.maxItems) || 10);
+  const maxPages = Math.max(1, Math.min(10, Number(j.maxPages) || 1));
+  const rec = { mode: mode, site: site, transport: 'http', startedAt: now() };
+
+  if (mode === 'aod' || mode === 'batch') {
+    const urls = [];
+    if (Array.isArray(j.urls)) urls.push(...j.urls);
+    if (j.url) urls.push(j.url);
+    if (Array.isArray(j.asins)) urls.push(...j.asins);
+    if (j.asins && typeof j.asins === 'string') urls.push(...String(j.asins).split(/[,\s]+/));
+    const asinList = [];
+    for (const u of urls) {
+      const m = String(u || '').match(/([A-Z0-9]{10})(?!.*[A-Z0-9]{10})/i);
+      if (m) asinList.push(m[1].toUpperCase());
+    }
+    const uniq = [...new Set(asinList)];
+    rec.products = [];
+    rec.errors = [];
+    let allAsins = new Set();
+    let shopOk = 0, shopFail = 0;
+    const maxShops = Math.max(0, Number(j.maxShops) || 0);
+    for (const asin of uniq) {
+      let sellers = [];
+      try { sellers = await hcSellersOf(asin, site); } catch (e) { sellers = []; }
+      if (maxShops) sellers = sellers.slice(0, maxShops);
+      rec.products.push({ asin: asin, sellerCount: sellers.length, sellers: sellers.map((x) => x.sellerId) });
+      for (const sl of sellers) {
+        try {
+          const got = await hcShopAsins(sl.sellerId, site, maxPages, maxItems);
+          if (got.length) { shopOk++; got.forEach((a) => allAsins.add(a)); }
+          else shopFail++;
+        } catch (e) { shopFail++; rec.errors.push(String((e && e.message) || e).slice(0, 120)); }
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+    const list = [...allAsins];
+    const saved = await hcSaveAsins(list, site, { source: 'http-' + mode });
+    Object.assign(rec, { productCount: list.length, added: saved.created, updated: saved.updated, failed: saved.failed, shopOk: shopOk, shopFail: shopFail });
+    return rec;
+  }
+
+  if (mode === 'brand') {
+    let brands = [];
+    if (Array.isArray(j.brands)) brands = j.brands;
+    else if (j.brands) brands = String(j.brands).split(/[,，]/);
+    brands = brands.map((x) => String(x || '').trim()).filter(Boolean);
+    if (!brands.length) {
+      const limit = Math.max(1, Math.min(20, Number(j.brandsLimit) || 2));
+      const site2 = String(j.site || '').toLowerCase();
+      const cnt = new Map();
+      for (const p of products) {
+        if (site2 && String(p.site || '') !== site2) continue;
+        const b = String(p.brand || '').trim();
+        if (!b || /^(generic|unbranded|unknown)$/i.test(b)) continue;
+        cnt.set(b, (cnt.get(b) || 0) + 1);
+      }
+      brands = [...cnt.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map((x) => x[0]);
+    }
+    const perBrand = Math.max(1, Number(j.maxPerBrand) || 5);
+    const all = new Set(); const per = [];
+    for (const b of brands) {
+      let got = [];
+      try { got = await hcBrandAsins(b, site, maxPages, perBrand); } catch (e) { got = []; }
+      per.push({ brand: b, count: got.length });
+      got.forEach((a) => all.add(a));
+    }
+    const list = [...all];
+    const saved = await hcSaveAsins(list, site, { source: 'http-brand' });
+    Object.assign(rec, { brands: per, productCount: list.length, added: saved.created, updated: saved.updated });
+    return rec;
+  }
+
+  /* shoplinks: 店铺链接 / 商品链接 / 品牌链接 */
+  const urls = (Array.isArray(j.urls) ? j.urls : (j.url ? [j.url] : []));
+  const all = new Set(); const per = [];
+  for (const u of urls) {
+    const su = String(u || '').trim();
+    if (!su) continue;
+    const sellerId = (su.match(/seller=([A-Z0-9]{8,})/i) || su.match(/\/s\?me=([A-Z0-9]{8,})/i) || [])[1];
+    const asin = (su.match(/\/dp\/([A-Z0-9]{10})/i) || [])[1];
+    let got = [];
+    if (sellerId) got = await hcShopAsins(sellerId, site, maxPages, maxItems);
+    else if (asin) {
+      const sellers = await hcSellersOf(asin, site).catch(() => []);
+      for (const sl of sellers.slice(0, 6)) {
+        const g2 = await hcShopAsins(sl.sellerId, site, maxPages, maxItems);
+        got.push(...g2);
+      }
+    }
+    per.push({ url: su, count: got.length });
+    got.forEach((a) => all.add(a));
+  }
+  const list = [...all];
+  const saved = await hcSaveAsins(list, site, { source: 'http-links' });
+  Object.assign(rec, { links: per, productCount: list.length, added: saved.created, updated: saved.updated });
+  return rec;
+}
+
+function directJobPublic() {
+  if (!directJob) return { running: false, total: 0 };
+  const j = directJob;
+  return {
+    running: j.running, startedAt: j.startedAt, finishedAt: j.finishedAt || null,
+    site: j.site, mode: j.mode, total: j.total, done: j.done,
+    created: j.created, updated: j.updated, unchanged: j.unchanged, failed: j.failed,
+    titlesFetched: j.titlesFetched, brandFixed: j.brandFixed || 0, fieldHits: j.fieldHits, ms: j.ms, perItemMs: j.perItemMs,
+    samples: j.samples, stopped: j.stopped, error: j.error, lastLog: j.lastLog || null,
+    chunkFailed: j.chunkFailed || 0,
+    localeFix: j.localeFix || null, bgFilled: j.bgFilled || 0, bgError: j.bgError || null,
+    variantsFilled: j.variantsFilled || 0, variantError: j.variantError || null,
+  };
+}
+/** 文本清洗：null/空串/纯空白 → null；超长截断 */
+function dcText(v, max) {
+  if (v == null) return null;
+  const s = String(v).replace(/\s+/g, ' ').trim();
+  if (!s) return null;
+  return max && s.length > max ? s.slice(0, max) : s;
+}
+/** 「缺这些字段」的判定表（mode=missing 时用） */
+const DC_NEED = {
+  brand: (it) => !it.brand || it.brand === 'Unknown',
+  bsr: (it) => it.bsrShop == null,
+  firstAvailable: (it) => !it.firstAvailable,
+  title: (it) => !dcText(it.title),
+  price: (it) => it.price == null || it.price === 0,
+  bullets: (it) => !(Array.isArray(it.bulletPoints) && it.bulletPoints.length),
+};
+/** 统计「由空变有」的字段（精确，不做假计数） */
+const DC_TRACK = {
+  brand: 'brand', bsrShop: 'bsr', price: 'price', firstAvailable: 'first_available',
+  monthlySales: 'monthly_sales', followCount: 'offers', brandHasRecord: 'brand_record',
+};
+
 let bgJob = null;
 function bgJobPublic() {
   if (!bgJob) return { running: false, total: 0 };
@@ -3979,17 +4238,31 @@ let _bgAccCache = { at: 0, list: null };
 async function bgAccounts(force) {
   const nowMs = Date.now();
   if (!force && _bgAccCache.list && (nowMs - _bgAccCache.at) < 60000) return _bgAccCache.list;
-  const d = await zyApi.call('/CmdHandler?cmd=amazon_acc.sum', { page: 1, pageSize: 100 });
-  const list = (d && d.list && d.list.data) || (d && d.data && d.list && d.data.list.data) || [];
-  const out = list.map((a) => ({
-    id: a.id, abbr: a.abbr || null, name: a.name || a.shop || null, flag: a.flag,
-    usable: a.flag !== 9,
-  }));
+  /* ★ 2026-11-13: 直连通道优先（不依赖浏览器插件），失败再回退 CDP 插件通道。
+   *   原因: 插件升级/页面导航后 CDP 通道容易失效（"没有 webpackChunk 全局"），直连更稳。 */
+  let out = null, pluginErr = null;
+  try { out = await zyStandalone.accounts(); } catch (e) { pluginErr = e; }
+  if (!out) {
+    try {
+      const d = await zyApi.call('/CmdHandler?cmd=amazon_acc.sum', { page: 1, pageSize: 100 });
+      const list = (d && d.list && d.list.data) || (d && d.data && d.list && d.data.list.data) || [];
+      out = list.map((a) => ({ id: a.id, abbr: a.abbr || null, name: a.name || a.shop || null, flag: a.flag, usable: a.flag !== 9 }));
+    } catch (e) { throw pluginErr || e; }
+  }
   _bgAccCache = { at: nowMs, list: out };
   return out;
 }
-function bgRawRestriction(aid, asin) {
-  return zyApi.call('/CmdHandler?cmd=amazon_hub_restriction.get', { aid: aid, asin: asin });
+async function bgRawRestriction(aid, asin) {
+  /* 直连优先，插件兜底（同样是为摆脱对浏览器插件的依赖） */
+  try {
+    const r = await zyStandalone.callAuto(zyStandalone.AMZ, '/CmdHandler?cmd=amazon_hub_restriction.get', { aid: Number(aid), asin: String(asin).toUpperCase() });
+    const j = r.json || {};
+    if (j.code && j.code !== 200 && /禁用|未授权/i.test(String(j.message || ''))) throw new Error(String(j.message));
+    return j.data !== undefined ? j.data : j;
+  } catch (e) {
+    if (/禁用|未授权/i.test(String(e.message || ''))) throw e;
+    return zyApi.call('/CmdHandler?cmd=amazon_hub_restriction.get', { aid: aid, asin: asin });
+  }
 }
 /** 原始响应 → 五态。判据与插件 content.js 完全一致，解析不到一律 ERROR */
 function bgParseStatus(resp, asin) {
@@ -4421,22 +4694,18 @@ function normFilter(raw) {
     //   badgeNot    = 页面标识【排除法】列表: 命中任一项即剔除 (A+ 也走这里)
     //   hasRankOnly = '1' 只看有排名 (= 排除没有排名的商品); 判据与 noRank 相同 (bigRankOf)
     badgeNot: arr(r.badgeNot),
-    hasRankOnly: (r.hasRankOnly === true || r.hasRankOnly === '1' || r.hasRankOnly === 1) ? '1' : '',
     china: s(r.china),                                       // '' | 1 | 0
-    noRank: r.noRank === true || r.noRank === '1' || r.noRank === 1,
     // ★ 2026-09-25 大排名三态: '' 不限 / 'ok' 有大排名 / 'not_listed' 未上榜 / 'unknown' 未采集到
-    rankState: (r.rankState == null ? '' : String(r.rankState).trim()),
     priceRange: s(r.priceRange), salesRange: s(r.salesRange), rankRange: s(r.rankRange),
     ratingRange: s(r.ratingRange), reviewsRange: s(r.reviewsRange), followRange: s(r.followRange),
     tmRange: s(r.tmRange), newDaysRange: s(r.newDaysRange),
-    tmCountries: s(r.tmCountries), is1688: s(r.is1688), brandStatus: s(r.brandStatus),
+    tmCountries: s(r.tmCountries), is1688: s(r.is1688), bgStatus: s(r.bgStatus),
     q: s(r.q), catNot: arr(r.catNot), catKw: s(r.catKw),
     // ★ 2026-09: 正向类目筛选 (大类目/二级类目)。前端 schema 里本来就有 cat1/cat2 键, 但 normFilter 不认,
     //   于是前端传了也会被丢掉 —— 表现为"加了类目筛选但不起作用"。
     cat1: s(r.cat1), cat2: s(r.cat2),
     cat1Cn: s(r.cat1Cn),                                     // ★ 中文大类目 (归并后的中文名)
     famFilter: s(r.famFilter), famKey: s(r.famKey), famAny: s(r.famAny),   // ★ 变体族筛选
-    dropOtherBrand: s(r.dropOtherBrand),                                   // ★ 他牌剔除开关: '' = 剔除(默认) / '0' = 保留他牌
     collectedFrom: s(r.collectedFrom), collectedTo: s(r.collectedTo),
     shopAplus: s(r.shopAplus), brandShop: s(r.brandShop), brandStore: s(r.brandStore),   // 仅采集(店铺维度)
   };
@@ -4488,6 +4757,7 @@ function filterToQuery(f) {
   if (f.newDaysRange) p.set('newDaysRange', f.newDaysRange);
   if (f.tmCountries) p.set('tmCountries', f.tmCountries);
   if (f.is1688 !== '') p.set('is1688', f.is1688);
+  if (f.bgStatus) p.set('bgStatus', f.bgStatus);
   if (f.brandStatus) p.set('brandStatus', f.brandStatus);
   const catNot = f.catNot.concat(String(f.catKw || '').split(/[,，]/).map((s) => s.trim()).filter(Boolean));
   if (catNot.length) p.set('categoryNot', catNot.join(','));
@@ -4517,7 +4787,6 @@ function canonicalToCollectFilter(raw) {
   const f = normFilter(raw);
   const filter = {};
   const put = (r, kmin, kmax) => { const x = rngRange(r); if (x.min != null) filter[kmin] = x.min; if (x.max != null) filter[kmax] = x.max; };
-  if (f.rankState) filter.rankState = f.rankState;                         // ★ 大排名三态 (未上榜/未采到/有)
   put(f.rankRange, 'rankMin', 'rankMax');
   put(f.priceRange, 'priceMin', 'priceMax');
   put(f.ratingRange, 'ratingMin', 'ratingMax');
@@ -4539,14 +4808,9 @@ function canonicalToCollectFilter(raw) {
   if (f.badgeNot.length) filter.badgeNot = f.badgeNot;
   const catNot = f.catNot.concat(String(f.catKw || '').split(/[,，]/).map((s) => s.trim()).filter(Boolean));
   if (catNot.length) filter.categoryNot = catNot;
-  // ★ 2026-09 他牌剔除开关: 原为写死"品牌页/搜索页混入他牌一律丢弃", 现改为采集过滤里的开关
-  if (f.dropOtherBrand != null && f.dropOtherBrand !== '') filter.dropOtherBrand = String(f.dropOtherBrand);
   if (f.tmCountries) filter.tmCountries = f.tmCountries;
   if (f.sites.length) filter.sites = f.sites;
   if (f.is1688 === '1' || f.is1688 === '0') filter.is1688 = f.is1688;
-  if (f.brandStatus) filter.brandStatus = f.brandStatus;
-  if (f.noRank) filter.noRank = true;
-  if (f.hasRankOnly === '1') filter.hasRankOnly = true;   // ★ 只看有排名 (排除没有排名) —— 原先同样没有通路
   if (f.china === '1') filter.china = true;
   else if (f.china === '0') filter.china = false;
   return filter;
@@ -4660,13 +4924,13 @@ function filterDescCanonical(raw) {
   if (f.tmRange) parts.push('排除商标数:' + rf(f.tmRange));
   if (f.tmCountries) parts.push('排除商标国:' + f.tmCountries);
   if (f.newDaysRange) parts.push('上架:' + rf(f.newDaysRange) + '天');
+  if (f.bgStatus) parts.push('可售状态=' + ({ OK: '可售', NOT_ELIGIBLE: '不可售', APPROVAL_REQUIRED: '需要批准', ASIN_NOT_FOUND: 'ASIN不存在' }[f.bgStatus] || f.bgStatus));
   if (f.is1688 === '1') parts.push('有1688同款');
   else if (f.is1688 === '0') parts.push('排除1688同款');
   if (f.brandStatus) parts.push('品牌:' + ({ registered: '排除已备案', tm: '排除TM', notfound: '仅未查到' }[f.brandStatus] || f.brandStatus));
   if (f.q) parts.push('标题含「' + f.q + '」');
   const catNot = f.catNot.concat(String(f.catKw || '').split(/[,，]/).map((s) => s.trim()).filter(Boolean));
   if (catNot.length) parts.push('排除类目:' + catNot.join('/'));
-  if (raw && (raw.dropOtherBrand === '0' || raw.dropOtherBrand === 0)) parts.push('保留他牌');
   if (f.collectedFrom || f.collectedTo) parts.push('采集时间:' + (f.collectedFrom || '…') + '~' + (f.collectedTo || '…'));
   if (f.shopAplus === '1') parts.push('仅有A+店铺');
   else if (f.shopAplus === '0') parts.push('排除A+店铺');
@@ -4695,6 +4959,7 @@ function filterDesc(filter) {
   if (filter.tmMin != null || filter.tmMax != null) parts.push('排除商标:' + fmt(filter.tmMin, filter.tmMax));
   if (filter.tmCountries) parts.push('商标国家=' + filter.tmCountries + '排除');
   if (filter.salesMin != null || filter.salesMax != null) parts.push('月销:' + fmt(filter.salesMin, filter.salesMax));
+  if (filter.bgStatus) parts.push('可售状态=' + ({ OK: '可售', NOT_ELIGIBLE: '不可售', APPROVAL_REQUIRED: '需要批准', ASIN_NOT_FOUND: 'ASIN不存在' }[filter.bgStatus] || filter.bgStatus));
   if (filter.is1688 === '1') parts.push('有1688同款');
   else if (filter.is1688 === '0') parts.push('排除1688同款');
   if (filter.brandStatus === 'registered') parts.push('排除已备案品牌');
@@ -4844,6 +5109,196 @@ async function cdpEnrichOne(send, host, it, filter) {
     console.error('[enrich]', it.asin, '详情补全异常:', e && e.message);
   }
   it.__skip = !applyCollectFilter(it, filter);
+}
+
+/* ===== 变体抓取（HTTP 逆向）: 浏览器只用来取 cookie, 页面 HTML 由 Node 直接请求 =====
+ * 背景: 页面级 CDP 会卡死(长时间跑/导航后 Runtime.evaluate 不回应), 但浏览器级 CDP 仍正常。
+ *   → 用 Storage.getCookies 拿 Amazon 会话, 直接 GET /dp/<asin> 解析 dimensionValuesDisplayData,
+ *     再用智赢接口按变体 ASIN 批量补价(站点币种, 和商品主数据一致)。
+ */
+const VAR_CACHE = new Map();
+const COOKIE_CACHE = new Map();          // site → { header, at, count }
+const COOKIE_TTL_MS = 30 * 60 * 1000;    // 30 分钟：Amazon 会话足够长，省掉每次采集的 CDP 往返
+async function getAmazonCookieHeader(site, force) {
+  const st = String(site).toLowerCase();
+  const hit = COOKIE_CACHE.get(st);
+  if (!force && hit && Date.now() - hit.at < COOKIE_TTL_MS) return hit;
+  const port = await activeCdpPort();
+  const ver = await new Promise((res, rej) => {
+    http.get({ host: '127.0.0.1', port, path: '/json/version' }, (r) => { let d = ''; r.on('data', (c) => d += c); r.on('end', () => { try { res(JSON.parse(d)); } catch (e) { rej(e); } }); }).on('error', rej);
+  });
+  const { ws, send } = await cdpConnect(ver.webSocketDebuggerUrl);
+  let all = [];
+  try { const ck = await send('Storage.getCookies', {}); all = (ck && ck.cookies) || []; }
+  finally { try { ws.close(); } catch (e) { } }
+  /* 只取目标站的 cookie（.amazon.de / www.amazon.de 等），别把别站 cookie 一起带上 */
+  const suffix = siteToHostSuffix(st);
+  const pick = all.filter((c) => { const d = String(c.domain || ''); return d.indexOf(suffix) >= 0 || d.indexOf('.amazon.') >= 0 && d.indexOf(suffix) >= 0; });
+  const header = pick.map((c) => c.name + '=' + c.value).join('; ');
+  const val = { header, at: Date.now(), count: pick.length };
+  if (header) COOKIE_CACHE.set(st, val);
+  return val;
+}
+function parseDimMap(html) {
+  const mi = html.indexOf('"dimensionValuesDisplayData"');
+  if (mi < 0) return null;
+  const st = html.indexOf('{', mi);
+  if (st < 0) return null;
+  let depth = 0, end = -1;
+  for (let i = st; i < html.length; i++) {
+    const c = html[i];
+    if (c === '{') depth++;
+    else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
+  }
+  if (end < 0) return null;
+  try { return JSON.parse(html.slice(st, end + 1).replace(/&quot;/g, '"')); } catch (e) { return null; }
+}
+async function fetchVariantsHttp(asin, site) {
+  const key = String(site).toLowerCase() + ':' + String(asin).toUpperCase();
+  const hit = VAR_CACHE.get(key);
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.val;
+  const host = 'www.amazon.' + siteToHostSuffix(site);
+  let ck = await getAmazonCookieHeader(site, false);
+  let cookieHeader = ck.header;
+  const lang = { de: 'de-DE,de;q=0.9,en;q=0.8', uk: 'en-GB,en;q=0.9', fr: 'fr-FR,fr;q=0.9', it: 'it-IT,it;q=0.9', es: 'es-ES,es;q=0.9', au: 'en-AU,en;q=0.9', us: 'en-US,en;q=0.9' }[String(site).toLowerCase()] || 'en-US,en;q=0.9';
+  const url = 'https://' + host + '/dp/' + String(asin).toUpperCase();
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0';
+  const doFetch = async (ckh) => {
+    const resp = await fetch(url, { headers: { 'user-agent': UA, cookie: ckh, 'accept-language': lang, accept: 'text/html,application/xhtml+xml' } });
+    const html = await resp.text();
+    return { resp, html, map: parseDimMap(html) };
+  };
+  let got = await doFetch(cookieHeader);
+  /* cookie 失效 / 被风控 / 页面不含变体 → 刷新一次 cookie 再试 */
+  if (!got.map && (got.resp.status !== 200 || /captcha|Robot Check|Enter the characters/i.test(got.html))) {
+    ck = await getAmazonCookieHeader(site, true);
+    cookieHeader = ck.header;
+    got = await doFetch(cookieHeader);
+  }
+  const r = got.resp;
+  const html = got.html;
+  const map = got.map;
+  if (!map) return { ok: false, error: '页面里没有变体数据（可能不是多变体商品 / 被风控）', http: r.status, size: html.length, cookieCached: true };
+  const asins = Object.keys(map).map((a) => String(a).toUpperCase());
+  let recs = {};
+  try { recs = await zyStandalone.moreAboutAsin(asins, String(site).toLowerCase()); } catch (e) { recs = {}; }
+  const items = asins.map((a) => {
+    const rec = recs[a] || {};
+    return { asin: a, attrs: map[a] || [], price: rec.price == null ? null : rec.price, currency: rec.currency || siteCurrency(String(site)), title: rec.brand || null };
+  });
+  const val = { ok: true, asin: String(asin).toUpperCase(), site: String(site).toLowerCase(), count: items.length, items, http: r.status, cookieCount: ck.count, cookieAgeMin: Math.round((Date.now() - ck.at) / 60000) };
+  VAR_CACHE.set(key, { at: Date.now(), val });
+  return val;
+}
+
+/* ===== 站点修正（不依赖页面渲染）=====
+ * 邮编: Node 直接 POST glow/address-change（带浏览器 cookie）
+ * 货币: 浏览器级 CDP attach 到任意页面 → Network.setCookie 改 i18n-prefs
+ *       （关键坑: 若存在 host-only 同名 cookie 会遮蔽 domain 那条 → 先 delete）
+ */
+async function localeFixHttp(site, opts) {
+  const st = String(site || 'de').toLowerCase();
+  const o = opts || {};
+  const host = 'www.amazon.' + siteToHostSuffix(st);
+  const origin = 'https://' + host;
+  const wantCur = String(o.currency || SITE_CURRENCY[st] || 'EUR').toUpperCase();
+  const zip = String(o.zip || (SITE_ZIP[st] || [null, ''])[1] || '');
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0';
+  const lang = { de: 'de-DE,de;q=0.9', uk: 'en-GB,en;q=0.9', fr: 'fr-FR,fr;q=0.9', it: 'it-IT,it;q=0.9', es: 'es-ES,es;q=0.9', au: 'en-AU,en;q=0.9', us: 'en-US,en;q=0.9' }[st] || 'en-US,en;q=0.9';
+  const readCookieHeader = async () => {
+    const ck = await getAmazonCookieHeader(st, true);
+    return ck.header;
+  };
+  const out = { ok: false, site: st, wantCurrency: wantCur, wantZip: zip };
+
+  /* ① 货币: attach session + Network.setCookie */
+  try {
+    const port = await activeCdpPort();
+    const ver = await new Promise((res, rej) => {
+      http.get({ host: '127.0.0.1', port, path: '/json/version' }, (r) => { let d = ''; r.on('data', (c) => d += c); r.on('end', () => { try { res(JSON.parse(d)); } catch (e) { rej(e); } }); }).on('error', rej);
+    });
+    /* 自己建一个支持 sessionId 的 CDP 连接（cdpConnect 不支持 sessionId） */
+    const ws = await new Promise((resolve, reject) => {
+      const w = new WebSocket(ver.webSocketDebuggerUrl);
+      w.onopen = () => resolve(w);
+      w.onerror = () => reject(new Error('browser ws 失败'));
+      setTimeout(() => reject(new Error('browser ws 超时')), 8000);
+    });
+    let msgId = 0; const pend = new Map();
+    ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); } };
+    const raw = (method, params, sid) => new Promise((r) => {
+      const i = ++msgId; pend.set(i, r);
+      const msg = { id: i, method, params: params || {} };
+      if (sid) msg.sessionId = sid;
+      ws.send(JSON.stringify(msg));
+      setTimeout(() => r(null), 15000);
+    });
+    const asResult = async (method, params, sid) => { const m = await raw(method, params, sid); return m && m.result !== undefined ? m.result : (m && m.error) ? { __error: m.error } : null; };
+    try {
+      const tabs = await cdpGetTabs();
+      let targetId = (tabs.find((t) => t.type === 'page') || {}).id;
+      if (!targetId) {
+        const c = await asResult('Target.createTarget', { url: origin + '/' });
+        targetId = c && c.targetId;
+        await new Promise((r) => setTimeout(r, 4000));
+      }
+      const at = await asResult('Target.attachToTarget', { targetId, flatten: true });
+      const sid = at && at.sessionId;
+      if (!sid) throw new Error('attach 失败');
+      await asResult('Network.enable', {}, sid);
+      const ck = await asResult('Network.getCookies', { urls: [origin + '/'] }, sid);
+      const list = (ck && ck.cookies) || [];
+      out.curBefore = (list.find((c) => c.name === 'i18n-prefs') || {}).value || null;
+      const dups = list.filter((c) => c.name === 'i18n-prefs');
+      if (dups.length > 1) await asResult('Network.deleteCookies', { name: 'i18n-prefs', url: origin + '/' }, sid);
+      const setR = await asResult('Network.setCookie', { name: 'i18n-prefs', value: wantCur, domain: '.' + host.replace(/^www\./, ''), path: '/', secure: true }, sid);
+      out.curSet = !!(setR && (setR.success !== false) && !setR.__error);
+      await new Promise((r) => setTimeout(r, 500));
+      const ck2 = await asResult('Network.getCookies', { urls: [origin + '/'] }, sid);
+      out.curAfter = (((ck2 && ck2.cookies) || []).find((c) => c.name === 'i18n-prefs') || {}).value || null;
+      const addr = await asResult('Runtime.evaluate', { expression: "(function(){var e=document.querySelector('#glow-ingress-line2');return e?e.textContent.trim():null})()", returnByValue: true }, sid);
+      out.addrBefore = (addr && addr.result && addr.result.value) || null;
+      await asResult('Target.detachFromTarget', { sessionId: sid });
+    } finally { try { ws.close(); } catch (e) { } }
+  } catch (e) { out.currencyError = String((e && e.message) || e).slice(0, 160); }
+
+  /* ② 邮编: HTTP glow */
+  try {
+    const cookieHeader = await readCookieHeader();
+    const r = await fetch(origin + '/portal-migration/hz/glow/address-change', {
+      method: 'POST',
+      headers: { 'user-agent': UA, cookie: cookieHeader, 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8', 'x-requested-with': 'XMLHttpRequest', origin, referer: origin + '/', 'accept-language': lang },
+      body: 'locationType=LOCATION_INPUT&zipCode=' + zip + '&deviceType=web&storeContext=generic&pageType=Gateway&actionSource=glow',
+    });
+    const j = await r.json().catch(() => ({}));
+    out.zipValid = j.isValidAddress === 1 || j.isValidAddress === true;
+    out.zipUpdated = j.isAddressUpdated === 1 || j.isAddressUpdated === true;
+    out.addrAfter = j.address ? ((j.address.city || '') + ' ' + (j.address.zipCode || '')).trim() : null;
+    out.country = j.address && j.address.countryCode;
+  } catch (e) { out.zipError = String((e && e.message) || e).slice(0, 160); }
+
+  out.ok = !!(out.curAfter === wantCur || out.zipUpdated);
+  return out;
+}
+
+/* 按站点修正采集浏览器: 配送邮编 → 国家 → 货币（供直连采集与面板手动修正复用） */
+async function localeFixForSite(site, zip, force) {
+  const st = String(site || 'de').toLowerCase();
+  const z = zip ? String(zip) : '';
+  const tabs = await cdpGetTabs();
+  const page = tabs.find((t) => t.type === 'page' && /amazon\./i.test(String(t.url))) || tabs.find((t) => t.type === 'page');
+  if (!page) return { ok: false, error: '没有可用的采集浏览器标签（需 9222/9333 且打开着 amazon 页）' };
+  const { send: send2 } = await cdpConnect(page.webSocketDebuggerUrl);
+  const home = 'https://www.amazon.' + siteToHostSuffix(st) + '/';
+  let glow = false;
+  try { glow = await cdpSetGlowAddress(send2, home, st, z); } catch (e) { }
+  if (force) { try { localeCheckedAt.delete(st); } catch (e) { } }
+  let chk = null;
+  try { chk = await cdpCheckSiteLocaleRun(send2, home, st, { zip: z }); } catch (e) { }
+  return {
+    ok: true, site: st, glowChanged: !!glow,
+    check: chk ? { ok: chk.ok, country: chk.country, cur: chk.cur, fixes: chk.fixes || [], warns: chk.warns || [] } : null,
+  };
 }
 
 // ===== 列表页公共工具: glow 地址设置 + 卡片提取 JS (list-direct / list-filtered 共用) =====
@@ -8033,12 +8488,22 @@ async function cdpFollowShopChain(url, opts = {}) {
                 // 价格: "1 option from €25.99" / "6 options from €11.97" / "€12.76"
                 let price = null;
                 const priceTxt = (li.textContent || '').replace(/\\s+/g, ' ').trim();
-                const CUR = '(?:€|£|A\\\\$|AU\\\\$|US\\\\$|C\\\\$|CA\\\\$|\\\\$|EUR|GBP|USD|AUD)';
+                /* ★ 2026-11-15 价格解析: 支持 HKD 等币种, 并正确识别小数分隔符 (142,29 / 1.234,56) */
+                const money = (t) => {
+                  if (!t) return null;
+                  const m = String(t).match(/([0-9][0-9.,]*)/);
+                  if (!m) return null;
+                  const v = m[1];
+                  if (/,\\d{2}$/.test(v)) return parseFloat(v.replace(/\\./g, '').replace(',', '.'));
+                  if (/\\.\\d{1,2}$/.test(v)) return parseFloat(v.replace(/,/g, ''));
+                  return parseFloat(v.replace(/[^0-9.]/g, ''));
+                };
+                const CUR = '(?:€|£|A\\$|AU\\$|US\\$|C\\$|CA\\$|\\$|EUR|GBP|USD|AUD|HKD|CAD|JPY)';
                 const fm = priceTxt.match(new RegExp('from\\\\s*' + CUR + '\\\\s*([\\\\d.,]+)'));
-                if (fm) price = parseFloat(fm[1].replace(/,/g, ''));
+                if (fm) price = money(fm[1]);
                 else {
                   const dm = priceTxt.match(new RegExp(CUR + '\\\\s*([\\\\d.,]+)'));
-                  if (dm) price = parseFloat(dm[1].replace(/,/g, ''));
+                  if (dm) price = money(dm[1]);
                 }
                 out.push({ asin, name: (name || '').slice(0, 60), price, selected: li.getAttribute('data-initiallyselected') === 'true' || !!li.querySelector('.a-button-selected, .swatchSelect') });
               });
@@ -9515,19 +9980,7 @@ async function cdpBrandBatch(opts = {}) {
         await cdpReadDetail(send, host, it);
         rec.read++;
         // 品牌名校验 (详情页品牌为权威值): 与目标品牌不一致 → 丢弃, 防止品牌页/搜索页混入他牌
-        // ★ 2026-09 「剔除他牌」改为采集过滤开关: 默认剔除(保持原行为); filter.dropOtherBrand==='0' 时保留他牌商品
-        const keepOtherBrand = filter.dropOtherBrand === '0' || filter.dropOtherBrand === 0;
-        if (!keepOtherBrand && target && it.brand && !sameBrand(it.brand, target)) {
-          rec.mismatch++;
-          // ★ 剔除他牌明细(供采集报告逐条给出亚马逊直达链接); 只留前 200 条, 计数仍然完整
-          if (!rec.mismatchItems) rec.mismatchItems = [];
-          if (rec.mismatchItems.length < 200) rec.mismatchItems.push({
-            asin: it.asin, title: it.title ? String(it.title).slice(0, 90) : null,
-            brand: it.brand || null, target,
-            url: 'https://www.amazon.' + siteToHostSuffix(site) + '/dp/' + it.asin,
-          });
-          continue;
-        }
+        // ★ 2026-11 用户要求「剔除它牌功能删掉」→ 一律保留，不再按品牌丢弃
         // 插件面板补全 (就地读, 不重新导航)
         if (needPanel) {
           const pa = await waitPanelInline(send, site, 6000, 15000);
@@ -10742,12 +11195,37 @@ const opHandler = (req, res) => {
      *   配合监听所有网卡, 任何网页都能直接向本机后端发请求并读数据。
      *   现在只对回环来源放行 —— DSH 界面在不同端口(如 57561), 所以仍需放行 127.0.0.1/localhost 的任意端口。 */
     const reqOrigin = String((req.headers && req.headers.origin) || '');
-    if (/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(reqOrigin)) {
+    /* ★ 2026-11-14 关键修复: DSH 新版界面以自定义安全协议加载, 请求的 Origin 是 dsh-app://app。
+     *   原来的白名单只认 http://127.0.0.1|localhost → dsh-app 来源拿不到 ACAO,
+     *   浏览器判定跨域失败, 前端就报 "Failed to fetch"(实测: 服务端只收到 OPTIONS 预检, 主请求被浏览器丢弃)。
+     *   现在放行: 回环 http(s) 来源 + dsh-app:// 自定义协议。 */
+    const originOk = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(reqOrigin)
+      || /^(dsh-app|app|file):\/\//i.test(reqOrigin)
+      /* ★ 商品页面板（注入在 amazon 页内）需要直接调本地接口做上架 */
+      || /^https:\/\/(www\.)?amazon\.[a-z.]+$/i.test(reqOrigin);
+    if (originOk) {
       res.setHeader('Access-Control-Allow-Origin', reqOrigin);
       res.setHeader('Vary', 'Origin');
+      /* Chromium 私有网络访问(PNA): 从非本地上下文访问 127.0.0.1 的预检必须显式允许,
+       * 否则即使 ACAO 正确, 浏览器也会把预检判失败(同样报 Failed to fetch)。 */
+      res.setHeader('Access-Control-Allow-Private-Network', 'true');
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    /* ─── 请求到达记录（用于排查"前端 Failed to fetch"到底是没到达还是响应问题）─── */
+    if (String(p).startsWith('/api/products') || String(p).startsWith('/api/debug')) {
+      try {
+        const __line = JSON.stringify({
+          at: now(), method: req.method, path: String(p).slice(0, 200),
+          q: String((url && url.search) || '').slice(0, 200),
+          origin: String(req.headers.origin || '').slice(0, 80),
+          ua: String(req.headers['user-agent'] || '').slice(0, 60),
+          rid: '__reqTrace',
+        });
+        fs.appendFileSync(path.join(DATA, 'requests.log'), __line + '\n');
+        try { const f2 = path.join(DATA, 'requests.log'); if (fs.statSync(f2).size > 2 * 1024 * 1024) fs.writeFileSync(f2, ''); } catch (e) {}
+      } catch (e) {}
+    }
     const send = (code, data) => {
       // 采集接口若在校验阶段就失败 (400/404/409), 必须清掉刚注册的"运行中"进度,
       // 否则进度会永远停在 running → 后续采集一律被 409 拒绝 ("已有采集正在运行")
@@ -10769,6 +11247,14 @@ const opHandler = (req, res) => {
       if (req.method === 'OPTIONS') { res.statusCode = 204; return res.end(); }
 
       // ---- 静态文件 ----
+      /* 浏览器版「搞薯条面板」Demo（同源，直接调 /api/*） */
+      if (req.method === 'GET' && (p === '/demo' || p === '/panel')) {
+        try {
+          res.setHeader('Content-Type', 'text/html; charset=utf-8');
+          res.setHeader('Cache-Control', 'no-store, must-revalidate');   // demo 常改，别让浏览器缓存
+          return res.end(fs.readFileSync(path.join(__dirname, 'panel-demo.html')));
+        } catch (e) { return send(500, { error: 'demo 页面缺失: ' + e.message }); }
+      }
       if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         return res.end(fs.readFileSync(path.join(PUBLIC, 'index.html')));
@@ -10812,6 +11298,30 @@ const opHandler = (req, res) => {
         }
       }
       if (p === '/api/license/status' && req.method === 'GET') return send(200, licenseStatus());
+      /* ─── 客户端请求追踪（只写日志，不做业务）─── */
+      if (p === '/api/debug/log' && req.method === 'POST') {
+        try {
+          const line = JSON.stringify({
+            at: now(), tag: String(j.tag || '').slice(0, 40), path: String(j.path || '').slice(0, 300),
+            ms: Number(j.ms) || null, status: j.status == null ? null : j.status,
+            error: j.error == null ? null : String(j.error).slice(0, 300),
+            note: j.note == null ? null : String(j.note).slice(0, 200),
+          });
+          const f = path.join(DATA, 'client-errors.log');
+          fs.appendFileSync(f, line + '\n');
+          try { if (fs.statSync(f).size > 2 * 1024 * 1024) fs.writeFileSync(f, ''); } catch (e) {}
+          return send(200, { ok: true });
+        } catch (e) { return send(200, { ok: false }); }
+      }
+      if (p === '/api/debug/log' && req.method === 'GET') {
+        try {
+          const f = path.join(DATA, 'client-errors.log');
+          const txt = fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '';
+          const lines = txt.trim() ? txt.trim().split('\n').slice(-120) : [];
+          return send(200, { ok: true, count: lines.length, lines: lines });
+        } catch (e) { return send(200, { ok: false, lines: [] }); }
+      }
+
       if (p === '/api/health') return send(200, { ok: true, time: now() });
 
   /* ===== 本地浏览器服务(第四期) ===== */
@@ -11071,70 +11581,6 @@ const opHandler = (req, res) => {
     const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get('limit') || '60', 10) || 60));
     return send(200, { ok: true, total: browserActivity.length, items: browserActivity.slice(-limit).reverse() });
   }
-  /* 「服务器」页: 桌面浏览器壳(Electron) —— 真窗口, 不串流
-   * 为什么要它: 面板流走 Chrome 的 Page.startScreencast, 实测硬上限 ~14fps(换分辨率/显卡/窗口模式都没用)。
-   *   想要"像自己用浏览器一样"顺滑, 只有不串流 —— 那个壳里的浏览器是原生控件, 实测滚动 89fps。
-   * 注意: 壳有自己的 profile, 登录态要在壳里重登一次; 自研采集插件是壳里本地加载的。
-   */
-  if (p === '/api/browser/shell') {
-    const SHELL_DIR = shellDirOf();
-    const SHELL_PORT = 9334;
-    const shellExe = path.join(SHELL_DIR, 'node_modules', 'electron', 'dist', 'electron.exe');
-    const probeShell = () => new Promise((resolve) => {
-      const rq = http.request({ host: '127.0.0.1', port: SHELL_PORT, path: '/json/version', method: 'GET', timeout: 2500 }, (rs) => {
-        let d = ''; rs.on('data', (c) => d += c);
-        rs.on('end', () => { try { resolve(JSON.parse(d)) } catch (e) { resolve(null) } });
-      });
-      rq.on('error', () => resolve(null)); rq.on('timeout', () => { rq.destroy(); resolve(null) }); rq.end();
-    });
-    const action = String(url.searchParams.get('action') || '');
-    return (async () => {
-      if (action === 'start') {
-        if (!fs.existsSync(shellExe)) return send(200, { ok: false, error: '没找到 Electron: ' + shellExe + ' (先在 zying-browser-shell 目录跑 npm.cmd install)' });
-        if (await probeShell()) return send(200, { ok: true, already: true, port: SHELL_PORT });
-        // ★ 必须清掉 ELECTRON_RUN_AS_NODE: DSH 环境里带着它, 不清掉 electron.exe 会被当普通 node 跑,
-        //   不报错但窗口永远不出来(实测踩过)。用 Remove-Item 真删掉, 置空字符串不算(原生层看的是"变量在不在")。
-        const ps = "Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue;"
-          + " Start-Process -FilePath " + JSON.stringify(shellExe) + " -ArgumentList @(" + JSON.stringify(SHELL_DIR) + ")"
-          + " -WorkingDirectory " + JSON.stringify(SHELL_DIR) + " -PassThru | Select-Object -ExpandProperty Id";
-        const pid = await new Promise((resolve) => {
-          require('child_process').execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 25000 }, (e, out) => {
-            if (e) return resolve(null);
-            const n = parseInt(String(out).trim(), 10);
-            resolve(isNaN(n) ? null : n);
-          });
-        });
-        pushActivity('browser', '启动桌面浏览器壳 (Electron)');
-        for (let i = 0; i < 30; i++) { await new Promise((r) => setTimeout(r, 500)); if (await probeShell()) break }
-        const v = await probeShell();
-        return send(200, { ok: !!v, started: !!v, pid: pid, port: SHELL_PORT, browser: v && v.Browser, error: v ? null : '起来了但 CDP 没应(可能 Electron 没装好)' });
-      }
-      if (action === 'stop') {
-        // 只杀【命令行里带这个壳目录】的 electron.exe —— 别误伤别的 Electron 应用(和之前那个 PID 教训同理)
-        const ps = "$p = Get-CimInstance Win32_Process -Filter \"Name='electron.exe'\" | Where-Object { $_.CommandLine -like '*zying-browser-shell*' };"
-          + " foreach ($x in $p) { taskkill /PID $($x.ProcessId) /T /F | Out-Null };"
-          + " ($p | Measure-Object).Count";
-        const killed = await new Promise((resolve) => {
-          require('child_process').execFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 20000 }, (e, out) => resolve(e ? -1 : parseInt(String(out).trim(), 10) || 0));
-        });
-        pushActivity('browser', '停止桌面浏览器壳 (关了 ' + killed + ' 个进程)');
-        await new Promise((r) => setTimeout(r, 1500));
-        return send(200, { ok: true, killed: killed, running: !!(await probeShell()) });
-      }
-      const v = await probeShell();
-      const st = { ok: true, running: !!v, port: SHELL_PORT, browser: v ? v.Browser : null, dir: SHELL_DIR, hasExe: fs.existsSync(shellExe) };
-      if (url.searchParams.get('ui') === '1' || String(req.headers.accept || '').indexOf('text/html') >= 0) {
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.end('<!doctype html><meta charset="utf-8"><title>智赢浏览器壳</title>'
-          + '<body style="font:14px/1.6 system-ui;background:#16181d;color:#e8e8ea;padding:40px;text-align:center">'
-          + '<div style="font-size:34px">' + (st.running ? '🖥' : '⏹') + '</div>'
-          + '<div style="margin-top:8px">桌面浏览器壳: ' + (st.running ? '正在运行' : '没在运行') + '</div>'
-          + '<div style="color:#9a9a9a;font-size:12px;margin-top:6px">关闭本页即可</div></body>');
-      }
-      return send(200, st);
-    })().catch((e) => send(500, { error: String((e && e.message) || e) }));
-  }
-
   if (p === '/api/browser/status' && req.method === 'GET') {
     // ★ 2026-09-26: 插件侧经 DSH 网关只能调通这个路径(专用的 /start /stop /switch 到不了 ERP, 实测),
     //   所以 启动/停止/切换 也挂在这里: /api/browser/status?action=start|stop|user|auto&mode=headless
@@ -11154,22 +11600,8 @@ const opHandler = (req, res) => {
         browserSvc.stop().then(() => { browserSvcLastErr = null }).catch((e) => { browserSvcLastErr = String((e && e.message) || e) });
         pushActivity('browser', '停止本地浏览器');
       } else if (action === 'user') { cdpPortOverride = 'user'; pushActivity('browser', '切到用户的采集浏览器 (9222)'); }
-      else if (action === 'shell') {
-        /* ★ 2026-09-28 用户要求: 采集面板里的「打开本地无头」可以直接改成【打开浏览器壳】——
-         *   壳 = Electron 桌面窗口(CDP 9334, 原生渲染不串流), 采集直接跑在它里面:
-         *   你能看见它在翻页, 验证码/登录也能人工接手; 代价是和你手动操作抢标签页。
-         *   为什么挂在 status?action 上: 插件侧经 DSH 网关只有这个路径能到 ERP(实测)。 */
-        cdpPortOverride = 'shell';
-        shellEnsureStart();
-        pushActivity('browser', '采集浏览器 → 桌面浏览器壳 (CDP ' + SHELL_CDP_PORT + ')');
-      }
-      else if (action === 'shellstop') {
-        cdpPortOverride = null;
-        shellEnsureStop();
-        pushActivity('browser', '停止桌面浏览器壳, 采集回落到本地无头');
-      }
       else if (action === 'auto' || action === 'local') { cdpPortOverride = null; pushActivity('browser', '切回本地无头浏览器'); }
-      else return send(400, { error: 'action 只能是 start / stop / user / auto / shell / shellstop' });
+      else return send(400, { error: 'action 只能是 start / stop / user / auto' });
     }
     // ui=1(新标签页直连过来) 就回一个小页面并自动关闭 —— 绕开 DSH 网关的限制
     if (action && (url.searchParams.get('ui') === '1' || String(req.headers.accept || '').indexOf('text/html') >= 0)) {
@@ -11317,7 +11749,9 @@ const opHandler = (req, res) => {
        *   全被守卫 409 拦死】, 且 api-stop 自己也被拦(不在名单里) → 连停都停不掉。
        *   api-status/selftest 是 GET, 放进来是防御性的。 */
       const GUARD_SKIP = new Set(['/api/collect/stop', '/api/collect/link-job/retry', '/api/collect/link-job/remove', '/api/collect/ingest-push',
-        '/api/collect/api-run', '/api/collect/api-stop', '/api/collect/api-status', '/api/collect/api-selftest']);
+        '/api/collect/api-run', '/api/collect/api-stop', '/api/collect/api-status', '/api/collect/api-selftest',
+        /* ★ 2026-11-14 直连采集: 纯 HTTP、不驱动 CDP, 与页面采集互不干扰 → 不在守卫范围 */
+        '/api/collect/direct', '/api/collect/direct/stop']);
       if (req.method === 'POST' && p.startsWith('/api/collect/') && !GUARD_SKIP.has(p)) {
         const busy = !!(collectProgress && collectProgress.running);
         if (busy) {
@@ -11384,6 +11818,24 @@ const opHandler = (req, res) => {
       }
       /* ★ 2026-10-04(按《优化文档.md》§7): 站点一致性校验结果 —— 每个站点的
        *   送货地址 / 国家地区 / 货币 是否与链接站点对上, 以及自动修正了什么。 */
+      /* 变体抓取（HTTP 逆向页面 HTML + 智赢补价），面板与采集共用 */
+      if (p === '/api/zy/variants' && req.method === 'POST') {
+        try {
+          const asin = String(j.asin || '').trim().toUpperCase();
+          if (!/^[A-Z0-9]{10}$/.test(asin)) return send(400, { ok: false, error: '需要合法 asin' });
+          const out = await fetchVariantsHttp(asin, String(j.site || 'de').toLowerCase());
+          return send(200, out);
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 240) }); }
+      }
+
+      /* 按站点修正采集浏览器: 邮编 / 国家 / 货币（面板设置里的「切到本店站点」用它） */
+      if (p === '/api/zy/locale/fix' && req.method === 'POST') {
+        try {
+          const r = await localeFixHttp(j.site, { zip: j.zip, currency: j.currency });
+          return send(200, r);
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
+
       if (p === '/api/collect/locale' && req.method === 'GET') {
         return send(200, { ok: true, locale: lastLocaleCheck || null, ttlMs: LOCALE_TTL_MS, countryFixTtlMs: COUNTRY_FIX_TTL });
       }
@@ -11638,84 +12090,7 @@ const opHandler = (req, res) => {
         });
       }
 
-      // ---- 物流配置 (云途 sourcekey / AppToken) ----
-      if (p === '/api/logistics/config' && req.method === 'GET') {
-        let cfg = {};
-        try { cfg = JSON.parse(fs.readFileSync(path.join(DATA, 'logistics-config.json'), 'utf8')); } catch {}
-        return send(200, { ok: true, sourcekey: cfg.sourcekey || '', appToken: cfg.appToken || '', EBusinessID: cfg.EBusinessID || '', kdAppKey: cfg.AppKey || '' });
-      }
-      if (p === '/api/logistics/config' && req.method === 'POST') {
-        try {
-          const file = path.join(DATA, 'logistics-config.json');
-          let cfg = {};
-          try { cfg = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
-          if (j.sourcekey !== undefined) cfg.sourcekey = String(j.sourcekey).trim();
-          if (j.appToken !== undefined) cfg.appToken = String(j.appToken).trim();
-          fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
-          return send(200, { ok: true, sourcekey: cfg.sourcekey || '', appToken: cfg.appToken || '' });
-        } catch (e) {
-          return send(500, { error: '保存配置失败: ' + (e && e.message || e) });
-        }
-      }
-      // ---- 物流报价表 (本地维护, 按国家×渠道, 每日/手动更新) ----
-      // 数据模型: { version, updatedAt, countries: { "GB": [ { channel, type, firstWeight, firstPrice, contWeight, contPrice, minKg, maxKg, eta, note } ] } }
-      const RATES_FILE = path.join(DATA, 'logistics-rates.json');
-      const loadRates = () => { try { return JSON.parse(fs.readFileSync(RATES_FILE, 'utf8')); } catch { return { version: 1, updatedAt: null, countries: {} }; } };
-      // 本地运费试算: 按国家 + 重量(kg) 计算各渠道费用 (首重+续重)
-      const calcRate = (country, weightKg, rates) => {
-        const list = (rates.countries && rates.countries[country]) || [];
-        return list.map((c) => {
-          const w = Math.max(0.001, weightKg);
-          let total = null;
-          if (c.firstWeight != null && c.firstPrice != null) {
-            const firstW = parseFloat(c.firstWeight) || 0.5;
-            const contW = parseFloat(c.contWeight) || 0.5;
-            const contP = parseFloat(c.contPrice) || 0;
-            if (w <= firstW) total = parseFloat(c.firstPrice);
-            else total = parseFloat(c.firstPrice) + Math.ceil((w - firstW) / contW) * contP;
-          }
-          return { channel: c.channel, type: c.type || '', eta: c.eta || '', firstWeight: c.firstWeight, firstPrice: c.firstPrice, contWeight: c.contWeight, contPrice: c.contPrice, total: total != null ? Math.round(total * 100) / 100 : null, note: c.note || '' };
-        }).filter((q) => q.total != null);
-      };
-      if (p === '/api/logistics/rates' && req.method === 'GET') {
-        const rates = loadRates();
-        const country = String(url.searchParams.get('country') || '').toUpperCase();
-        const weightKg = parseFloat(url.searchParams.get('weight')) || 0;
-        if (country && weightKg > 0) {
-          // 试算模式: 返回该国家各渠道报价
-          const quotes = calcRate(country, weightKg, rates);
-          return send(200, { ok: true, country, weightKg, updatedAt: rates.updatedAt, count: quotes.length, quotes, note: '本地报价表试算, 价格为录入值, 请定期更新' });
-        }
-        return send(200, { ok: true, updatedAt: rates.updatedAt, countryCount: Object.keys(rates.countries || {}).length, countries: rates.countries || {} });
-      }
-      if (p === '/api/logistics/rates' && req.method === 'POST') {
-        try {
-          const rates = loadRates();
-          // 两种模式: 单条保存 { country, channel, ... } | 整表覆盖 { countries } | 刷新时间 { _touch }
-          if (j._touch) {
-            // 仅刷新 updatedAt (标记已更新)
-          } else if (j.countries) {
-            rates.countries = j.countries;
-          } else if (j.country && j.channel) {
-            const cc = String(j.country).toUpperCase();
-            if (!rates.countries[cc]) rates.countries[cc] = [];
-            const item = { channel: String(j.channel), type: j.type || '', firstWeight: parseFloat(j.firstWeight) || 0.5, firstPrice: parseFloat(j.firstPrice) || 0, contWeight: parseFloat(j.contWeight) || 0.5, contPrice: parseFloat(j.contPrice) || 0, eta: j.eta || '', note: j.note || '' };
-            if (j.remove) rates.countries[cc] = rates.countries[cc].filter((c) => c.channel !== item.channel);
-            else {
-              const idx = rates.countries[cc].findIndex((c) => c.channel === item.channel);
-              if (idx >= 0) rates.countries[cc][idx] = { ...rates.countries[cc][idx], ...item };
-              else rates.countries[cc].push(item);
-            }
-          }
-          rates.updatedAt = new Date().toISOString().slice(0, 19).replace('T', ' ');
-          rates.version = (rates.version || 1) + 1;
-          fs.writeFileSync(RATES_FILE, JSON.stringify(rates, null, 2));
-          return send(200, { ok: true, updatedAt: rates.updatedAt, countryCount: Object.keys(rates.countries || {}).length });
-        } catch (e) {
-          return send(500, { error: '保存报价表失败: ' + (e && e.message || e) });
-        }
-      }
-      // ---- 实时汇率 (免费 API 每日快照, 可手动覆盖; 基准 CNY) ----
+
       if (p === '/api/rates' && req.method === 'GET') {
         const ratesFile = path.join(DATA, 'rates.json');
         let cache = {};
@@ -12156,12 +12531,7 @@ const opHandler = (req, res) => {
           keys: FILTER_KEYS,
           groups: {
             productOnly: ['noRank', 'collectedFrom', 'collectedTo', 'cat1', 'cat2', 'cat1Cn', 'famFilter', 'famKey', 'famAny'],   // ★ 补登记: 这些条件采集侧无对应判定 (badgeNot/hasRankOnly 两处同义, 故不在此列)
-            /* ★ 2026-10-02 修: dropOtherBrand(他牌商品/剔除他牌) 原来不在 collectOnly,
-             *   于是商品管理面板里也画了它 —— 但 /api/products 的查询链路根本不认这个键,
-             *   用户点了"没反应"(实测 dropOtherBrand=0 → 返回全库 9526 条, 一个都没筛)。
-             *   它是采集侧概念(采集时要不要把非目标品牌的商品也收下), 商品库里没有这个维度,
-             *   所以登记成 collectOnly: 采集面板照常显示, 商品管理面板不再显示。 */
-            collectOnly: ['shopAplus', 'brandShop', 'brandStore', 'dropOtherBrand'],
+            collectOnly: ['shopAplus', 'brandShop', 'brandStore'],
           },
           tmCountryOptions: tmOpts,
           tmCountryCounts: [...tmSeen.entries()].sort((a, b) => b[1] - a[1]).slice(0, 40).map(([c, n]) => ({ country: c, count: n })),
@@ -12627,6 +12997,8 @@ const opHandler = (req, res) => {
           try { fcanon = normFilter(JSON.parse(fraw)); } catch (e) { fcanon = null; }
         }
         const q = fcanon ? filterToQuery(fcanon) : url.searchParams;
+        /* ★ 2026-11-15 店铺维度: 卡片可售状态按所选店铺展示 */
+        const shopAbbr = String(url.searchParams.get('shopAbbr') || '').toUpperCase();
         let list = [...products];
         if (q.get('risk')) list = list.filter((x) => x.aiRiskLevel === q.get('risk'));
         if (q.get('fba')) list = list.filter((x) => x.fulfill === q.get('fba'));
@@ -12733,6 +13105,18 @@ const opHandler = (req, res) => {
         const badgeNotQ = String(q.get('badgeNot') || '').split(/[,，]/).map((s) => s.trim()).filter(Boolean);
         if (badgeNotQ.length) list = list.filter((x) => !badgeNotQ.some((b) => itemMatchesBadge(x, b)));
         // 1688 同款 / 品牌状态 (与采集过滤同一语义)
+        if (q.get('bgStatus')) {
+          const want = String(q.get('bgStatus'));
+          list = list.filter((x) => {
+            if (shopAbbr) {
+              const by = x.bgByAccount || {};
+              return String(((by[shopAbbr] || {}).status) || '') === want;
+            }
+            if (String(x.bgStatus || '') === want) return true;
+            const by = x.bgByAccount || {};
+            return Object.keys(by).some((k) => String((by[k] || {}).status || '') === want);
+          });
+        }
         if (q.get('is1688') === '1') list = list.filter((x) => x.is1688 === true);
         else if (q.get('is1688') === '0') list = list.filter((x) => x.is1688 !== true);
         if (q.get('brandStatus') === 'registered') list = list.filter((x) => x.brandStatus !== 'registered');
@@ -12816,7 +13200,22 @@ const opHandler = (req, res) => {
         else if (famFilter === 'confirmed') list = list.filter((x) => isMultiFam(x) && (x.variantSrc === 'twister' || x.variantSrc === 'card'));
         else if (famFilter === 'manual') list = list.filter((x) => isMultiFam(x) && x.variantSrc === 'manual');
         else if (famFilter === 'hideGuess') list = list.filter((x) => !(isMultiFam(x) && x.variantSrc === 'title'));   // 隐藏标题推测族
-        else if (famFilter === 'repOnly') list = list.filter((x) => !(isMultiFam(x) && x.variantRole === 'child'));     // 只看族代表(服务端折叠)
+        else if (famFilter === 'repOnly') {
+          /* ★ 2026-11-14 每族保留【一个】代表（原来只按 "variantRole !== child" 过滤，
+           *   遇到"只有 child、库里没有 parent 行"的族会把整族 100+ 条全删光 → 列表里直接消失）。
+           *   代表优先级: 明确 parent 角色 > asin === 族键 > 同族第一条。 */
+          const __rep = new Map();
+          for (const x of products) {
+            const k = famKeyOfX(x);
+            if (!k) continue;
+            const cur = __rep.get(k);
+            const better = !cur
+              || (x.variantRole === 'parent' && cur.variantRole !== 'parent')
+              || (x.asin === k && cur.asin !== k && cur.variantRole !== 'parent');
+            if (better) __rep.set(k, x);
+          }
+          list = list.filter((x) => { const k = famKeyOfX(x); return k ? __rep.get(k) === x : true; });
+        }
         // ★ 族内任一满足 → 整族保留: 把同族未被筛中的成员补回来(选品直觉: 这个族里有符合条件的就是目标)
         if (q.get('famAny') === '1') {
           const keepFams = new Set();
@@ -12839,17 +13238,47 @@ const opHandler = (req, res) => {
         // 分页: 必须从原始 URL 参数读 (q 在带 filter= 时是过滤条件换算出来的查询串, 里面没有 limit)
         const limitRaw = url.searchParams.get('limit');
         const offsetRaw = url.searchParams.get('offset');
+        /* ★ 2026-11-14 变体族: 给每个商品带上 famKey(族键) + famCount(全库同族数量)。
+         *   前端据此决定是否显示「🔀 变体商品」按钮，并按 famKey 拉全族成员。 */
+        const __famCnt = new Map();
+        for (const __x of products) { const __k = famKeyOfX(__x); if (__k) __famCnt.set(__k, (__famCnt.get(__k) || 0) + 1); }
+        list = list.map((x) => { const k = famKeyOfX(x); return Object.assign({}, x, { famKey: k, famCount: __famCnt.get(k) || 1 }); });
+
         const totalAll = list.length;
-        let returned = totalAll, offUsed = 0;
+        let returned = totalAll, offUsed = 0, truncated = false;
         if (limitRaw !== null && limitRaw !== '' && !isNaN(parseInt(limitRaw, 10))) {
-          const lim = Math.min(5000, Math.max(1, parseInt(limitRaw, 10)));
+          const lim = Math.min(500, Math.max(1, parseInt(limitRaw, 10)));   // ★ 2026-11-14 5000→500: 全库已 40MB, 一次给太多会压垮宿主 RPC
           offUsed = (offsetRaw !== null && offsetRaw !== '' && !isNaN(parseInt(offsetRaw, 10))) ? Math.max(0, parseInt(offsetRaw, 10)) : 0;
           list = list.slice(offUsed, offUsed + lim);
           returned = list.length;
+        } else if (list.length > 500) {
+          /* ★ 2026-11-14 护栏: 不传 limit 时不再回全库(9866 条/41MB → 宿主 fetch 失败)。
+           *   老客户端(不带 limit)也能正常打开, 只是只能看到前 500 条。 */
+          list = list.slice(0, 500);
+          returned = list.length;
+          truncated = true;
         }
+        /* ★ 2026-11-14 列表瘦身: 详情字段（五点/报价明细/洞察/报价历史等）列表页用不到，
+         *   但占了 40MB 里的绝大部分；slim=1 时裁掉，列表接口从数十 MB 降到几百 KB。 */
+        if (url.searchParams.get('slim') === '1') {
+          const DROP = ['bulletPoints', 'offers', 'insight', 'offerPrices', 'apiPackageDimensions',
+            'apiDimensions', 'apiDimensionsUnit', 'variants', 'variantAttrs', 'brandSources', 'suggestMarket',
+            'brandLink', 'catPath', 'searchTerms', 'description', 'aplusRaw', 'images'];
+          list = list.map((x) => {
+            const o = {};
+            for (const k in x) if (DROP.indexOf(k) < 0) o[k] = x[k];
+            return o;
+          });
+        }
+
         /* ★ 2026-10-18 单品选品分析: 只给这一页打标签(用全库算类目基准, 60s 缓存, 失败不影响主流程) */
         try { productInsight.annotate(list, products); } catch (e) {}
-        return send(200, { total: totalAll, returned, offset: offUsed, items: list });
+        if (shopAbbr) {
+          list = list.map((x) => Object.assign({}, x, {
+            bgView: (function () { const b = (x.bgByAccount || {})[shopAbbr]; return b && b.status ? { status: b.status, abbr: shopAbbr, at: b.at || null } : null; })(),
+          }));
+        }
+        return send(200, { total: totalAll, returned, offset: offUsed, truncated, items: list });
       }
 
       // 面板补全更新 (对已入库商品重新读插件面板, 全程 CDP, 修正品牌/商标/排名/销量)
@@ -13577,7 +14006,8 @@ const opHandler = (req, res) => {
           } catch (e) {
             job.error = String((e && e.message) || e).slice(0, 300);
           } finally {
-            job.running = false; job.finishedAt = now();
+            job.running = false;
+            job.finishedAt = now();
           }
         })();
         return send(200, { ok: true, started: true, job: apiJobPublic() });
@@ -13624,9 +14054,11 @@ const opHandler = (req, res) => {
        * ══════════════════════════════════════════════════════════════════════ */
       if (p === '/api/bg/accounts' && req.method === 'GET') {
         try {
-          const list = await bgAccounts();
+          /* ?force=1 → 绕过 60s 缓存（用户刚重新授权店铺时用这个立刻看到新状态） */
+          const force = /(?:^|&)force=1/.test(String(req.url || '').split('?')[1] || '');
+          const list = await bgAccounts(force);
           const usable = list.filter((a) => a.usable).length;
-          return send(200, { ok: true, accounts: list, total: list.length, usable: usable,
+          return send(200, { ok: true, accounts: list, total: list.length, usable: usable, cached: !force,
             note: usable ? null : '全部授权账号已被禁用(flag=9)，请先在智赢后台重新授权/启用店铺，BG 检测才能用' });
         } catch (e) {
           return send(500, { ok: false, error: String((e && e.message) || e).slice(0, 300), pluginHint: '需要采集浏览器 9222 + 智赢选品插件已登录' });
@@ -13753,7 +14185,1208 @@ const opHandler = (req, res) => {
         }
       }
 
+      /* ══════════════════════════════════════════════════════════════════════
+       * 智赢数据源「直连通道」+ 店铺可售体检（2026-11-13 接入）
+       *
+       * 逆向来源：智赢选品扩展 5.2.0
+       *   签名 = 扩展内嵌安全 wasm（解密副本已随插件放在 erp/tools/zy-security.wasm）
+       *   token = 插件 chrome.storage.local['zying_token']，之后用 AuthV2/RefreshToken 自动续期
+       *   → 不经过浏览器插件，直接 HTTP 拿数据（见 erp/zy-standalone.js）
+       *
+       * 提供：
+       *   GET  /api/zy/status       直连通道状态（token/账号/配额）
+       *   POST /api/zy/token        {bootstrap:true} 从插件取 token / {token:"..."} 手动设置
+       *   GET  /api/zy/accounts     授权店铺（直连）
+       *   POST /api/zy/product      {asins,site} 直连取商品数据（标题/图/品牌/价格/BSR/尺寸/备案）
+       *   POST /api/bg/scan         店铺可售体检（后台任务，直连通道）
+       *   GET  /api/bg/scan/status  进度
+       *   POST /api/bg/scan/stop    停止
+       * ══════════════════════════════════════════════════════════════════════ */
+      if (p === '/api/zy/status' && req.method === 'GET') {
+        try { return send(200, Object.assign({ ok: true }, await zyStandalone.status())); }
+        catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+      if (p === '/api/zy/token' && req.method === 'POST') {
+        try {
+          if (j.token) {
+            const t = zyStandalone.saveToken(String(j.token).trim(), { source: 'manual' });
+            return send(200, { ok: true, source: t.source, length: String(j.token).trim().length });
+          }
+          const t = await zyStandalone.bootstrapFromPlugin();
+          return send(200, { ok: true, source: t.source, length: t.token.length });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+      /* 账号授权到期监控（用未公开的 amazon_acc.detail 拿 acc_expire） */
+      if (p === '/api/zy/expiry' && req.method === 'GET') {
+        try {
+          const list = await zyStandalone.accounts();
+          const out = [];
+          for (const a of list) {
+            let expire = null, mtime = null, token = null;
+            try {
+              const r = await zyStandalone.callAuto(zyStandalone.AMZ, '/CmdHandler?cmd=amazon_acc.detail', { id: a.id });
+              const root = (((r.json || {}).data || {}).root) || [];
+              const d = root.find((x) => x.acc_id === a.id) || root[0] || {};
+              expire = d.acc_expire || null;
+              mtime = d.acc_mtime || null;
+              token = d.acc_token ? '有' : '无';
+            } catch (e) {}
+            let daysLeft = null;
+            if (expire) {
+              const t = Date.parse(String(expire).replace(' ', 'T'));
+              if (!isNaN(t) && new Date(t).getFullYear() > 2000) daysLeft = Math.round((t - Date.now()) / 86400e3);
+            }
+            out.push({ id: a.id, abbr: a.abbr, name: a.name, flag: a.flag, usable: a.usable,
+              expire: expire, daysLeft: daysLeft, lastSync: mtime, hasToken: token,
+              warn: daysLeft != null && daysLeft < 30 });
+            await new Promise((r2) => setTimeout(r2, 150));
+          }
+          return send(200, { ok: true, accounts: out, needReauth: out.filter((x) => !x.usable).length, soon: out.filter((x) => x.warn).length });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+
+      if (p === '/api/zy/accounts' && req.method === 'GET') {
+        try {
+          const list = await zyStandalone.accounts();
+          return send(200, { ok: true, accounts: list, total: list.length, usable: list.filter((a) => a.usable).length, channel: 'standalone' });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+      /* ─── 智赢账号「账号密码」统一保管（AES-256-GCM）───
+       *   密码永不回传；登录成功后产物是 token，落到 token 仓库供所有数据请求使用。 */
+      if (p === '/api/zy/logins' && req.method === 'GET') {
+        try { return send(200, Object.assign({ ok: true }, zyAccounts.list())); }
+        catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
+      if (p === '/api/zy/logins' && req.method === 'POST') {
+        try {
+          const r = zyAccounts.upsert(j.label, j.name, j.pwd);
+          return send(200, { ok: true, account: r, list: zyAccounts.list() });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
+      if (p === '/api/zy/logins/login' && req.method === 'POST') {
+        try {
+          const id = String(j.id || '');
+          const a = zyAccounts.getRaw(id);
+          const pwd = zyAccounts.passwordOf(id);
+          const r = await zyStandalone.loginV2({
+            name: a.name, pwd: pwd,
+            code: j.code == null ? null : String(j.code),
+            codeId: j.codeId == null ? null : String(j.codeId),
+            type: j.type == null || j.type === '' ? null : Number(j.type),
+          });
+          if (r.ok && r.token) {
+            zyStandalone.addToken(a.label || a.name, r.token, { source: 'saved-login' });
+            zyAccounts.mark(id, true);
+            return send(200, { ok: true, loggedIn: true, list: zyAccounts.list(), tokens: zyStandalone.listTokens() });
+          }
+          zyAccounts.mark(id, false, r.message, r.needSms);
+          return send(200, { ok: false, loggedIn: false, needSms: !!r.needSms, phone: r.phone, message: r.message, list: zyAccounts.list() });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+      if (p === '/api/zy/logins/rename' && req.method === 'POST') {
+        try {
+          const r = zyAccounts.rename(String(j.id || ''), j.label);
+          return send(200, { ok: true, account: r, list: zyAccounts.list() });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
+      if (p === '/api/zy/logins/remove' && req.method === 'POST') {
+        try { const r = zyAccounts.remove(String(j.id || '')); return send(200, { ok: true, result: r, list: zyAccounts.list() }); }
+        catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
+
+      /* ═══════════ ifast.top 直连（上架系统）═══════════
+       * 认证：shiroCookie（从采集浏览器抓一次，存本机）
+       * 上架单位：站点 siteId + 跟卖方案 sellingId
+       */
+      /* 变体规格：从商品数据推导维度（颜色/尺码/尺寸/款式/容量…），支持多维 */
+      if (p === '/api/variant-dims' && req.method === 'POST') {
+        try {
+          const LABEL = {
+            color: '颜色', colour: '颜色', size: '尺寸', size_name: '尺码', style: '款式',
+            pattern: '图案', configuration: '配置', capacity: '容量', flavor: '口味', scent: '香味',
+            material: '材质', item_package_quantity: '包装数量', number_of_items: '数量',
+            customer_package_type: '包装', model: '型号', theme: '主题',
+          };
+          const ORDER = ['color', 'colour', 'size_name', 'size', 'style', 'pattern', 'configuration', 'capacity', 'flavor', 'scent', 'material', 'model', 'theme'];
+          const wanted = (Array.isArray(j.asins) ? j.asins : []).map((x) => String(x).toUpperCase()).filter(Boolean);
+          const site = String(j.site || '').toLowerCase();
+          const out = {};
+          for (const asin of wanted) {
+            const p2 = products.find((x) => String(x.asin).toUpperCase() === asin && (!site || String(x.site || '') === site))
+              || products.find((x) => String(x.asin).toUpperCase() === asin);
+            const attrs = Object.assign({}, (p2 && p2.variantAttrs) || {});
+            if (p2) {
+              if (!attrs.color && p2.color) attrs.color = p2.color;
+              if (!attrs.size && p2.variantSize) attrs.size = p2.variantSize;
+            }
+            /* 清掉无意义的占位值 */
+            Object.keys(attrs).forEach((k) => {
+              const v = attrs[k];
+              if (v == null || v === '' || /^(siehe beschreibung|see description|n\/a|-)$/i.test(String(v).trim())) delete attrs[k];
+            });
+            const dims = [];
+            const keys = Object.keys(attrs).sort((a, b) => {
+              const ia = ORDER.indexOf(a), ib = ORDER.indexOf(b);
+              return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+            });
+            for (const k of keys) {
+              dims.push({ key: k, label: LABEL[k] || k, value: String(attrs[k]) });
+            }
+            out[asin] = dims;
+          }
+          return send(200, { ok: true, dims: out });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
+      /* 变体颜色识别：按 ASIN 取主图主色 → 中文色名（缓存 24h） */
+      if (p === '/api/variants/colors' && req.method === 'POST') {
+        try {
+          const asins = (Array.isArray(j.asins) ? j.asins : []).map((x) => String(x).toUpperCase());
+          if (!asins.length) return send(200, { ok: true, colors: {} });
+          const items = asins.map((a) => {
+            const p2 = products.find((x) => String(x.asin).toUpperCase() === a);
+            return { asin: a, image: (p2 && (p2.mainImage || p2.image)) || '' };
+          }).filter((x) => x.image);
+          const colors = await variantColor.detect(items);
+          /* 回写商品库，后续直接用 */
+          let wrote = 0;
+          for (const p2 of products) {
+            const c = colors[String(p2.asin).toUpperCase()];
+            if (c) { p2.colorName = c.color; p2.colorHex = c.hex; wrote++; }
+          }
+          if (wrote) save('products.json', products);
+          return send(200, { ok: true, count: Object.keys(colors).length, colors });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
+
+      /* ═══════ 智赢实时运价（逆向 RPC 直连，不用登录）═══════ */
+      if (p === '/api/zy/freight/status' && req.method === 'GET') {
+        try { return send(200, Object.assign({ ok: true }, zyFreight.status())); }
+        catch (e) { return send(200, { ok: false, error: String((e && e.message) || e) }); }
+      }
+      if (p === '/api/debug/hc' && req.method === 'GET') {
+        try {
+          const site = String(url.searchParams.get('site') || 'uk').toLowerCase();
+          const target = String(url.searchParams.get('url') || '/');
+          const r = await hcFetch(site, target);
+          const asins = hcAsins(r.html);
+          const ck = await getAmazonCookieHeader(site, false);
+          return send(200, { ok: true, status: r.status, bytes: r.html.length, asins: asins.length, sample: asins.slice(0, 8), cookieCount: ck.count, cookieAgeMin: Math.round((Date.now() - ck.at) / 60000), captcha: /captcha|Robot Check|Enter the characters/i.test(r.html) });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e) }); }
+      }
+      if (p === '/api/zy/freight/quote' && req.method === 'GET') {
+        try {
+          const country = String(url.searchParams.get('country') || 'DE').toUpperCase();
+          const weightG = Number(url.searchParams.get('weight') || url.searchParams.get('weightG') || 200);
+          const refresh = url.searchParams.get('refresh') === '1';
+          /* ★ 固定默认渠道: 云途普货（客户要求不可更改；没传 channel 也走它） */
+          const channelKey = String(url.searchParams.get('channel') || '').trim() || '云途普货';
+          const r = await zyFreight.quote(country, weightG, { refresh });
+          let picked = r.channels[0] || null;
+          let channelMissing = false;
+          if (channelKey) {
+            const hit = r.channels.find((c) => c.channel === channelKey)
+              || r.channels.find((c) => c.channelFull === channelKey)
+              || r.channels.find((c) => c.channel.includes(channelKey))
+              || r.channels.find((c) => (c.channelFull || '').includes(channelKey));
+            if (hit) picked = hit;
+            else channelMissing = true;
+          }
+          return send(200, Object.assign({ ok: true, cheapest: r.channels[0] || null, picked, channelMissing }, r));
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e) }); }
+      }
+      if (p === '/api/zy/freight/channels' && req.method === 'GET') {
+        try {
+          const cs = await zyFreight.fetchChannels({ refresh: url.searchParams.get('refresh') === '1' });
+          return send(200, { ok: true, count: cs.length, channels: cs.map((c) => ({ name: c.name, nameFull: c.nameFull || c.name, factor: c.factor, countries: Object.keys(c.countries) })) });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e) }); }
+      }
+      /* 渠道附加费（挂号/操作费等固定项，不在运价表里，可随时调整） */
+      /* 校准：用客户端实测价反推该渠道附加费（自动写入附加费表）
+       * POST { country:'DE', weightG:200, channel:'云途普货', clientPrice:77.62, scope:'channel'|'country' } */
+      if (p === '/api/zy/freight/calibrate' && req.method === 'POST') {
+        try {
+          const country = String(j.country || '').toUpperCase();
+          const weightG = Number(j.weightG || j.weight || 0);
+          const channel = String(j.channel || '').trim();
+          const clientPrice = Number(j.clientPrice);
+          if (!country || !weightG || !channel || !(clientPrice > 0)) {
+            return send(400, { ok: false, error: '需要 country / weightG / channel / clientPrice' });
+          }
+          const r = await zyFreight.quote(country, weightG, { refresh: true });
+          const hit = r.channels.find((c) => c.channel === channel)
+            || r.channels.find((c) => (c.channelFull || '').includes(channel));
+          if (!hit) return send(200, { ok: false, error: '该站点没有这个渠道: ' + channel });
+          const baseNoSurcharge = Math.round((hit.price - (hit.surcharge || 0)) * 100) / 100;
+          const diff = Math.round((clientPrice - baseNoSurcharge) * 100) / 100;
+          const map = zyFreight.loadSurcharge();
+          /* 默认按国家范围（同一渠道在不同国家的服务费可能不同） */
+          const key = (j.scope === 'channel') ? channel : (channel + '@' + country);
+          if (diff === 0) delete map[key]; else map[key] = diff;
+          zyFreight.saveSurcharge(map);
+          return send(200, {
+            ok: true, country, weightG, channel, clientPrice,
+            base: baseNoSurcharge, surcharge: diff, key, map,
+            message: diff === 0 ? '无需附加费，已移除' : ('已记录附加费 ' + diff + ' 元/票 → ' + key),
+          });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
+      if (p === '/api/zy/freight/surcharge' && req.method === 'GET') {
+        try { return send(200, { ok: true, map: zyFreight.loadSurcharge() }); }
+        catch (e) { return send(200, { ok: false, error: String((e && e.message) || e) }); }
+      }
+      if (p === '/api/zy/freight/surcharge' && req.method === 'POST') {
+        try {
+          const map = (j && typeof j.map === 'object') ? j.map : null;
+          if (!map) return send(400, { ok: false, error: '需要 {map:{渠道:金额}}' });
+          const clean = {};
+          for (const k of Object.keys(map)) {
+            const v = Number(map[k]);
+            if (Number.isFinite(v) && v !== 0) clean[k] = v;
+          }
+          zyFreight.saveSurcharge(clean);
+          return send(200, { ok: true, map: clean });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e) }); }
+      }
+      if (p === '/api/zy/freight/frame' && req.method === 'POST') {
+        try {
+          let buf = null;
+          if (j.frameHex) buf = Buffer.from(String(j.frameHex), 'hex');
+          else if (j.frameBase64) buf = Buffer.from(String(j.frameBase64), 'base64');
+          if (!buf || !buf.length) return send(400, { ok: false, error: '需要 frameHex 或 frameBase64' });
+          zyFreight.saveFrame(buf, { source: j.source || 'manual' });
+          return send(200, { ok: true, bytes: buf.length });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e) }); }
+      }
+
+      if (p === '/api/ifast/status' && req.method === 'GET') {
+        try { return send(200, Object.assign({ ok: true }, await ifastClient.status())); }
+        catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
+      if (p === '/api/ifast/cookie' && req.method === 'POST') {
+        try {
+          if (j.browser) {
+            const r = await ifastClient.captureCookieFromBrowser();
+            return send(200, { ok: true, source: 'browser', count: r.count, status: await ifastClient.status() });
+          }
+          const ck = String(j.cookie || '').trim();
+          if (!ck) return send(400, { ok: false, error: '需要 cookie，或传 browser:true 从浏览器抓' });
+          ifastClient.saveCookie(ck);
+          return send(200, { ok: true, source: 'manual', status: await ifastClient.status() });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+      if (p === '/api/ifast/items' && req.method === 'POST') {
+        try {
+          const r = await ifastClient.listItems({ page: Number(j.page) || 1, limit: Number(j.limit) || 50,
+            asinSearch: j.asinSearch || '', searchName: j.searchName || '', siteId: j.siteId || '', sellingId: j.sellingId || '' });
+          return send(200, { ok: true, total: r.total, items: r.items });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+      /* 批量/多变体上架：{ site, sellingId|sellingName, stock, leadDays, onOff, autoUpload, items:[{asin,initPrice,lowerPrice,title,brand,image}] } */
+      if (p === '/api/ifast/add' && req.method === 'POST') {
+        try {
+          const sites = await ifastClient.sites();
+          const siteId = String(j.siteId || ifastClient.siteIdOf(sites, j.site) || '');
+          if (!siteId) return send(200, { ok: false, error: '站点无法识别: ' + j.site });
+          const shops = await ifastClient.shops();
+          let sellingId = String(j.sellingId || '');
+          if (!sellingId && j.sellingName) {
+            const hit = shops.find((x) => x.name === j.sellingName);
+            if (hit) sellingId = hit.id;
+          }
+          if (!sellingId) sellingId = (shops[0] || {}).id || '';
+          const items = (Array.isArray(j.items) ? j.items : []).filter((x) => x && /^[A-Z0-9]{10}$/.test(String(x.asin || '').toUpperCase()));
+          if (!items.length) return send(200, { ok: false, error: 'items 为空' });
+
+          /* 幂等：同站点已存在就跳过 */
+          const exist = await ifastClient.duplicates(items.map((x) => x.asin), siteId);
+          const fresh = items.filter((x) => !exist[String(x.asin).toUpperCase()]);
+          if (!fresh.length) {
+            return send(200, { ok: true, added: 0, skipped: Object.keys(exist).length, duplicated: exist, note: '全部已存在（同站点）' });
+          }
+
+          const r = await ifastClient.addItems({
+            siteId, sellingId, stock: j.stock, fulfillmentLatency: j.leadDays, onOff: j.onOff, remark: j.remark || '', items: fresh,
+          });
+
+          /* 回查刚加进去的记录 id（用于提交亚马逊 / 回写） */
+          let ids = [];
+          try {
+            const chk = await ifastClient.listItems({ page: 1, limit: Math.min(200, fresh.length * 2), siteId });
+            const want = new Set(fresh.map((x) => String(x.asin).toUpperCase()));
+            ids = (chk.items || []).filter((x) => want.has(String(x.asin || '').toUpperCase())).map((x) => x.id);
+          } catch (e) {}
+
+          /* ★ 上架成功 → 自动写「选品归档」（价格 = 最终绿色承受价 lowerPrice） */
+          let archived = 0;
+          const shopName = ((shops || []).find((x) => String(x.id) === String(sellingId)) || {}).name || String(sellingId);
+          const siteCountry = ((sites || []).find((x) => String(x.id) === String(siteId)) || {}).country || String(j.site || '').toUpperCase();
+          const siteCode = (String(siteCountry).toUpperCase() === 'GB' ? 'UK' : String(siteCountry)).toLowerCase();
+          const listedAt = now();
+          for (const it of fresh) {
+            try {
+              const asinU = String(it.asin).toUpperCase();
+              const rec = {
+                asin: asinU, site: siteCode, shop: shopName, status: 'listed',
+                title: it.title || null, brand: it.brand || null, mainImage: it.image || null,
+                url: 'https://www.amazon.' + (siteCode === 'uk' ? 'co.uk' : siteCode) + '/dp/' + asinU,
+                price: it.lowerPrice != null && it.lowerPrice !== '' ? Number(it.lowerPrice) : null,   // ★ 绿色最终价
+                currency: (typeof siteCurrency === 'function' ? siteCurrency(siteCode) : null),
+                fill: {
+                  initPrice: it.initPrice != null && it.initPrice !== '' ? Number(it.initPrice) : null,
+                  bearPrice: it.lowerPrice != null && it.lowerPrice !== '' ? Number(it.lowerPrice) : null,
+                  purchaseCost: j.purchaseCost != null ? Number(j.purchaseCost) : (j.cost != null ? Number(j.cost) : null),
+                  logisticsCost: j.logisticsCost != null ? Number(j.logisticsCost) : null,
+                  weightKg: j.weightKg != null ? Number(j.weightKg) : null,
+                  stock: j.stock != null ? Number(j.stock) : null,
+                  leadDays: j.leadDays != null ? Number(j.leadDays) : null,
+                  bearMargin: j.margin != null ? Number(j.margin) : null,
+                  bearNet: j.net != null ? Number(j.net) : null,
+                  bearFx: j.fx != null ? Number(j.fx) : null,
+                },
+                source: 'ifast-direct', savedAt: listedAt, listedAt: listedAt, collectedAt: listedAt,
+              };
+              if (archiveAddListing(rec)) archived++;
+            } catch (e) {}
+          }
+
+          /* ★ 同步写「上架记录」—— ifast 页面上的「搞薯条面板」读的就是这张表 */
+          let recorded = 0;
+          try {
+            const recShop = shopClean(j.shop) || currentShopName() || shopName || null;
+            for (const it of fresh) {
+              const raw = {
+                asin: it.asin, site: siteCode, shop: recShop,
+                title: it.title || null, brand: it.brand || null, mainImage: it.image || null,
+                url: 'https://www.amazon.' + (siteCode === 'uk' ? 'co.uk' : siteCode) + '/dp/' + String(it.asin).toUpperCase(),
+                initPrice: it.initPrice, bearPrice: it.lowerPrice,
+                bearMargin: j.margin, bearNet: j.net, bearFx: j.fx,
+                purchaseCost: j.purchaseCost != null ? j.purchaseCost : (j.cost != null ? j.cost : null),
+                logisticsCost: j.logisticsCost != null ? j.logisticsCost : null,
+                weightKg: j.weightKg != null ? j.weightKg : null,
+                stock: j.stock, leadDays: j.leadDays,
+                followPresetText: shopName || null, allDay: !shopName,
+              };
+              const rec = normalizeListingItem(raw, siteCode, recShop);
+              if (!rec) continue;
+              rec.status = 'listed';
+              rec.listedAt = listedAt;
+              rec.savedAt = listedAt;
+              rec.source = 'amazon-panel';
+              const idx = listingRecords.findIndex((r) => r.id === rec.id);
+              if (idx >= 0) listingRecords[idx] = Object.assign({}, listingRecords[idx], rec);
+              else listingRecords.unshift(rec);
+              recorded++;
+            }
+            if (recorded) save('listing-records.json', listingRecords);
+          } catch (e) {}
+
+          let uploaded = null;
+          if (j.autoUpload && ids.length) {
+            try { await ifastClient.upload(ids); uploaded = { ok: true, count: ids.length }; }
+            catch (e) { uploaded = { ok: false, error: String((e && e.message) || e).slice(0, 200) }; }
+          }
+
+          return send(200, { ok: true, added: r.added || fresh.length, skipped: Object.keys(exist).length,
+            ids, uploaded, archived, recorded, shop: shopName, site: siteCode, duplicated: exist, siteId, sellingId });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+      if (p === '/api/ifast/upload' && req.method === 'POST') {
+        try {
+          const ids = (Array.isArray(j.ids) ? j.ids : []).map((x) => Number(x)).filter((x) => x > 0);
+          if (!ids.length) return send(400, { ok: false, error: '需要 ids 数组' });
+          await ifastClient.upload(ids);
+          return send(200, { ok: true, count: ids.length });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+      if (p === '/api/ifast/on-off' && req.method === 'POST') {
+        try {
+          const ids = (Array.isArray(j.ids) ? j.ids : []).map((x) => Number(x)).filter((x) => x > 0);
+          if (!ids.length) return send(400, { ok: false, error: '需要 ids 数组' });
+          await ifastClient.onOff(ids, j.status === 0 ? 0 : 1);
+          return send(200, { ok: true, count: ids.length, status: j.status === 0 ? 0 : 1 });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+
+      /* ─── 多账号（智赢账号 token）管理：保存 / 一键切换 / 删除 ─── */
+      /* ─── 智赢账号密码登录（面板里直接输入账号密码）─── */
+      if (p === '/api/zy/login' && req.method === 'POST') {
+        try {
+          const name = String(j.name || '').trim();
+          const pwd = String(j.pwd || '');
+          if (!name || !pwd) return send(400, { ok: false, error: '需要账号和密码' });
+          const r = await zyStandalone.loginV2({ name: name, pwd: pwd,
+            code: j.code == null ? null : String(j.code),
+            codeId: j.codeId == null ? null : String(j.codeId),
+            type: j.type == null || j.type === '' ? null : Number(j.type) });
+          if (r.ok && r.token) {
+            const label = String(j.label || name);
+            const a = zyStandalone.addToken(label, r.token, { source: 'password-login' });
+            return send(200, { ok: true, loggedIn: true, account: { id: a.id, label: a.label }, uinfo: r.uinfo, list: zyStandalone.listTokens() });
+          }
+          return send(200, { ok: false, loggedIn: false, needSms: !!r.needSms, needToken: !!r.needToken,
+            phone: r.phone, type: r.type, failtype: r.failtype, message: r.message, raw: r.raw });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+      if (p === '/api/zy/sms' && req.method === 'POST') {
+        try {
+          const r = await zyStandalone.sendSms(String(j.phone == null ? '' : j.phone).trim());
+          return send(200, r);
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+
+      if (p === '/api/zy/tokens' && req.method === 'GET') {
+        try { return send(200, Object.assign({ ok: true }, zyStandalone.listTokens())); }
+        catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
+      if (p === '/api/zy/tokens' && req.method === 'POST') {
+        try {
+          let token = j.token ? String(j.token).trim() : '';
+          let source = 'manual';
+          if (!token) { const t = await zyStandalone.bootstrapFromPlugin(); token = t.token; source = t.source; }
+          const a = zyStandalone.addToken(j.label || null, token, { source: source });
+          return send(200, { ok: true, account: { id: a.id, label: a.label }, list: zyStandalone.listTokens() });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+      if (p === '/api/zy/tokens/active' && req.method === 'POST') {
+        try {
+          const a = zyStandalone.switchToken(String(j.id || ''));
+          return send(200, { ok: true, account: { id: a.id, label: a.label }, list: zyStandalone.listTokens() });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
+      if (p === '/api/zy/tokens/remove' && req.method === 'POST') {
+        try { const r = zyStandalone.removeToken(String(j.id || '')); return send(200, { ok: true, result: r, list: zyStandalone.listTokens() }); }
+        catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
+      /* ─── 多店铺 BG 检测：同一个商品，一次拿到所有店铺的判定 ─── */
+      /* ★ 2026-11-14 列表页卡片数据：一次拿多个 ASIN 的 关键字段 + BG（只查与站点匹配的店铺）
+       *   用途: 浏览器扩展在 Amazon 搜索/品牌列表页，给每张商品卡片下面加一行信息。 */
+      if (p === '/api/zy/cards' && req.method === 'POST') {
+        try {
+          const site = String(j.site || 'de').toLowerCase();
+          let asins = (Array.isArray(j.asins) ? j.asins : [])
+            .map((x) => String(x || '').trim().toUpperCase())
+            .filter((x) => /^[A-Z0-9]{10}$/.test(x));
+          asins = [...new Set(asins)].slice(0, Math.max(1, Math.min(60, Number(j.limit) || 30)));
+          if (!asins.length) return send(200, { ok: true, site: site, items: {}, note: '没有合法 ASIN' });
+
+          const items = {};
+          for (const a of asins) items[a] = { asin: a };
+
+          /* 1) 商品字段（20 条/批） */
+          try {
+            const prod = await zyStandalone.moreAboutAsin(asins, site);
+            for (const [a, r] of Object.entries(prod)) {
+              if (!items[a]) continue;
+              items[a].brand = r.brand || null;
+              items[a].price = r.price != null ? r.price : null;
+              items[a].currency = r.currency || null;
+              items[a].shipping = r.shipping != null ? r.shipping : null;
+              items[a].isFba = r.isFba == null ? null : r.isFba;
+              items[a].shipByAmazon = r.shipByAmazon === true;   // AMZ 自营（用于卡片配色：蓝）
+              items[a].sales = r.sales || null;
+              items[a].brandHasRecord = r.brandHasRecord === true;
+              items[a].offers = r.offers || 0;
+              if (r.bsr && r.bsr.length) {
+                items[a].bsrTop = r.bsr[0].rank || null;
+                items[a].bsrCat = r.bsr[0].title || null;
+                // 大类排名（通常第二项）
+                const main = r.bsr.find((x) => x && x.rank && x.title && x === r.bsr[r.bsr.length - 1]);
+                items[a].bsrMain = main ? main.rank : null;
+              }
+              if (r.firstAvailable) {
+                const m = String(r.firstAvailable).match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+                if (m) {
+                  const t = Date.UTC(+m[1], (+m[2]) - 1, +m[3]);
+                  items[a].firstDays = Math.max(0, Math.round((Date.now() - t) / 86400e3));
+                }
+                items[a].firstAvailable = r.firstAvailable;
+              }
+            }
+          } catch (e) {}
+
+          /* ★ 2026-11-15 先用商品库里已存的 BG 结果（bgByAccount / bgStatus），列表一开就有标签 */
+          try {
+            const byAsin = new Map(products.map((x) => [x.asin, x]));
+            const siteAbbr = site.toUpperCase() === 'UK' ? 'GB' : site.toUpperCase();
+            for (const a of asins) {
+              const p = byAsin.get(a);
+              if (!p) continue;
+              const by = p.bgByAccount || {};
+              const hit = by[siteAbbr];
+              if (hit && hit.status) items[a].bg = { status: hit.status, abbr: siteAbbr, stored: true, at: hit.at || null };
+              else if (p.bgStatus) items[a].bg = { status: p.bgStatus, abbr: p.bgAbbr || null, stored: true, at: p.bgCheckedAt || null };
+            }
+          } catch (e) {}
+
+          /* 2) BG：只查与页面站点匹配的可用店铺，3 并发（只补没存过的） */
+          let bgShop = null;
+          if (j.bg !== false) {
+            try {
+              const accs = await zyStandalone.accounts();
+              const wantAbbr = site === 'uk' ? 'GB' : site.toUpperCase();
+              const matched = accs.filter((a) => a.usable && String(a.abbr || '').toUpperCase() === wantAbbr);
+              bgShop = matched[0] || null;
+              if (bgShop) {
+                const list = asins.filter((a) => !(items[a] && items[a].bg)).slice(0, Math.max(1, Math.min(40, Number(j.bgLimit) || 24)));
+                let idx = 0;
+                const worker = async () => {
+                  while (idx < list.length) {
+                    const a = list[idx++];
+                    try {
+                      const r = await zyStandalone.bgCheck(bgShop.id, a);
+                      if (items[a]) items[a].bg = r.ok ? { status: r.status, abbr: bgShop.abbr } : { status: 'ERROR', error: (r.message || '').slice(0, 60), abbr: bgShop.abbr };
+                    } catch (e) {
+                      if (items[a]) items[a].bg = { status: 'ERROR', error: String(e.message || '').slice(0, 60) };
+                    }
+                    await new Promise((r2) => setTimeout(r2, 120));
+                  }
+                };
+                await Promise.all([worker(), worker(), worker()]);
+              }
+            } catch (e) {}
+          }
+
+          /* ★ 2026-11-14 BG 回流入库：浏览器在列表页自动检测的结果直接写进商品库，
+           *   商品管理里就能"直接显示"BG，不需要再人工点检测。 */
+          try {
+            if (bgShop) {
+              const idx = new Map(products.map((x, i) => [x.asin, i]));
+              const at = now();
+              let wrote = 0;
+              for (const [asin, it] of Object.entries(items)) {
+                if (!it || !it.bg || !it.bg.status || it.bg.status === 'ERROR') continue;
+                const i = idx.get(asin);
+                if (i == null) continue;
+                const p = products[i];
+                p.bgByAccount = Object.assign({}, p.bgByAccount || {}, { [String(bgShop.abbr || bgShop.id)]: { status: it.bg.status, at: at, aid: bgShop.id } });
+                p.bgStatus = it.bg.status;
+                p.bgAbbr = bgShop.abbr || null;
+                p.bgCheckedAt = at;
+                wrote++;
+              }
+              if (wrote) save('products.json', products);
+            }
+          } catch (e) {}
+
+          return send(200, { ok: true, site: site, bgShop: bgShop ? { id: bgShop.id, abbr: bgShop.abbr } : null,
+            count: Object.keys(items).length, items: items });
+        } catch (e) {
+          return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) });
+        }
+      }
+
+      if (p === '/api/bg/probe-multi' && req.method === 'POST') {
+        try {
+          const asin = String(j.asin || '').trim().toUpperCase();
+          if (!/^[A-Z0-9]{10}$/.test(asin)) return send(400, { ok: false, error: '需要合法 asin' });
+          let aids = Array.isArray(j.aids) && j.aids.length ? j.aids : null;
+          /* ★ 2026-11-13 「按站点自动匹配店铺」: 传 sites=['de'] 时只查 DE 店，
+           *   避免 DE 的品在英国店报 ASIN_NOT_FOUND 这种噪音。 */
+          if (!aids && Array.isArray(j.sites) && j.sites.length) {
+            const want = j.sites.map((x) => String(x).toUpperCase());
+            const accs = await zyStandalone.accounts();
+            const matched = accs.filter((a) => a.usable && want.indexOf(String(a.abbr || '').toUpperCase()) >= 0);
+            aids = matched.length ? matched.map((a) => a.id) : null;
+          }
+          const results = await zyStandalone.bgProbeMulti(asin, aids);
+          const stat = {};
+          for (const r of results) stat[r.status] = (stat[r.status] || 0) + 1;
+          /* ★ 2026-11-15 多店结果按站点分别存进 bgByAccount（GB 可售 + DE 可售 都要能同时显示） */
+          try {
+            const idx = products.findIndex((x) => x.asin === asin);
+            if (idx >= 0 && results.length) {
+              const it = products[idx];
+              const by = Object.assign({}, it.bgByAccount || {});
+              const at = utcNow();
+              const RANK = { OK: 0, APPROVAL_REQUIRED: 1, NOT_ELIGIBLE: 2, ASIN_NOT_FOUND: 3, ERROR: 4 };
+              let best = null;
+              for (const r of results) {
+                const ab = String(r.abbr || '').toUpperCase();
+                if (!ab) continue;
+                by[ab] = { status: r.status, at: at, name: r.name || null, aid: r.aid || null };
+                if (!best || (RANK[r.status] == null ? 9 : RANK[r.status]) < (RANK[best.status] == null ? 9 : RANK[best.status])) best = r;
+              }
+              it.bgByAccount = by;
+              if (best) { it.bgStatus = best.status; it.bgAbbr = String(best.abbr || '').toUpperCase() || null; it.bgAccount = best.name || null; it.bgAid = best.aid || null; }
+              it.bgCheckedAt = at;
+              products[idx] = it;
+              save('products.json', products);
+            }
+          } catch (e) { console.error('[bg] 多店结果落库失败:', e && e.message); }
+          return send(200, { ok: true, asin: asin, results: results, stat: stat,
+            aidsUsed: aids || null, sitesIn: j.sites || null,
+            account: (zyStandalone.listTokens().accounts || []).filter((x) => x.active)[0] || null });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+
+      if (p === '/api/zy/product' && req.method === 'POST') {
+        try {
+          const site = String(j.site || 'de').toLowerCase();
+          const asins = (Array.isArray(j.asins) ? j.asins : []).map((x) => String(x).trim().toUpperCase()).filter((x) => /^[A-Z0-9]{10}$/.test(x));
+          if (!asins.length) return send(400, { ok: false, error: '需要 asins 数组' });
+          const limit = Math.min(2000, Math.max(1, Number(j.limit) || asins.length));
+          const list = asins.slice(0, limit);
+          const out = { ok: true, site, count: 0, withTitle: 0, withImage: 0, items: {} };
+          for (let i = 0; i < list.length; i += 20) {
+            const chunk = list.slice(i, i + 20);
+            const data = await zyStandalone.moreAboutAsin(chunk, site).catch(() => ({}));
+            Object.assign(out.items, data);
+            if (j.withTitleImage !== false) {
+              const ti = await zyStandalone.titlesImages(chunk, site).catch(() => ({}));
+              for (const [a, v] of Object.entries(ti)) {
+                out.items[a] = Object.assign(out.items[a] || { asin: a }, { title: v.title, image: v.image });
+              }
+            }
+          }
+          out.count = Object.keys(out.items).length;
+          out.withTitle = Object.values(out.items).filter((x) => x.title).length;
+          out.withImage = Object.values(out.items).filter((x) => x.image).length;
+          /* 可选：直接写回商品库 */
+          if (j.apply === true) {
+            let changed = 0;
+            const byAsin = new Map(products.map((x, i) => [x.asin, i]));
+            for (const [asin, v] of Object.entries(out.items)) {
+              const idx = byAsin.get(asin);
+              if (idx == null) continue;
+              const it = products[idx];
+              const before = JSON.stringify([it.title, it.image || it.mainImage, it.brand, it.price, it.bsrShop]);
+              if (v.title && !it.title) it.title = v.title;
+              if (v.image && !(it.image || it.mainImage)) { it.image = v.image; it.mainImage = it.mainImage || v.image; }
+              if (v.brand && !it.brand) it.brand = v.brand;
+              if (v.price != null && (it.price == null || it.price === 0)) { it.price = v.price; it.currency = v.currency || it.currency; }
+              /* ★ 2026-11-15 全库补齐: 排名字段改为写完整 bsr 数组并回算 rankParent/rankChild */
+              if (Array.isArray(v.bsr) && v.bsr.length) {
+                if (!Array.isArray(it.bsr) || !it.bsr.length) it.bsr = v.bsr.map((b) => ({ rank: b.rank, category: b.title, level: null }));
+              }
+              if (v.firstAvailable) {
+                if (!it.firstAvailable) it.firstAvailable = v.firstAvailable;
+                if (!it.listedAt) it.listedAt = String(v.firstAvailable).slice(0, 10).replace(/\//g, '-');
+              }
+              if (v.dims && !it.dims) it.dims = v.dims;
+              if (v.weight != null && it.weight == null) { it.weight = v.weight; it.weightUnit = v.weightUnit; }
+              if (v.sales && !it.sales) it.sales = v.sales;
+              if (v.sales != null && it.monthlySales == null) { const n = parseInt(String(v.sales).replace(/[<>\s]/g, ''), 10); if (!isNaN(n)) it.monthlySales = n; }
+              if (v.offers != null && (it.followCount == null || it.followCount === 0)) it.followCount = Number(v.offers) || 0;
+              if (v.sellerId && !it.sellerId) { it.sellerId = v.sellerId; if (!it.mainSeller) it.mainSeller = v.sellerId; }
+              if (v.isFba != null && !it.fulfill) it.fulfill = v.isFba ? 'FBA' : 'FBM';
+              if (v.variations && !it.variantAttrs && typeof v.variations === 'object') it.variantAttrs = v.variations;
+              if (Array.isArray(v.bullets) && v.bullets.length && !(Array.isArray(it.bulletPoints) && it.bulletPoints.length)) it.bulletPoints = v.bullets;
+              if (typeof v.brandHasRecord === 'boolean') { it.brandHasRecord = v.brandHasRecord; if (v.brandHasRecord && !it.brandStatus) it.brandStatus = 'registered'; }
+              if (v.trademarkCount != null) it.trademarkCount = v.trademarkCount;
+              if (typeof applyRankFields === 'function') { const merged = applyRankFields(it); products[idx] = merged; }
+              if (JSON.stringify([it.title, it.image || it.mainImage, it.brand, it.price, it.bsrShop]) !== before) changed++;
+            }
+            out.applied = changed;
+            if (changed) save('products.json', products);
+          }
+          return send(200, out);
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+
+      /* ★ 2026-11-13 智赢风格「商品面板」——把直连能拿到的字段聚合成一块面板
+       * 只返回我们确实拿到的字段；拿不到（评分/评论/A+/图集）不返回，前端也不显示。 */
+      if (p === '/api/zy/panel' && req.method === 'POST') {
+        try {
+          const asin = String(j.asin || '').trim().toUpperCase();
+          const site = String(j.site || 'de').toLowerCase();
+          if (!/^[A-Z0-9]{10}$/.test(asin)) return send(400, { ok: false, error: '需要合法 asin' });
+          const out = { ok: true, asin: asin, site: site, source: 'zy-standalone' };
+
+          /* 标题 + 主图 */
+          const ti = await zyStandalone.titlesImages([asin], site).catch(() => ({}));
+          if (ti[asin]) { out.title = ti[asin].title || null; out.image = ti[asin].image || null; }
+
+          /* 商品主体数据 */
+          const v2 = await zyStandalone.moreAboutAsin([asin], site).catch(() => ({}));
+          const r = v2[asin] || null;
+          if (r) {
+            out.brand = r.brand || null;
+            out.manufacturer = r.manufacturer || null;
+            out.bsr = (r.bsr || []).map((b) => ({ title: b.title || null, rank: b.rank || null, id: b.id || null }));
+            out.variations = r.variations || null;
+            out.dims = r.dims || null;
+            out.dimsUnit = r.dimsUnit || null;
+            out.weight = r.weight != null ? r.weight : null;
+            out.weightUnit = r.weightUnit || null;
+            out.firstAvailable = r.firstAvailable || null;
+            out.bullets = r.bullets || [];
+            out.price = r.price != null ? r.price : null;
+            out.currency = r.currency || null;
+            out.shipping = r.shipping != null ? r.shipping : null;
+            out.isFba = r.isFba == null ? null : r.isFba;
+            out.sellerId = r.sellerId || null;
+            out.offers = r.offers || 0;
+            out.sales = r.sales || null;
+            out.shipByAmazon = r.shipByAmazon === true;
+            out.brandHasRecord = r.brandHasRecord === true;
+            out.brandSources = r.brandSources || [];
+            out.trademarkCount = r.trademarkCount || 0;
+          }
+
+          /* 上架天数（FirstTime 形如 "2025/9/2 0:35:56"，非 ISO，需手工解析） */
+          if (out.firstAvailable) {
+            const m = String(out.firstAvailable).match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})[ T]?(\d{1,2})?:?(\d{2})?:?(\d{2})?/);
+            if (m) {
+              const t = Date.UTC(+m[1], (+m[2]) - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0));
+              out.firstDays = Math.max(0, Math.round((Date.now() - t) / 86400e3));
+            }
+          }
+          /* 尺寸/重量取整到 2 位小数（原值是英寸换算的浮点，面板上要好看） */
+          const rnd2 = (v) => (typeof v === 'number' && isFinite(v) ? Math.round(v * 100) / 100 : v);
+          if (Array.isArray(out.dims)) out.dims = out.dims.map(rnd2);
+          if (typeof out.weight === 'number') out.weight = rnd2(out.weight);
+
+          /* 品牌备案明细（按站点） */
+          if (out.brand) {
+            const bs = await zyStandalone.brandStatus([out.brand]).catch(() => ({}));
+            const arr = (bs && bs[out.brand]) || [];
+            out.brandRegistry = arr.slice(0, 40);
+            out.brandRegistryTotal = arr.length;
+            out.brandRegistered = arr.filter((x) => /已注册/.test(String(x.Status || ''))).map((x) => x.Source);
+            out.brandApplied = arr.filter((x) => /已申请/.test(String(x.Status || ''))).map((x) => x.Source);
+          }
+
+          /* 可选：BG（要传 aid，且账号必须可用） */
+          if (j.aid != null) {
+            try {
+              const bg = await zyStandalone.bgCheck(Number(j.aid), asin);
+              out.bg = bg.ok ? { status: bg.status } : { status: 'ERROR', error: bg.message || '检测失败', accountDisabled: !!bg.accountDisabled };
+            } catch (e) { out.bg = { status: 'ERROR', error: String((e && e.message) || e).slice(0, 160) }; }
+          }
+
+          /* 明确告诉前端：这些字段拿不到（不显示） */
+          out.missing = ['rating', 'reviews', 'aplus', 'imageSet', 'fullCategoryPath'];
+          return send(200, out);
+        } catch (e) {
+          return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) });
+        }
+      }
+
+      if (p === '/api/bg/scan' && req.method === 'POST') {
+        if (bgScanJob && bgScanJob.running) return send(409, { ok: false, error: '已有店铺体检任务在跑', job: bgScanJobPublic() });
+        try {
+          const accs = await zyStandalone.accounts();
+          const usable = accs.filter((a) => a.usable);
+          const wantAid = j.aid != null ? Number(j.aid) : null;
+          /* ★ 2026-11-15 多店铺: j.aids=[886074,890746] 或 j.allAccounts=true → 同时检测多家店, 结果按站点分别存 */
+          let scanAids = null;
+          if (Array.isArray(j.aids) && j.aids.length) scanAids = j.aids.map(Number).filter(Boolean);
+          else if (j.allAccounts) scanAids = usable.map((a) => a.id);
+          const scanAccs = scanAids ? accs.filter((a) => scanAids.indexOf(Number(a.id)) >= 0) : null;
+          const pick = wantAid ? accs.find((a) => a.id === wantAid) : (scanAccs && scanAccs[0]) || usable[0];
+          if (!pick) return send(200, { ok: false, error: '账号列表里找不到 aid=' + wantAid, accounts: accs });
+          if (!pick.usable) {
+            return send(200, { ok: false, error: '该店铺账号被禁用(flag=9)，服务端会拒绝所有检测；请先在智赢后台恢复店铺授权', accounts: accs, aid: pick.id });
+          }
+          const mode = String(j.mode || 'given');
+          let asins = (Array.isArray(j.asins) ? j.asins : []).map((x) => String(x).trim().toUpperCase()).filter((x) => /^[A-Z0-9]{10}$/.test(x));
+          if (mode !== 'given' || !asins.length) {
+            let pool = products.slice();
+            if (j.site) pool = pool.filter((x) => (x.site || '') === String(j.site).toLowerCase());
+            if (j.cat) pool = pool.filter((x) => String(x.cat1 || '').toLowerCase().includes(String(j.cat).toLowerCase()));
+            if (mode === 'unchecked') pool = pool.filter((x) => !x.bgStatus);
+            else if (mode === 'blocked') pool = pool.filter((x) => x.bgStatus === 'APPROVAL_REQUIRED' || x.bgStatus === 'NOT_ELIGIBLE');
+            asins = pool.map((x) => x.asin);
+          }
+          const limit = Math.max(0, Number(j.limit) || 0);
+          if (limit) asins = asins.slice(0, limit);
+          if (!asins.length) return send(200, { ok: true, total: 0, note: '没有需要检测的商品' });
+
+          bgScanJob = {
+            running: true, startedAt: now(), aid: pick.id, abbr: pick.abbr, accountName: pick.name, mode,
+            accounts: (scanAccs || [pick]).map((a) => ({ id: a.id, abbr: a.abbr, name: a.name })),
+            total: asins.length, done: 0, stat: {}, failed: 0, stopped: false, error: null,
+            samples: [], channel: 'standalone', gapMs: j.gapMs == null ? 400 : Math.max(100, Number(j.gapMs)),
+          };
+          const job = bgScanJob;
+          (async () => {
+            try {
+              const byAsin = new Map(products.map((x, i) => [x.asin, i]));
+              for (let i = 0; i < asins.length; i++) {
+                if (job.stopped) break;
+                const asin = asins[i];
+                const idx = byAsin.get(asin);
+                try {
+                  if (scanAccs && scanAccs.length > 1) {
+                    /* 多店铺: 一次查完, 每个站点各存一条 bgByAccount */
+                    const results = await zyStandalone.bgProbeMulti(asin, scanAccs.map((a) => a.id));
+                    const at = now();
+                    const RANK = { OK: 0, APPROVAL_REQUIRED: 1, NOT_ELIGIBLE: 2, ASIN_NOT_FOUND: 3, ERROR: 4 };
+                    let best = null;
+                    for (const r of results) {
+                      job.stat[r.status] = (job.stat[r.status] || 0) + 1;
+                      const ab = String(r.abbr || '').toUpperCase();
+                      if (!ab) continue;
+                      if (!best || (RANK[r.status] == null ? 9 : RANK[r.status]) < (RANK[best.status] == null ? 9 : RANK[best.status])) best = r;
+                    }
+                    if (idx != null) {
+                      const it = products[idx];
+                      const by = Object.assign({}, it.bgByAccount || {});
+                      for (const r of results) {
+                        const ab = String(r.abbr || '').toUpperCase();
+                        if (ab) by[ab] = { status: r.status, at: at, name: r.name || null, aid: r.aid || null };
+                      }
+                      it.bgByAccount = by;
+                      if (best) { it.bgStatus = best.status; it.bgAid = best.aid || null; it.bgAbbr = String(best.abbr || '').toUpperCase() || null; it.bgAccount = best.name || null; }
+                      it.bgCheckedAt = at;
+                    }
+                    if (job.samples.length < 12 && best) job.samples.push({ asin, status: best.status, results: results.map((r) => r.abbr + ':' + r.status) });
+                    if (!results.length) job.failed++;
+                  } else {
+                  const r = await zyStandalone.bgCheck(pick.id, asin);
+                  if (!r.ok) {
+                    if (r.accountDisabled) { job.error = r.message || '账号被禁用'; job.stopped = true; break; }
+                    job.failed++; job.stat.ERROR = (job.stat.ERROR || 0) + 1;
+                  } else {
+                    job.stat[r.status] = (job.stat[r.status] || 0) + 1;
+                    if (idx != null) {
+                      const it = products[idx];
+                      it.bgStatus = r.status;
+                      it.bgAid = pick.id;
+                      it.bgAbbr = pick.abbr || null;
+                      it.bgAccount = pick.name || null;
+                      it.bgCheckedAt = now();
+                      it.bgByAccount = Object.assign({}, it.bgByAccount || {}, { [String(pick.abbr || pick.id)]: { status: r.status, at: it.bgCheckedAt } });
+                    }
+                    if (job.samples.length < 12) job.samples.push({ asin, status: r.status });
+                  }
+                  }
+                } catch (e) {
+                  job.failed++; job.stat.ERROR = (job.stat.ERROR || 0) + 1;
+                  job.lastError = String((e && e.message) || e).slice(0, 160);
+                }
+                job.done++;
+                if (job.done % 25 === 0) save('products.json', products);
+                await new Promise((r) => setTimeout(r, job.gapMs));
+              }
+              save('products.json', products);
+            } catch (e) { job.error = String((e && e.message) || e).slice(0, 300); }
+            finally { job.running = false; job.finishedAt = now(); }
+          })();
+          return send(200, { ok: true, started: true, job: bgScanJobPublic() });
+        } catch (e) { return send(500, { ok: false, error: String((e && e.message) || e).slice(0, 300) }); }
+      }
+      if (p === '/api/bg/scan/status' && req.method === 'GET') return send(200, bgScanJobPublic());
+      if (p === '/api/bg/scan/stop' && req.method === 'POST') {
+        if (bgScanJob) { bgScanJob.stopped = true; }
+        return send(200, { ok: true, stopping: true });
+      }
+
+      /* ─── 直连采集（不经过浏览器 / 智赢插件）─── */
+      if (p === '/api/collect/direct' && req.method === 'POST') {
+        if (directJob && directJob.running) return send(409, { ok: false, error: '已有直连采集在跑', job: directJobPublic() });
+        /* ★ 不与 CDP 采集互斥：本任务只用 HTTP（不开浏览器），两者改的是同一份内存数组的不同字段，
+         *   save() 又是整份快照落盘，互不覆盖。强行互斥反而会被插件的自动采集挡死。 */
+        if (!zyStandalone.readToken()) return send(400, { ok: false, error: '直连通道没有 token：先 POST /api/zy/token {bootstrap:true}' });
+
+        let site = String(j.site || 'de').toLowerCase();
+        const mode = String(j.mode || 'given');
+        const withTitle = j.withTitle !== false;
+        let asins = (Array.isArray(j.asins) ? j.asins : [])
+          .map((x) => String(x || '').trim().toUpperCase())
+          .filter((x) => /^[A-Z0-9]{10}$/.test(x));
+
+        /* ★ 2026-11-14 采集默认路径：给 url 就先用【无头浏览器】找品（只读 DOM 拿 ASIN，
+         *   不依赖智赢插件面板），再用直连通道取数入库。 */
+        let found = null;
+        if (j.url) {
+          try {
+            found = await headlessFinder.findAsins(String(j.url), {
+              maxPages: Math.min(10, Math.max(1, Number(j.maxPages) || 1)),
+              maxItems: Math.max(1, Math.min(400, Number(j.maxItems) || (Number(j.limit) || 120))),
+              timeoutMs: 25000,
+            });
+            site = found.site || site;
+            asins = found.asins.slice();
+            if (!asins.length) {
+              return send(200, { ok: false, error: '无头浏览器没找到商品（页面可能被风控/改版）', found: { pages: found.pages, perPage: found.perPage } });
+            }
+          } catch (e) {
+            return send(200, { ok: false, error: '找品失败: ' + String((e && e.message) || e).slice(0, 200) });
+          }
+        }
+
+        if (mode !== 'given' || !asins.length) {
+          let pool = products.filter((x) => (x.site || '') === site);
+          if (Array.isArray(j.needs) && j.needs.length) {
+            pool = pool.filter((it) => j.needs.some((k) => DC_NEED[k] && DC_NEED[k](it)));
+          }
+          if (j.since) {
+            const cut = Date.parse(String(j.since).replace(' ', 'T')) || 0;
+            pool = pool.filter((it) => !(it.apiAt && (Date.parse(String(it.apiAt).replace(' ', 'T')) || 0) > cut));
+          }
+          asins = pool.map((x) => x.asin);
+        }
+        asins = [...new Set(asins)];
+        const limit = Math.max(0, Number(j.limit) || 0);
+        if (limit) asins = asins.slice(0, limit);
+        if (!asins.length) return send(200, { ok: true, total: 0, note: '没有需要采集的商品' });
+
+        directJob = {
+          running: true, startedAt: now(), site, mode, total: asins.length, done: 0,
+          created: 0, updated: 0, unchanged: 0, failed: 0, titlesFetched: 0,
+          fieldHits: {}, ms: 0, perItemMs: null, samples: [], stopped: false, error: null, lastLog: null,
+        };
+        const job = directJob;
+        /* ★ 2026-11-15 直连采集也写实时进度，采集面板能直接看到（步骤/条数/BG/站点修正） */
+        collectProgress = {
+          running: true, mode: 'direct', site: site, step: '准备中', startedAt: Date.now(),
+          total: job.total, done: 0, items: 0, added: 0, bgDone: 0, bgTotal: 0, locale: null,
+        };
+        const setProg = (patch) => { if (collectProgress) Object.assign(collectProgress, patch); };
+        const byAsin = new Map(products.map((x, i) => [x.asin, i]));
+        const t0 = Date.now();
+
+        (async () => {
+          try {
+            const needTitle = [];
+            for (let i = 0; i < asins.length; i += 20) {
+              if (job.stopped) break;
+              const chunk = asins.slice(i, i + 20);
+              job.lastLog = '拉取 ' + (i + 1) + '~' + (i + chunk.length) + '/' + job.total;
+              const rawRes = await zyStandalone.moreAboutAsinRaw(chunk, site, { gapMs: 250, retries: 2, timeoutMs: 25000 })
+                .catch(() => ({ data: {}, failedAsins: chunk }));
+              const rawMap = rawRes.data || {};
+              if (rawRes.failedAsins && rawRes.failedAsins.length) {
+                job.chunkFailed = (job.chunkFailed || 0) + 1;
+                job.lastLog = '分片失败 ' + rawRes.failedAsins.length + ' 条（重试后仍失败）';
+                /* 熔断：连续 3 个分片失败 → 判定被限流/令牌失效，停止并报错，不空转 */
+                if (job.chunkFailed >= 3) {
+                  job.error = '连续 ' + job.chunkFailed + ' 个分片失败（疑似被限流或 token 失效），已停止';
+                  job.stopped = true;
+                  break;
+                }
+              } else {
+                job.chunkFailed = 0;
+              }
+
+              for (const asin of chunk) {
+                job.done++;
+                setProg({ done: job.done, items: job.done, added: job.created, step: '拉取数据 ' + job.done + '/' + job.total });
+                const rec = rawMap[asin];
+                if (!rec) { job.failed++; continue; }
+
+                const idx = byAsin.get(asin);
+                const isNew = idx == null;
+                const it = isNew ? { asin: asin, site: site, source: 'direct-collect', createdAt: now() } : products[idx];
+                const snap = {};
+                for (const k of Object.keys(DC_TRACK)) snap[k] = it[k];
+
+                try {
+                  mergeZyApiRecord(it, rec);
+
+                  /* 价格只认 BuyBox（接口 offers 里唯一有意义的价） */
+                  const offers = Array.isArray(it.offers) ? it.offers : [];
+                  const bb = offers.find((o) => o.buyBox) || offers[0] || null;
+                  if (bb && bb.listing != null && bb.listing > 0) {
+                    it.price = bb.listing;
+                    if (!dcText(it.currency) && bb.currency) it.currency = dcText(bb.currency, 8);
+                  }
+                  if (isNew) it.title = dcText(it.title, 500);   // 新记录标题交给下面批量补
+                  if (withTitle && !dcText(it.title)) needTitle.push(asin);
+
+                  /* ★ 品牌准确性：库里旧值可能是页面误读（实测有把品牌读成 "American Express" 的），
+                   *   智赢库品牌是权威来源 → 冲突时以接口为准，旧值留在 brandPrev 便于追溯。 */
+                  const apiBrand = dcText(rec.Brand, 80);
+                  if (apiBrand && it.brand && apiBrand !== it.brand && !/^(generic|unbranded|unknown)$/i.test(apiBrand)) {
+                    it.brandPrev = it.brand;
+                    it.brand = apiBrand;
+                    it.brandSrc = 'zying-api';
+                    it.brandFixedAt = now();
+                    job.brandFixed = (job.brandFixed || 0) + 1;
+                  }
+
+                  const merged = applyRankFields(it);
+                  products[isNew ? products.length : idx] = merged;
+                  if (isNew) { byAsin.set(asin, products.length - 1); job.created++; }
+                  else if (JSON.stringify(Object.keys(DC_TRACK).map((k) => merged[k])) !== JSON.stringify(Object.keys(DC_TRACK).map((k) => snap[k]))) job.updated++;
+                  else job.unchanged++;
+
+                  for (const [k, label] of Object.entries(DC_TRACK)) {
+                    if (merged[k] != null && snap[k] == null) job.fieldHits[label] = (job.fieldHits[label] || 0) + 1;
+                  }
+                  if (job.samples.length < 8) job.samples.push({ asin: asin, brand: merged.brand || null, bsr: merged.bsrShop == null ? null : merged.bsrShop, price: merged.price == null ? null : merged.price });
+                } catch (e) {
+                  job.failed++;
+                }
+              }
+              if (job.done % 100 === 0) save('products.json', products);   // 每 100 条落一次盘（整份快照，够安全也够省 IO）
+            }
+
+            /* 标题/主图补齐（只补缺，每批 3 条） */
+            if (withTitle && needTitle.length && !job.stopped) {
+              for (let i = 0; i < needTitle.length; i += 3) {
+                if (job.stopped) break;
+                const part = needTitle.slice(i, i + 3);
+                job.lastLog = '补标题 ' + Math.min(i + 3, needTitle.length) + '/' + needTitle.length;
+                const ti = await zyStandalone.titlesImages(part, site).catch(() => ({}));
+                for (const [asin, v] of Object.entries(ti)) {
+                  const idx = byAsin.get(asin);
+                  if (idx == null) continue;
+                  const it = products[idx];
+                  const title = dcText(v && v.title, 500);
+                  if (title && !dcText(it.title)) { it.title = title; job.titlesFetched++; }
+                  const img = dcText(v && v.image, 500);
+                  if (img && !it.mainImage) { it.mainImage = img; if (!it.image) it.image = img; }
+                }
+                await new Promise((r) => setTimeout(r, 80));
+              }
+            }
+
+            /* ★ 2026-11-15 补变体前先把浏览器切到目标站点（配送邮编/国家/货币），保证页面价是站点币种 */
+            if (j.fixLocale !== false) {
+              try {
+                const fix = await localeFixHttp(site, { zip: j.zip, currency: j.currency });
+                job.localeFix = (fix && fix.ok) ? { zipUpdated: !!fix.zipUpdated, addrAfter: fix.addrAfter || null, curBefore: fix.curBefore || null, curAfter: fix.curAfter || null } : { error: (fix && fix.error) || '修正失败' };
+                setProg({ locale: { site: String(site).toUpperCase(), zip: fix && fix.addrAfter, cur: (fix && fix.curAfter) || null }, step: '已切站点 ' + String(site).toUpperCase() + ' · ' + ((fix && fix.addrAfter) || '') + ' · ' + ((fix && fix.curAfter) || '') });
+              } catch (e) { job.localeFix = { error: String((e && e.message) || e).slice(0, 120) }; }
+            }
+            /* ★ 2026-11-15 变体改为【HTTP 逆向】+ 并发 variantConcurrency（默认 2）；
+             *   页面 HTML 取变体清单 + 数据源按 ASIN 补价（不导航页面，失败不影响主数据）
+             */
+            if (j.withVariants !== false) {
+              const vLimit = Math.max(1, Math.min(200, Number(j.variantLimit) || 30));
+              const vConc = Math.max(1, Math.min(4, Number(j.variantConcurrency) || 2));
+              const vTargets = asins.slice(0, vLimit).filter((a) => byAsin.get(a) != null);
+              let vCursor = 0, vDone = 0;
+              const vWorker = async () => {
+                while (true) {
+                  if (job.stopped) return;
+                  const k = vCursor++;
+                  if (k >= vTargets.length) return;
+                  const asin = vTargets[k];
+                  try {
+                    const vr = await fetchVariantsHttp(asin, site);
+                    const idx = byAsin.get(asin);
+                    if (vr && vr.ok && vr.items && vr.items.length && idx != null) {
+                      const it = products[idx];
+                      it.variants = [{ dim: 'color', options: vr.items.map((v) => ({ text: (v.attrs || []).join(' / '), asin: v.asin, price: v.price, selected: v.asin === asin })) }];
+                      it.variations = vr.items.length;
+                      products[idx] = it;
+                      job.variantsFilled = (job.variantsFilled || 0) + 1;
+                    } else if (vr && !vr.ok) {
+                      job.variantError = String(vr.error || '').slice(0, 160);
+                    }
+                  } catch (e) { job.variantError = String((e && e.message) || e).slice(0, 160); }
+                  vDone++;
+                  job.lastLog = '补变体 ' + vDone + '/' + vTargets.length;
+                  setProg({ step: '补变体 ' + vDone + '/' + vTargets.length, detailDone: vDone, detailTotal: vTargets.length });
+                  await new Promise((r) => setTimeout(r, 80));
+                }
+              };
+              await Promise.all(Array.from({ length: Math.min(vConc, Math.max(1, vTargets.length)) }, vWorker));
+            }
+            /* ★ 2026-11-15 采集即入库全部店铺可售(BG)：默认开启；
+             *   · 并发 bgConcurrency（默认 3）：纯 HTTP 接口，不需要浏览器
+             *   · 24h 缓存：同商品同店铺在 24h 内测过且覆盖所有当前店铺 → 跳过不重测
+             *   · j.withBG=false 关闭 / j.bgConcurrency 调整 / j.bgCacheH=0 关闭缓存
+             */
+            if (j.withBG !== false) {
+              try {
+                const accs = await zyStandalone.accounts();
+                const usable = accs.filter((a) => a.usable);
+                const aids = usable.map((a) => a.id);
+                const wantAbbrs = usable.map((a) => String(a.abbr || '').toUpperCase()).filter(Boolean);
+                const bgLimit = Math.max(1, Math.min(500, Number(j.bgLimit) || 60));
+                const conc = Math.max(1, Math.min(6, Number(j.bgConcurrency) || 3));
+                const cacheH = j.bgCacheH == null ? 24 : Math.max(0, Number(j.bgCacheH));
+                const RANK = { OK: 0, APPROVAL_REQUIRED: 1, NOT_ELIGIBLE: 2, ASIN_NOT_FOUND: 3, ERROR: 4 };
+                let targets = asins.slice(0, bgLimit).filter((a) => byAsin.get(a) != null);
+                /* 缓存跳过 */
+                let skipped = 0;
+                if (cacheH > 0 && wantAbbrs.length) {
+                  const cut = Date.now() - cacheH * 3600e3;
+                  targets = targets.filter((a) => {
+                    const idx = byAsin.get(a);
+                    if (idx == null) return false;
+                    const it = products[idx];
+                    const t = it.bgCheckedAt ? Date.parse(String(it.bgCheckedAt).replace(' ', 'T')) : NaN;
+                    const by = it.bgByAccount || {};
+                    const cover = wantAbbrs.every((ab) => by[ab] && by[ab].status);
+                    if (cover && isFinite(t) && t >= cut) { skipped++; return false; }
+                    return true;
+                  });
+                }
+                job.bgSkipped = skipped;
+                if (skipped) job.lastLog = 'BG 跳过缓存 ' + skipped + ' 条';
+                setProg({ step: 'BG 检测 0/' + targets.length + (skipped ? ('（缓存跳过 ' + skipped + '）') : ''), bgDone: 0, bgTotal: targets.length });
+                if (!aids.length) {
+                  job.bgError = '没有可用店铺账号';
+                } else {
+                  let cursor = 0, done = 0;
+                  const worker = async () => {
+                    while (true) {
+                      if (job.stopped) return;
+                      const k = cursor++;
+                      if (k >= targets.length) return;
+                      const asin = targets[k];
+                      try {
+                        const results = await zyStandalone.bgProbeMulti(asin, aids);
+                        const idx = byAsin.get(asin);
+                        if (idx != null && results.length) {
+                          const it = products[idx];
+                          const by = Object.assign({}, it.bgByAccount || {});
+                          const at = now();
+                          let best = null;
+                          for (const r of results) {
+                            const ab = String(r.abbr || '').toUpperCase();
+                            if (!ab) continue;
+                            by[ab] = { status: r.status, at: at, name: r.name || null, aid: r.aid || null };
+                            if (!best || (RANK[r.status] == null ? 9 : RANK[r.status]) < (RANK[best.status] == null ? 9 : RANK[best.status])) best = r;
+                          }
+                          it.bgByAccount = by;
+                          if (best) { it.bgStatus = best.status; it.bgAbbr = String(best.abbr || '').toUpperCase() || null; it.bgAccount = best.name || null; it.bgAid = best.aid || null; }
+                          it.bgCheckedAt = at;
+                          products[idx] = it;
+                          job.bgFilled = (job.bgFilled || 0) + 1;
+                        }
+                      } catch (e) { job.bgError = String((e && e.message) || e).slice(0, 140); }
+                      done++;
+                      job.lastLog = 'BG ' + done + '/' + targets.length + (skipped ? ('（跳过 ' + skipped + '）') : '');
+                      setProg({ step: 'BG 检测 ' + done + '/' + targets.length, bgDone: done, bgTotal: targets.length });
+                      await new Promise((r) => setTimeout(r, 60));
+                    }
+                  };
+                  await Promise.all(Array.from({ length: Math.min(conc, Math.max(1, targets.length)) }, worker));
+                  if (job.bgFilled % 25 !== 0) save('products.json', products);
+                }
+              } catch (e) { job.bgError = String((e && e.message) || e).slice(0, 140); }
+            }
+            save('products.json', products);
+            job.ms = Date.now() - t0;
+            job.perItemMs = job.total ? Math.round(job.ms / job.total) : null;
+          } catch (e) {
+            job.error = String((e && e.message) || e).slice(0, 300);
+          } finally {
+            job.running = false;
+            if (collectProgress && collectProgress.mode === 'direct') { collectProgress.running = false; endCollectProgress(); }
+            job.finishedAt = now();
+            try {
+              pushNotify('直连采集完成', '新增 ' + job.created + ' · 更新 ' + job.updated + ' · 失败 ' + job.failed + ' · ' + (job.perItemMs || 0) + 'ms/条');
+            } catch (e) {}
+          }
+        })();
+
+        return send(200, { ok: true, started: true, job: directJobPublic(),
+          found: found ? { site: found.site, pages: found.pages, count: found.count, perPage: found.perPage } : null });
+      }
+      if (p === '/api/collect/direct/status' && req.method === 'GET') return send(200, directJobPublic());
+      if (p === '/api/collect/direct/stop' && req.method === 'POST') {
+        if (directJob) directJob.stopped = true;
+        return send(200, { ok: true, stopping: true });
+      }
+
       if (p === '/api/collect/brand-batch' && req.method === 'POST') {
+        /* ★ 2026-11-15 默认改走 HTTP 通道（页面渲染在无头浏览器里会卡死）；传 transport:'cdp' 可回退老路径 */
+        if (String(j.transport || 'http') !== 'cdp') {
+          try {
+            const r = await hcCollectMode('brand', j);
+            try { endCollectProgress(); } catch (e2) {}
+            return send(200, Object.assign({ ok: true }, r));
+          } catch (e) {
+            return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) });
+          }
+        }
         /* ★ 2026-10-02 修: 站点原来只认 j.site, 缺省写死 'au' —— 而前端「批量品牌采集」表单里
          * 根本没有 site 字段 → 界面上用这个功能永远只按【澳洲站】找线索品牌, 别的站点一律报
          * "站点 au 的商品库里没有这些品牌的商品"。现在按优先级取:
@@ -13975,6 +15608,16 @@ const opHandler = (req, res) => {
 
       // 跟卖店铺批量采集: 对每个商品 → 遍历其全部跟卖卖家 → 逐个跳转店铺采集 (全程 CDP)
       if (p === '/api/collect/follow-shop-batch' && req.method === 'POST') {
+        /* ★ 2026-11-15 默认改走 HTTP 通道（页面渲染在无头浏览器里会卡死）；传 transport:'cdp' 可回退老路径 */
+        if (String(j.transport || 'http') !== 'cdp') {
+          try {
+            const r = await hcCollectMode('batch', j);
+            try { endCollectProgress(); } catch (e2) {}
+            return send(200, Object.assign({ ok: true }, r));
+          } catch (e) {
+            return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) });
+          }
+        }
         const asins = (j.asins || []).map((x) => String(x).trim()).filter((x) => x);
         if (!asins.length) return send(400, { error: '请输入商品 ASIN 列表 (如 ["B0XXXXXXX","B0YYYYYYY"])' });
         // 0 = 无限制 (循环轮次/每店商品数/每店翻页)
@@ -14032,6 +15675,16 @@ const opHandler = (req, res) => {
 
       // 商品 aod URL → 提取全部跟卖卖家 → 并行开标签页采集各自店铺 (全程 CDP)
       if (p === '/api/collect/follow-shop-aod' && req.method === 'POST') {
+        /* ★ 2026-11-15 默认改走 HTTP 通道（页面渲染在无头浏览器里会卡死）；传 transport:'cdp' 可回退老路径 */
+        if (String(j.transport || 'http') !== 'cdp') {
+          try {
+            const r = await hcCollectMode('aod', j);
+            try { endCollectProgress(); } catch (e2) {}
+            return send(200, Object.assign({ ok: true }, r));
+          } catch (e) {
+            return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) });
+          }
+        }
         // 支持多商品: urls 数组 (ASIN / 普通商品链接 / aod 报价链接) 或单 url
         const urls = Array.isArray(j.urls) ? j.urls.map((u) => String(u).trim()).filter(Boolean) : (j.url ? [String(j.url).trim()] : []);
         if (!urls.length) return send(400, { error: '请输入商品 (ASIN / 商品链接 / aod 报价链接, 每行一个)' });
@@ -14112,6 +15765,16 @@ const opHandler = (req, res) => {
       //   · wait=1 同步等结果(仅调试用, 真实采集几十分钟会 HTTP 超时)
       //   · 进度由顶层守卫注册(路由已加进守卫 MAP, 坑 #29) —— 这里不要再调 beginCollectProgress
       if ((p === '/api/collect/shop-links' || p === '/api/collect/links') && req.method === 'POST') {
+        /* ★ 2026-11-15 默认改走 HTTP 通道；transport:'cdp' 回退老路径 */
+        if (String(j.transport || 'http') !== 'cdp') {
+          try {
+            const r = await hcCollectMode('links', j);
+            try { endCollectProgress(); } catch (e2) {}
+            return send(200, Object.assign({ ok: true }, r));
+          } catch (e) {
+            return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) });
+          }
+        }
         let list = siteLinks.parseLinkList(j.urls != null ? j.urls : j.links);
         // ── 续跑: jobId='last' 取最近一个还有待办/失败的任务, 或指定 job-xxx ──
         const wantJob = String(j.jobId || j.resume || j.resumeTaskId || '').trim();
@@ -16420,6 +18083,25 @@ if (p === '/api/blueocean/analyze' && req.method === 'GET') {
        */
       if (p === '/api/ifast/sync' && req.method === 'POST') {
         try {
+          /* ★ 没有 rows 时走【直连】：用 ifast-client 自己翻页拉全量，再复用同一套落库逻辑 */
+          if ((!Array.isArray(j.rows) || !j.rows.length) && !j.groups) {
+            const _sites = await ifastClient.sites();
+            const _shops = await ifastClient.shops();
+            /* ★ 单次大分页：实测 limit=5000 一次拿全 3208 条（6s），
+             *   比 limit=100 翻 33 页（13.5s）更快，代码也更简单；
+             *   万一条数超过 5000 再自动续页。 */
+            let _rows = [], _page = 1, _total = 0, _pulled = 0;
+            for (;;) {
+              const _r = await ifastClient.listItems({ page: _page, limit: 5000 });
+              if (_page === 1) _total = _r.total || 0;
+              const _rs = _r.items || [];
+              _rows = _rows.concat(_rs); _pulled += _rs.length;
+              if (!_rs.length || _pulled >= _total || _page >= 20) break;
+              _page++;
+            }
+            j.rows = _rows; j.groups = _shops; j.sites = _sites;
+            j.count = _total; j.final = true; j.source = 'ifast-direct';
+          }
           const rows = Array.isArray(j.rows) ? j.rows : [];
           if (j.groups) {
             ifastGroups = (j.groups || []).map((g) => ({ id: String(g.id == null ? '' : g.id), name: g.name || null, onSale: g.onSaleDesc || null, offSale: g.offSaleDesc || null, status: (g.status == null ? null : g.status) }));
@@ -16430,9 +18112,61 @@ if (p === '/api/blueocean/analyze' && req.method === 'GET') {
           const r = ifastItemsSync(rows);
           let claimsWrote = 0;
           if (rows.length) claimsWrote = claimsFromIfastRows(r.normalized, j.source || 'ifast-sync');
+           /* ★ 同步来的在架商品 → 写进选品归档（一键同步全部已上架商品到归档） */
+           let archived = 0;
+           if (j.final && r.normalized.length) {
+             try {
+               for (const it of r.normalized) {
+                 const okArc = archiveAddListing({
+                   asin: it.asin, site: it.site, status: 'listed',
+                   shop: it.storeName || null,
+                   title: it.title, brand: it.brand, mainImage: it.image, url: it.url,
+                   price: it.price != null ? it.price : it.lowerPrice,
+                   listedAt: it.createTime || it.updateTime || now(),
+                   source: 'ifast-sync', savedAt: it.createTime || now(),
+                   fill: {
+                     initPrice: it.initPrice,
+                     bearPrice: it.lowerPrice != null ? it.lowerPrice : it.price,
+                     stock: it.stock,
+                   },
+                 }, { noSave: true });
+                 if (okArc) archived++;
+               }
+               if (archived) { archiveTrim(); save('selection-archive.json', selectionArchive, true); }
+             } catch (e) { console.error('[ifast-sync] 归档写入失败: ' + ((e && e.message) || e)); }
+           }
+           /* ★ 同步的在架商品也写进「上架记录」—— ifast 页面上的搞薯条面板按它展示 */
+           let recordedSync = 0;
+           if (j.final && r.normalized.length) {
+             try {
+               const _lrIdx = new Map();
+               for (let i = 0; i < listingRecords.length; i++) _lrIdx.set(listingRecords[i].id, i);
+               for (const it of r.normalized) {
+                 const rec = normalizeListingItem({
+                   asin: it.asin, site: it.site, shop: currentShopName() || null,
+                   title: it.title, brand: it.brand, mainImage: it.image, url: it.url,
+                   price: it.price != null ? it.price : it.lowerPrice,
+                   initPrice: it.initPrice, bearPrice: it.lowerPrice != null ? it.lowerPrice : it.price,
+                   stock: it.stock, followPresetText: it.storeName || null,
+                 }, it.site, currentShopName() || null);
+                 if (!rec) continue;
+                 rec.status = 'listed';
+                 rec.listedAt = it.createTime || it.updateTime || now();
+                 rec.savedAt = rec.listedAt;
+                 rec.source = 'ifast-sync';
+                 const idxR = _lrIdx.has(rec.id) ? _lrIdx.get(rec.id) : -1;
+                 if (idxR >= 0) listingRecords[idxR] = Object.assign({}, listingRecords[idxR], rec);
+                 else { listingRecords.push(rec); _lrIdx.set(rec.id, listingRecords.length - 1); }
+                 recordedSync++;
+               }
+               listingRecords.sort((a, b) => String(b.listedAt || b.savedAt || '').localeCompare(String(a.listedAt || a.savedAt || '')));
+               if (recordedSync) save('listing-records.json', listingRecords);
+             } catch (e) { console.error('[ifast-sync] 上架记录写入失败: ' + ((e && e.message) || e)); }
+           }
+
           const out = {
             ok: true, chunk: j.chunk == null ? null : j.chunk, pages: j.pages == null ? null : j.pages,
-            added: r.added, updated: r.updated, total: ifastItems.length, claimsWrote: claimsWrote,
+            added: r.added, updated: r.updated, total: ifastItems.length, claimsWrote: claimsWrote, archived: archived, recorded: recordedSync,
           };
           if (j.final) {
             const byStore = {}, bySite = {};
@@ -16459,6 +18193,22 @@ if (p === '/api/blueocean/analyze' && req.method === 'GET') {
         } catch (e) { return send(500, { error: String((e && e.message) || e) }); }
       }
 
+      /* 清理归档条目（测试/误上架用）：{ key } 或 { asin, site, shop } */
+      if (p === '/api/archive/remove' && req.method === 'POST') {
+        try {
+          let key = String(j.key || '');
+          if (!key && j.asin) key = archiveKeyOf(shopClean(j.shop) || null, String(j.site || '').toLowerCase(), String(j.asin).toUpperCase());
+          if (!key || !selectionArchive.items || !selectionArchive.items[key]) return send(200, { ok: false, error: '归档里没有该条目: ' + key });
+          delete selectionArchive.items[key];
+          for (const b of (selectionArchive.batches || [])) {
+            if (!Array.isArray(b.keys)) continue;
+            const idx = b.keys.indexOf(key);
+            if (idx >= 0) { b.keys.splice(idx, 1); b.count = b.keys.length; }
+          }
+          save('selection-archive.json', selectionArchive, true);
+          return send(200, { ok: true, removed: key });
+        } catch (e) { return send(200, { ok: false, error: String((e && e.message) || e).slice(0, 200) }); }
+      }
       if (p === '/api/ifast/items' && req.method === 'GET') {
         const q = String(url.searchParams.get('q') || '').trim().toUpperCase();
         const storeF = String(url.searchParams.get('storeId') || '').trim();

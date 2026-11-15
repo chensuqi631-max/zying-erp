@@ -2534,7 +2534,9 @@ async function openProductDetail(asin) {
     btn.textContent = '试算中…'; btn.disabled = true;
     try {
       const cc = String(f.country || '').toUpperCase();
-      const r = await API('/api/logistics/rates?country=' + encodeURIComponent(cc) + '&weight=' + encodeURIComponent(f.weight));
+      const _g1 = Math.max(1, Math.round(Number(f.weight) * 1000));
+      const _r1 = await API('/api/zy/freight/quote?country=' + encodeURIComponent(cc) + '&weight=' + _g1);
+      const r = { quotes: (_r1 && _r1.picked) ? [{ channel: _r1.picked.channel, total: _r1.picked.price }] : ((_r1 && _r1.channels) || []).map(function (c) { return { channel: c.channel, total: c.price }; }) };
       const quotes = (r && r.quotes) || [];
       if (!quotes.length) {
         await zyAlert('⚠️ 报价表里没有该目的国', `目的国 ${cc} 在报价表里没有费率。请到「物流工具 → 报价表」添加该国各渠道的首重/续重价格。`);
@@ -2635,7 +2637,9 @@ async function openProductDetail(asin) {
         const country = ({ uk: 'GB', de: 'DE', us: 'US', fr: 'FR', it: 'IT', es: 'ES', nl: 'NL', jp: 'JP', ca: 'CA', in: 'IN', au: 'AU' }[p.site] || 'GB');
         let best = null, source = '';
         status.textContent = '正在用报价表计算物流成本…';
-        const rt = await API('/api/logistics/rates?country=' + country + '&weight=' + wKg2).catch(() => ({}));
+        const _g2 = Math.max(1, Math.round(Number(wKg2) * 1000));
+        const _r2 = await API('/api/zy/freight/quote?country=' + country + '&weight=' + _g2).catch(() => ({}));
+        const rt = { quotes: (_r2 && _r2.picked) ? [{ channel: _r2.picked.channel, total: _r2.picked.price }] : ((_r2 && _r2.channels) || []).map(function (c) { return { channel: c.channel, total: c.price }; }) };
         if (rt && rt.quotes && rt.quotes.length) {
           best = rt.quotes.filter((x) => x.total != null).sort((a, b) => a.total - b.total)[0];
           source = '报价表';
@@ -4585,137 +4589,11 @@ async function renderNotify() {
 //  后续实时物流价格改从智赢客户端「国际运费预估」的 UI 读取)
 async function renderLogistics() {
   const content = $('#content');
-  const rates = await API('/api/logistics/rates').catch(() => ({}));
-  const stale = rates.updatedAt ? ((Date.now() - new Date(String(rates.updatedAt).replace(' ', 'T')).getTime()) > 86400000) : true;
   content.innerHTML = `
-    <div class="notice">📦 <b>物流工具:</b> 报价表 (本地维护首重/续重, 「一键计算」优先用它算物流成本) · 报价表试算。</div>
-    <div class="card">
-      <div class="card-title">${ic('logistics', 16)} 报价表试算 <button id="lgQuote" class="btn primary" style="margin-left:auto">开始试算</button></div>
-      <div class="filter-grid" style="margin-top:8px">
-        <div class="filter-item"><label>目的国 (ISO2 代码)</label><input id="lgCountry" class="input" value="GB" placeholder="如 GB / DE / US / FR"></div>
-        <div class="filter-item"><label>重量 (kg)</label><input id="lgWeight" class="input" type="number" step="0.1" value="1" placeholder="如 0.5 / 1 / 2"></div>
-      </div>
-      <div id="lgResult" style="margin-top:12px"></div>
-    </div>
-    <div class="card" style="margin-top:12px">
-      <div class="card-title">${ic('save', 14)} 报价表 (一键计算用) <span class="muted" style="font-weight:400;font-size:12px">${stale ? '<span class="badge danger">超过24小时未更新</span>' : '<span class="badge low">更新于 ' + esc(rates.updatedAt || '-') + '</span>'}</span>
-        <button id="lgRateAdd" class="btn small" style="margin-left:auto">新增渠道</button>
-        <button id="lgRateRefresh" class="btn small" title="标记已更新 (录入/核对完价格后点)">已更新</button>
-      </div>
-      <div class="muted" style="font-size:11px;margin:4px 0">共 ${rates.countryCount || 0} 个国家有报价 · 请根据物流商最新价目表每日核对更新 · 更新后点「已更新」</div>
-      <div id="lgRateList" style="margin-top:6px"></div>
-      <div id="lgRateForm" style="display:none;margin-top:8px;border:1px dashed var(--line);border-radius:8px;padding:10px">
-        <div class="filter-grid" style="grid-template-columns:repeat(auto-fill,minmax(140px,1fr))">
-          <div class="filter-item"><label>国家 (ISO2)</label><input id="lrCountry" class="input" value="GB" placeholder="GB"></div>
-          <div class="filter-item"><label>渠道名称</label><input id="lrChannel" class="input" placeholder="如 全球专线挂号"></div>
-          <div class="filter-item"><label>类型</label><input id="lrType" class="input" placeholder="专线/快速"></div>
-          <div class="filter-item"><label>首重 (kg)</label><input id="lrFirstW" class="input" type="number" step="0.1" value="0.5"></div>
-          <div class="filter-item"><label>首重价 (¥)</label><input id="lrFirstP" class="input" type="number" step="0.1" value="50"></div>
-          <div class="filter-item"><label>续重 (kg)</label><input id="lrContW" class="input" type="number" step="0.1" value="0.5"></div>
-          <div class="filter-item"><label>续重价 (¥)</label><input id="lrContP" class="input" type="number" step="0.1" value="15"></div>
-          <div class="filter-item"><label>时效</label><input id="lrEta" class="input" placeholder="5-8天"></div>
-        </div>
-        <div class="toolbar" style="margin-top:6px"><button id="lrSave" class="btn primary">保存渠道</button><button id="lrCancel" class="btn">取消</button><span class="muted" id="lrMsg"></span></div>
-      </div>
-    </div>
-  `;
-  // 开始试算 (本地报价表)
-  $('#lgQuote').addEventListener('click', async () => {
-    const btn = $('#lgQuote');
-    const box = $('#lgResult');
-    const cc = $('#lgCountry').value.trim().toUpperCase();
-    const wkg = parseFloat($('#lgWeight').value) || 1;
-    btn.textContent = '试算中…'; btn.disabled = true;
-    box.innerHTML = '<div class="muted" style="padding:8px 0">正在按报价表计算…</div>';
-    try {
-      const r = await API('/api/logistics/rates?country=' + encodeURIComponent(cc) + '&weight=' + encodeURIComponent(wkg));
-      const quotes = (r && r.quotes) || [];
-      if (!quotes.length) {
-        box.innerHTML = `<div class="notice warn">⚠️ 报价表里没有 ${esc(cc)} 的费率 —— 请在下方「报价表」里新增该国各渠道的首重/续重价格</div>`;
-        return;
-      }
-      const rows = quotes.map((q) => `<tr>
-        <td>${esc(q.channel)}</td><td>${esc(q.type)}</td><td>${esc(q.eta)}</td>
-        <td>首重 ${esc(String(q.firstWeight))}kg ¥${esc(String(q.firstPrice))}</td>
-        <td>续重 ${esc(String(q.contWeight))}kg ¥${esc(String(q.contPrice))}</td>
-        <td><b>¥${q.total}</b></td>
-      </tr>`).join('');
-      box.innerHTML = `<div class="muted" style="margin-bottom:6px">目的国 ${esc(cc)} · ${esc(String(wkg))}kg · 共 <b>${quotes.length}</b> 个渠道 · 报价表更新于 ${esc(r.updatedAt || '未记录')}</div>
-        <table class="ov-table" style="width:100%"><thead><tr><th>渠道</th><th>类型</th><th>时效</th><th>首重</th><th>续重</th><th>总费用</th></tr></thead><tbody>${rows}</tbody></table>
-        <div class="muted" style="font-size:11px;margin-top:6px">价格为报价表录入值, 请定期核对; 需要实时价可在智赢客户端「国际运费预估」里查。</div>`;
-    } catch (e) {
-      box.innerHTML = `<div class="notice warn">❌ 试算失败: ${esc((e && e.message) || e)}</div>`;
-    }
-    btn.textContent = '开始试算'; btn.disabled = false;
-  });
-  // ===== 报价表管理 =====
-  const renderRateList = () => {
-    const box = $('#lgRateList');
-    const countries = rates.countries || {};
-    const entries = Object.entries(countries);
-    if (!entries.length) { box.innerHTML = '<div class="muted" style="font-size:12px;padding:6px 0">暂无报价 — 点击「新增渠道」录入 (需国家+渠道+首重/续重价)</div>'; return; }
-    box.innerHTML = entries.map(([cc, list]) => `
-      <div style="margin-bottom:8px">
-        <div class="muted" style="font-size:12px;font-weight:600;margin-bottom:2px">${esc(cc)} (${list.length} 渠道)</div>
-        <table class="ov-table" style="width:100%"><tbody>
-          ${list.map((c, i) => `<tr>
-            <td>${esc(c.channel)}</td><td class="muted" style="font-size:11px">${esc(c.type || '')}</td>
-            <td>首${c.firstWeight}kg/¥${c.firstPrice}</td><td>续${c.contWeight}kg/¥${c.contPrice}</td>
-            <td class="muted">${esc(c.eta || '')}</td>
-            <td style="text-align:right"><button class="btn small" data-del="${esc(cc)}" data-i="${i}" title="删除渠道">✕</button></td>
-          </tr>`).join('')}
-        </tbody></table>
-      </div>`).join('');
-    box.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
-      const cc = b.dataset.del, idx = parseInt(b.dataset.i, 10);
-      const ch = rates.countries[cc][idx].channel;
-      const r = await API('/api/logistics/rates', { method: 'POST', body: JSON.stringify({ country: cc, channel: ch, remove: true }) });
-      if (r.ok) { (rates.countries[cc] || []).splice(idx, 1); renderRateList(); }
-    }));
-  };
-  renderRateList();
-  $('#lgRateAdd').addEventListener('click', () => { $('#lgRateForm').style.display = $('#lgRateForm').style.display === 'none' ? 'block' : 'none'; });
-  $('#lrCancel').addEventListener('click', () => { $('#lgRateForm').style.display = 'none'; });
-  $('#lrSave').addEventListener('click', async () => {
-    const body = {
-      country: $('#lrCountry').value.trim().toUpperCase(),
-      channel: $('#lrChannel').value.trim(),
-      type: $('#lrType').value.trim(),
-      firstWeight: parseFloat($('#lrFirstW').value) || 0.5,
-      firstPrice: parseFloat($('#lrFirstP').value) || 0,
-      contWeight: parseFloat($('#lrContW').value) || 0.5,
-      contPrice: parseFloat($('#lrContP').value) || 0,
-      eta: $('#lrEta').value.trim(),
-    };
-    if (!body.country || !body.channel) { $('#lrMsg').textContent = '⚠ 国家+渠道必填'; return; }
-    const r = await API('/api/logistics/rates', { method: 'POST', body: JSON.stringify(body) });
-    $('#lrMsg').textContent = r.ok ? '✔ 已保存' : ('✗ ' + (r.error || '保存失败'));
-    if (r.ok) { $('#lgRateForm').style.display = 'none'; $('#lrMsg').textContent = ''; location.reload(); }
-  });
-  $('#lgRateRefresh').addEventListener('click', async () => {
-    // 标记已更新: 更新 updatedAt (发一个空保存刷新时间)
-    const r = await API('/api/logistics/rates', { method: 'POST', body: JSON.stringify({ _touch: true }) }).catch(() => ({}));
-    if (r && r.ok) { location.reload(); }
-  });
+    <div class="notice">📦 <b>物流工具:</b> 报价表已废弃，改为<b>智赢实时运价</b>（按目的国 + 重量实时计算，含燃油系数与国家附加费）。</div>
+    <div class="card" style="margin-top:12px;padding:16px">
+      <div class="muted">请在「利润测算 → 一键计算」里直接使用实时运价；批量取价可调用接口：</div>
+      <pre style="margin-top:8px;font-size:12px">GET /api/zy/freight/quote?country=DE&amp;weight=200
+GET /api/zy/freight/channels?refresh=1</pre>
+    </div>`;
 }
-
-/* ===== 初始化 ===== */
-document.addEventListener('DOMContentLoaded', async () => {
-  initTheme();
-  // 注入线性 SVG 图标 (导航 + logo)
-  $$('[data-icon]').forEach((n) => {
-    const box = n.querySelector('.nav-emoji');
-    if (box) box.innerHTML = ic(n.dataset.icon, 17);
-  });
-  const logoIcon = $('#logoIcon');
-  if (logoIcon) logoIcon.innerHTML = ic('bolt', 24);
-  $$('.nav-item').forEach((n) => n.addEventListener('click', () => navigate(n.dataset.page)));
-  try {
-    await API('/api/health');
-    $('#healthBadge').textContent = '● 服务在线';
-  } catch { $('#healthBadge').textContent = '● 服务离线'; }
-  navigate('workbench');
-});
-
-
-
