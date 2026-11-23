@@ -1,0 +1,721 @@
+/* 智赢采集器 —— 设置页
+ *
+ * 为什么单独做一个页面而不是塞进 popup:
+ *   · popup 宽度上限 800px 且一关就没, 塞不下这些分组和说明;
+ *   · 三个地方(采集器面板 / ifast 上架面板 / 工作台)都要能进设置 —— 统一跳这个页面最省事。
+ *
+ * 设置存在 chrome.storage.local 的两个键里(三处脚本共用同一份):
+ *   settings —— 行为类: 采集/物流/上传默认值/连接
+ *   pricing  —— 算价类: 利润率 + 各站 到手比例/汇率/本币调整 + 是否用实时汇率
+ *               (各站那几张表在采集器面板的「⚙ 定价」里改, 这里只管利润率和汇率来源)
+ */
+'use strict';
+
+/** 行为设置的默认值 —— 这里是唯一权威来源; 各处消费方用它兜底(键缺失时行为与这里一致)。 */
+let ZT = { taxBySite: { UK: 0.68, DE: 0.68, AU: 0.85, ES: 0.68, IT: 0.68, FR: 0.68 }, taxLock: false };
+const DEF = {
+  autoVariantFetch: true,      // 详情页自动逐个直采变体
+  rankFreshMin: 30,            // 排名快照新鲜度阈值(分钟)
+  maxRows: 200,                // 面板最多显示行数
+  logisticsPick: 'lowest',     // lowest | second —— 物流报价取最低/次低
+  defaultWeightKg: 0,          // >0 时: 页面采不到重量就用它
+  defaultScope: 'one',         // one | family —— 上传范围
+  defaultFillMode: 'auto',     // auto | single | multi —— 上传方式
+  defaultStock: 0,             // 默认库存
+  defaultLeadDays: 15,         // 默认备货周期(天)
+  defaultFollowPreset: 'allday', // 默认跟卖时间预设
+  autoSubmit: true,            // 点上传后自动到 ifast 填表并保存
+  apiDirect: true,             // ★ 优先直连 ifast 接口提交(不打开「添加跟卖」弹窗); 失败自动回退页面流程
+  erpBase: 'http://127.0.0.1:3088',
+  /* ★ 2026-11-14 列表页卡片底色（AMZ 蓝 / FBA 红 / FBM 绿） */
+  zylColors: { amz: '#1677ff', fba: '#cf1322', fbm: '#237804' },
+};
+
+const $ = (id) => document.getElementById(id);
+let S = Object.assign({}, DEF);       // settings
+let P = { margin: 0.3, net: {}, fx: {}, adj: {}, useLiveFx: false };  // pricing
+let rates = null, ratesAt = null;
+
+const num = (v, d) => { const n = Number(v); return isNaN(n) ? d : n; };
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const msg = (t, cls) => { const m = $('msg'); m.textContent = t || ''; m.className = cls || ''; };
+
+function load(cb) {
+  chrome.storage.local.get(['settings', 'pricing', 'pricingRates', 'freightQuote', 'zyp_v3_settings'], (o) => {
+    S = Object.assign({}, DEF, (o && o.settings) || {});
+    const __zyp = (o && o.zyp_v3_settings) || null;
+    if (__zyp) { ZT.taxBySite = Object.assign({}, ZT.taxBySite, __zyp.taxBySite || {}); ZT.taxLock = !!__zyp.taxLock; }
+    const p = (o && o.pricing) || null;
+    if (p) P = Object.assign({ margin: 0.3, net: {}, fx: {}, adj: {}, useLiveFx: false }, p);
+    const rt = (o && o.pricingRates) || null;
+    if (rt && rt.rates) { rates = rt.rates; ratesAt = rt.at || null; }
+    FQ = (o && o.freightQuote) || null;
+    if (cb) cb();
+  });
+}
+
+function render() {
+  $('margin').value = P.margin != null ? P.margin : 0.3;
+  renderTax();
+  $('useLiveFx').checked = !!P.useLiveFx;
+  $('defaultWeightKg').value = num(S.defaultWeightKg, 0);
+  $('rankFreshMin').value = num(S.rankFreshMin, 30);
+  $('maxRows').value = num(S.maxRows, 200);
+  $('autoVariantFetch').checked = !!S.autoVariantFetch;
+  $('defaultStock').value = num(S.defaultStock, 0);
+  $('defaultLeadDays').value = num(S.defaultLeadDays, 15);
+  $('autoSubmit').checked = !!S.autoSubmit;
+  $('apiDirect').checked = (S.apiDirect !== false);   // 默认开
+  $('erpBase').value = S.erpBase || DEF.erpBase;
+  $('defaultFollowPreset').value = S.defaultFollowPreset || DEF.defaultFollowPreset;
+  seg('pickSeg', S.logisticsPick || DEF.logisticsPick);
+  seg('scopeSeg', S.defaultScope || DEF.defaultScope);
+  seg('modeSeg', S.defaultFillMode || DEF.defaultFillMode);
+  renderFq();
+  renderFx();
+  renderData();
+  renderColors();
+}
+
+function seg(id, on) {
+  [...$(id).children].forEach((s) => s.classList.toggle('on', s.getAttribute('data-v') === on));
+}
+function segBind(id, key, after) {
+  $(id).addEventListener('click', (e) => {
+    const v = e.target && e.target.getAttribute && e.target.getAttribute('data-v');
+    if (!v) return;
+    seg(id, v); S[key] = v; if (after) after(v); dirty();
+  });
+}
+let dirtyT = null;
+function dirty() { msg('有未保存的改动', 'warn'); clearTimeout(dirtyT); dirtyT = setTimeout(() => { /* 提示常驻到保存 */ }, 100); }
+
+/* ★ 物流报价表导入 (2026-09-28)
+ * 背景: 面板上「按重量查物流成本」走 ERP(127.0.0.1:3088) 的 /api/logistics/rates,
+ *       而那张表要手工录入、常常是空的 → 允许直接从报价表文件导入。
+ * 存法: chrome.storage.local.freightQuote = { source, importedAt, channel, rates }
+ *       rates = { GB: { '200': 27.13, '300': 31.58, ... }, ... }   (键 = 克数)
+ * 用法: 后台 LOGISTICS_QUOTE 优先查这张表, 查不到的国家/重量才回落到 ERP。
+ */
+let FQ = null;
+const FQ_SITE = {
+  '德国': 'DE', '法国': 'FR', '英国': 'GB', '澳大利亚': 'AU', '澳洲': 'AU', '意大利': 'IT', '西班牙': 'ES',
+  DE: 'DE', FR: 'FR', GB: 'GB', AU: 'AU', IT: 'IT', ES: 'ES', UK: 'GB',
+};
+function fqSiteCode(v) {
+  const t = String(v == null ? '' : v).trim();
+  if (!t) return null;
+  const up = t.toUpperCase();
+  if (FQ_SITE[up]) return FQ_SITE[up];
+  for (const k in FQ_SITE) if (t.indexOf(k) >= 0) return FQ_SITE[k];
+  return null;
+}
+/** 重量 → 克: 200g / 200 / 0.2(kg) / 1.5kg 都认 */
+function fqGram(v) {
+  let s = String(v == null ? '' : v).trim().toLowerCase();
+  if (!s) return null;
+  const isKg = /kg|千克|公斤/.test(s);
+  s = s.replace(/[^0-9.]/g, '');
+  const n = Number(s);
+  if (!isFinite(n) || n <= 0) return null;
+  const g = (isKg || n < 10) ? Math.round(n * 1000) : Math.round(n);
+  return g > 0 ? g : null;
+}
+function fqPrice(v) {
+  const s = String(v == null ? '' : v).replace(/[^0-9.]/g, '');
+  const n = Number(s);
+  return isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : null;
+}
+function fqPut(rates, code, g, p) {
+  if (!code || !g || p == null) return 0;
+  (rates[code] = rates[code] || {})[String(g)] = p;
+  return 1;
+}
+/** 「站点|重量|价格」三列一组 → rates (列数不固定, 逐列扫描, 认到就吃三列) */
+function fqAddTriples(rows) {
+  const rates = {}; let n = 0;
+  for (const r of rows) {
+    for (let i = 0; i + 2 < r.length; i++) {
+      const code = fqSiteCode(r[i]); if (!code) continue;
+      const g = fqGram(r[i + 1]); if (!g) continue;
+      const p = fqPrice(r[i + 2]); if (p == null) continue;
+      n += fqPut(rates, code, g, p);
+      i += 2;
+    }
+  }
+  return { rates, n };
+}
+function fqParseJson(text) {
+  const j = JSON.parse(String(text).replace(/^\uFEFF/, ''));
+  const rates = {};
+  // ① 本插件/脚本导出的格式: { rates: { GB: { name, prices: { 200: 27.13 } } } }
+  if (j && j.rates && typeof j.rates === 'object') {
+    for (const k in j.rates) {
+      const v = j.rates[k] || {};
+      const code = fqSiteCode(k) || fqSiteCode(v.name);
+      const prices = (v && typeof v === 'object' && (v.prices || v.rates)) || v;
+      if (typeof prices !== 'object') continue;
+      for (const g in prices) fqPut(rates, code, fqGram(g), fqPrice(prices[g]));
+    }
+  }
+  // ② 直接 { GB: { '200': 27.13 } } / { 英国: { '200g': 27.13 } }
+  if (!Object.keys(rates).length) {
+    for (const k in j) {
+      const code = fqSiteCode(k); const v = j[k];
+      if (!code || !v || typeof v !== 'object') continue;
+      for (const g in v) fqPut(rates, code, fqGram(g), fqPrice(v[g]));
+    }
+  }
+  return rates;
+}
+function fqParseDelimited(text) {
+  const sep = text.indexOf('\t') >= 0 ? '\t' : ',';
+  const rows = text.split(/\r?\n/).filter((l) => l.trim()).map((l) => l.split(sep).map((x) => x.trim().replace(/^"|"$/g, '')));
+  return fqAddTriples(rows).rates;
+}
+function fqColIdx(ref) { let n = 0; for (const ch of String(ref)) { const c = ch.charCodeAt(0); if (c < 65 || c > 90) break; n = n * 26 + (c - 64); } return n - 1; }
+function fqXmlUnesc(s) { return String(s).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&'); }
+/** 极简 xlsx 读取: 只用 DecompressionStream('deflate-raw'), 不引第三方库
+ *  ★ 2026-10-08: 多带一个 diag 出参 —— 解析不出报价时要说清"读到几行、第一行长什么样",
+ *    否则用户只看到"解析不出报价", 完全不知道该改哪里(实测: 用户选到了「定价表.xlsx」这个文件夹)。 */
+async function fqUnzip(buf) {
+  const ent = {};
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  for (let i = 0; i + 30 < buf.length; i++) {
+    if (!(buf[i] === 0x50 && buf[i + 1] === 0x4b && buf[i + 2] === 0x03 && buf[i + 3] === 0x04)) continue;
+    const method = dv.getUint16(i + 8, true);
+    const compSize = dv.getUint32(i + 18, true);
+    const nameLen = dv.getUint16(i + 26, true);
+    const extraLen = dv.getUint16(i + 28, true);
+    const name = new TextDecoder('utf-8').decode(buf.subarray(i + 30, i + 30 + nameLen));
+    const start = i + 30 + nameLen + extraLen;
+    if (!compSize) continue;
+    const data = buf.subarray(start, start + compSize);
+    try {
+      if (method === 0) ent[name] = data;
+      else if (method === 8) {
+        const ds = new DecompressionStream('deflate-raw');
+        const out = await new Response(new Blob([data]).stream().pipeThrough(ds)).arrayBuffer();
+        ent[name] = new Uint8Array(out);
+      }
+    } catch (e) { /* 某一条解不开就跳过 */ }
+    i = start + compSize - 1;
+  }
+  return ent;
+}
+async function fqParseXlsx(file, diag) {
+  if (typeof DecompressionStream !== 'function') throw new Error('本浏览器不支持解压 xlsx, 请另存为 csv 再导入');
+  const ent = await fqUnzip(new Uint8Array(await file.arrayBuffer()));
+  const dec = new TextDecoder('utf-8');
+  if (diag) diag.entries = Object.keys(ent).length;
+  const shared = [];
+  if (ent['xl/sharedStrings.xml']) {
+    const sx = dec.decode(ent['xl/sharedStrings.xml']);
+    for (const m of sx.matchAll(/<si[^>]*>([\s\S]*?)<\/si>/g)) {
+      shared.push([...m[1].matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map((x) => fqXmlUnesc(x[1])).join(''));
+    }
+  }
+  const sheets = Object.keys(ent).filter((k) => /^xl\/worksheets\/.*\.xml$/.test(k));
+  if (diag) { diag.sheets = sheets.length; diag.shared = shared.length }
+  const key = Object.keys(ent).find((k) => /^xl\/worksheets\/sheet1\.xml$/.test(k)) || sheets[0];
+  if (!key) { if (diag) diag.why = '不是有效的 xlsx（解压后没有工作表）'; throw new Error('xlsx 里没找到工作表') }
+  const sx = dec.decode(ent[key]);
+  const rows = [];
+  for (const rm of sx.matchAll(/<row[^>]*>([\s\S]*?)<\/row>/g)) {
+    const cells = [];
+    for (const cm of rm[1].matchAll(/<c([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+      const attrs = cm[1] || ''; const inner = cm[2] || '';
+      const ref = (attrs.match(/\br="([A-Z]+)\d+"/) || [])[1] || '';
+      const t = (attrs.match(/\bt="([^"]+)"/) || [])[1] || '';
+      let v = '';
+      if (t === 'inlineStr') v = [...inner.matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map((x) => x[1]).join('');
+      else {
+        const vm = inner.match(/<v[^>]*>([\s\S]*?)<\/v>/);
+        v = vm ? vm[1] : '';
+        if (t === 's') v = shared[Number(v)] != null ? shared[Number(v)] : '';
+      }
+      const ci = fqColIdx(ref);
+      if (ci >= 0) cells[ci] = fqXmlUnesc(v);
+    }
+    for (let i = 0; i < cells.length; i++) if (cells[i] == null) cells[i] = '';
+    if (cells.some((x) => String(x).trim() !== '')) rows.push(cells);
+  }
+  if (diag) { diag.rows = rows.length; diag.firstRow = (rows[0] || []).slice(0, 6).map((x) => String(x).slice(0, 14)) }
+  return fqAddTriples(rows).rates;
+}
+/** 一句人话: 这个文件为什么解析不出报价(给用户看, 别只说"解析不出") */
+function fqWhy(diag, cells) {
+  if (!diag) return '解析不出报价';
+  if (cells) return '';
+  if (diag.kind === 'json') return 'JSON 结构不认识（既不是 {rates:{GB:{prices:{…}}}} 也不是 {GB:{"200":27.13}}）';
+  if (diag.entries === 0) return '不是有效的 xlsx（一个内部文件都没解出来）';
+  if (diag.sheets === 0) return '不是有效的 xlsx（解压后没有工作表）';
+  if (diag.rows === 0) return '表是空的（没有读到任何一行）';
+  if (diag.rows != null) {
+    const fr = (diag.firstRow || []).filter(Boolean).join(' | ');
+    return '读到 ' + diag.rows + ' 行，但每行都凑不出「站点|重量|价格」三列' + (fr ? ('（第一行是：' + fr + '）') : '');
+  }
+  return '按 ' + (diag.sep === '\t' ? 'Tab' : '逗号') + ' 切列后凑不出三列组' + ((diag.firstRow || []).length ? ('（第一行是：' + diag.firstRow.filter(Boolean).join(' | ') + '）') : '');
+}
+const FQ_TIP = '正确格式：一行里横向排若干组「站点|重量|价格」，例如 <code>英国|200g|27.13|德国|200g|56.24</code>（重量 200g / 200 / 0.2 都认；站点认 德国/法国/英国/澳大利亚/意大利/西班牙 或 DE/FR/GB/AU/IT/ES）。';
+async function fqParseFile(file, diag) {
+  const nm = String(file.name || '').toLowerCase();
+  if (diag) diag.name = file.name;
+  if (/\.xlsx?$|\.xlsm$/.test(nm)) { if (diag) diag.kind = 'xlsx'; return fqParseXlsx(file, diag) }
+  const text = String(await file.text()).replace(/^\uFEFF/, '');   // 有些编辑器写出的 json/csv 带 BOM
+  if (/\.json$/.test(nm)) { if (diag) diag.kind = 'json'; return fqParseJson(text) }
+  if (diag) { diag.kind = 'text'; diag.sep = text.indexOf('\t') >= 0 ? '\t' : ','; diag.rows = text.split(/\r?\n/).filter((l) => l.trim()).length; diag.firstRow = (text.split(/\r?\n/)[0] || '').split(text.indexOf('\t') >= 0 ? '\t' : ',').slice(0, 6).map((x) => x.trim().slice(0, 14)) }
+  return fqParseDelimited(text);
+}
+function fqCount(rates) {
+  const sites = Object.keys(rates || {}).filter((k) => Object.keys(rates[k]).length);
+  return { sites: sites.length, cells: sites.reduce((a, k) => a + Object.keys(rates[k]).length, 0) };
+}
+function renderFq() {
+  const el = $('fqMeta'); if (!el) return;
+  if (!FQ || !FQ.rates) { el.innerHTML = '未导入 —— 查询走 ERP（<code>127.0.0.1:3088</code>）的物流报价表'; return; }
+  const c = fqCount(FQ.rates);
+  el.innerHTML = '<span class="ok">✓ 已导入</span> <b>' + esc(FQ.source || '') + '</b>：' + c.sites + ' 个国家 / ' + c.cells +
+    ' 个重量档 · 渠道 <b>' + esc(FQ.channel || '云途普货') + '</b> · ' + esc(FQ.importedAt || '');
+}
+/** 用一份文件的内容建表并保存 */
+async function fqTakeFile(file, label) {
+  const diag = {};
+  const rates = await fqParseFile(file, diag);
+  const c = fqCount(rates);
+  if (!c.cells) throw new Error('没解析出报价：' + (fqWhy(diag, 0) || '需要「站点|重量|价格」三列一组的表'));
+  FQ = { source: label || file.name, importedAt: new Date().toISOString().slice(0, 16).replace('T', ' '), channel: '云途普货', rates };
+  await new Promise((res) => chrome.storage.local.set({ freightQuote: FQ }, res));
+  renderFq();
+  try { chrome.runtime.sendMessage({ type: 'FREIGHT_QUOTE_CHANGED' }, () => void chrome.runtime.lastError); } catch (e) {}
+  msg('✓ 已导入 ' + (label || file.name) + '：' + c.sites + ' 个国家 / ' + c.cells + ' 个重量档', 'ok');
+}
+async function fqImportFolder() {
+  if (typeof window.showDirectoryPicker !== 'function') { msg('本浏览器不支持选文件夹，请用「选单个文件」', 'warn'); return; }
+  let dir = null;
+  try { dir = await window.showDirectoryPicker({ id: 'zyingFreightQuote', mode: 'read' }); } catch (e) { return; }  // 取消
+  const cands = [];
+  try {
+    for await (const [name, h] of dir.entries()) {
+      if (h.kind !== 'file') continue;
+      if (/\.(xlsx|xlsm|json|csv|tsv)$/i.test(name)) cands.push([name, h]);
+    }
+  } catch (e) { msg('✗ 读文件夹失败: ' + e.message, 'bad'); return; }
+  if (!cands.length) { msg('✗ 这个文件夹里没有 .xlsx / .xlsm / .json / .csv / .tsv 文件', 'bad'); return; }
+  const score = (n) => { const s = n.toLowerCase(); let v = 0; if (/物流|运费|报价|freight/.test(s)) v += 10; if (/\.xlsx?$/.test(s)) v += 6; else if (/\.json$/.test(s)) v += 4; else v += 2; return v; };
+  cands.sort((a, b) => score(b[0]) - score(a[0]));
+  // 桌面上常有好几份同名表(旧的档数一样但值是旧的) —— 每个都解析一遍: 先比档数, 平手取“最近修改”的那份
+  let best = null;
+  const tries = [];                       // ★ 逐个留证: 文件名 + 组数 + 为什么不行(用户要看得懂)
+  for (const [name, h] of cands) {
+    const diag = {};
+    try {
+      const file = await h.getFile();
+      const rates = await fqParseFile(file, diag);
+      const c = fqCount(rates);
+      const mt = Number(file.lastModified) || 0;
+      tries.push({ name, cells: c.cells, why: fqWhy(diag, c.cells) });
+      if (c.cells > 0 && (!best || c.cells > best.cells || (c.cells === best.cells && mt > best.mt))) best = { name, rates, sites: c.sites, cells: c.cells, mt };
+    } catch (e) { tries.push({ name, cells: 0, why: diag.why || ('读不出来: ' + ((e && e.message) || e)) }) }
+  }
+  if (!best) {
+    /* ★ 2026-10-08 用户报障「这个文件夹里的 1 个表格都解析不出报价」—— 原来只说这一句, 用户完全不知道
+     *   该改哪里(实测他选到了放着「定价表.xlsx」的文件夹: 那是"定价参数表", 根本不带站点/重量/价格)。
+     *   现在把每个文件为什么不行写清楚, 并给出正确格式示例。
+     *   ★ 注意 msg() 用的是 textContent(不是 innerHTML) → 只能纯文本, 用「；」分隔, 不能用 <br>。 */
+    msg('✗ 这个文件夹里 ' + cands.length + ' 个表格都解析不出报价 —— ' +
+      tries.map((t) => t.name + '：' + (t.why || '没有报价数据')).join('；') +
+      '。' + FQ_TIP.replace(/<[^>]+>/g, '') + '（也可点「选单个文件」直接挑那份报价表）', 'bad');
+    return;
+  }
+  FQ = { source: best.name + '  (文件夹 ' + dir.name + ')', importedAt: new Date().toISOString().slice(0, 16).replace('T', ' '), channel: '云途普货', rates: best.rates };
+  await new Promise((res) => chrome.storage.local.set({ freightQuote: FQ }, res));
+  renderFq();
+  try { chrome.runtime.sendMessage({ type: 'FREIGHT_QUOTE_CHANGED' }, () => void chrome.runtime.lastError); } catch (e) {}
+  msg('✓ 已导入 ' + esc(best.name) + '：' + best.sites + ' 个国家 / ' + best.cells + ' 个重量档' + (cands.length > 1 ? ('（文件夹里还有 ' + (cands.length - 1) + ' 个表格，已自动挑最全的）') : ''), 'ok');
+}
+
+
+/** 汇率区: 显示当前生效的是什么 + 实时值 */
+function renderFx() {
+  const SITE = { uk: ['英国', 'GBP', '£'], de: ['德国', 'EUR', '€'], au: ['澳大利亚', 'AUD', 'A$'] };
+  const rows = [];
+  for (const k of Object.keys(SITE)) {
+    const [cn, code] = SITE[k];
+    const table = (P.fx && P.fx[k] != null && P.fx[k] !== '') ? Number(P.fx[k]) : null;
+    const live = (rates && rates[code] != null) ? Number(rates[code]) : null;
+    let use = null, src = '';
+    if (P.useLiveFx && live != null) { use = live; src = 'live' }
+    else if (table != null) { use = table; src = 'tbl' }
+    else if (live != null) { use = live; src = 'live' }
+    rows.push('<tr><td>' + cn + ' <span class="pill">' + code + '</span></td>' +
+      '<td class="num">' + (table != null ? table : '—') + '</td>' +
+      '<td class="num">' + (live != null ? live : '—') + '</td>' +
+      '<td class="num"><b>' + (use != null ? use : '—') + '</b> ' +
+      (src === 'live' ? '<span class="pill live">实时</span>' : '<span class="pill tbl">表</span>') +
+      '</td></tr>');
+  }
+  $('fxTable').innerHTML = '<table><thead><tr><th>站点</th><th>表里值</th><th>实时值</th><th>当前生效</th></tr></thead><tbody>' + rows.join('') + '</tbody></table>';
+  $('fxMeta').innerHTML = rates
+    ? ('来源 <b>' + esc((rates._source || 'ERP')) + '</b> · 取到时间 ' + esc(ratesAt || '—') + ' · 共 ' + Object.keys(rates).length + ' 个币种')
+    : '还没取过实时汇率（点左边按钮）';
+}
+
+async function fetchRates() {
+  const base = String($('erpBase').value || DEF.erpBase).replace(/\/+$/, '');
+  msg('正在拉取汇率…', '');
+  try {
+    const r = await fetch(base + '/api/rates', { signal: AbortSignal.timeout(20000) });
+    const j = await r.json();
+    if (!j || !j.rates) throw new Error('返回里没有 rates');
+    rates = j.rates; rates._source = j.source || 'ERP'; ratesAt = new Date().toISOString().slice(0, 16).replace('T', ' ');
+    chrome.storage.local.set({ pricingRates: { at: ratesAt, base: j.base, date: j.date, source: j.source, rates: j.rates } });
+    renderFx();
+    msg('✓ 汇率已更新（' + (j.date || '') + '）', 'ok');
+  } catch (e) {
+    msg('✗ 拉取失败: ' + (e && e.message ? e.message : e) + '（确认 ERP 在 ' + base + ' 上跑着）', 'bad');
+  }
+}
+
+function renderData() {
+  chrome.storage.local.get(['rowdata', 'pendingUploads', 'bench'], (o) => {
+    const rd = (o && o.rowdata) || {}, pu = (o && o.pendingUploads) || [], be = (o && o.bench) || [];
+    const filled = Object.keys(rd).filter((k) => rd[k] && (rd[k].cost != null || rd[k].quote || rd[k].uploaded)).length;
+    $('dataMeta').innerHTML = '本地填写数据 <b>' + Object.keys(rd).length + '</b> 行（其中 <b>' + filled + '</b> 行有内容） · 待上传队列 <b>' + pu.length + '</b> 条 · 工作台累积 <b>' + be.length + '</b> 条';
+  });
+}
+
+function save() {
+  S.autoVariantFetch = $('autoVariantFetch').checked;
+  S.defaultWeightKg = num($('defaultWeightKg').value, 0);
+  S.rankFreshMin = Math.max(1, num($('rankFreshMin').value, 30));
+  S.maxRows = Math.max(20, num($('maxRows').value, 200));
+  S.defaultStock = num($('defaultStock').value, 0);
+  S.defaultLeadDays = num($('defaultLeadDays').value, 15);
+  S.autoSubmit = $('autoSubmit').checked;
+  S.apiDirect = $('apiDirect').checked;
+  S.defaultFollowPreset = $('defaultFollowPreset').value;
+  S.erpBase = String($('erpBase').value || DEF.erpBase).trim().replace(/\/+$/, '');
+  /* 面板配色 */
+  S.zylColors = {
+    fba: String($('cFba').value || DEF.zylColors.fba),
+    fbm: String($('cFbm').value || DEF.zylColors.fbm),
+    amz: String($('cAmz').value || DEF.zylColors.amz),
+  };
+  if (!/^https?:\/\//.test(S.erpBase)) S.erpBase = DEF.erpBase;
+
+  P.margin = Math.max(0, num($('margin').value, 0.3));
+  P.useLiveFx = $('useLiveFx').checked;
+
+  chrome.storage.local.set({ settings: S, pricing: P }, () => {
+    if (chrome.runtime.lastError) { msg('✗ 保存失败: ' + chrome.runtime.lastError.message, 'bad'); return }
+    // 通知所有已打开的采集器/上架面板立刻重读(不用刷新页面)
+    try { chrome.runtime.sendMessage({ type: 'SETTINGS_CHANGED', settings: S, pricing: P }, () => void chrome.runtime.lastError); } catch (e) {}
+    msg('✓ 已保存并通知各面板', 'ok');
+    renderFx();
+    setTimeout(() => { if ($('msg').textContent.indexOf('已保存') >= 0) msg('', '') }, 4000);
+  });
+}
+
+/** 回填/刷新配色区 + 预览 */
+function renderColors() {
+  const c = Object.assign({}, DEF.zylColors, S.zylColors || {});
+  ['fba', 'fbm', 'amz'].forEach((k) => {
+    const el = $('c' + k.charAt(0).toUpperCase() + k.slice(1));
+    if (el) el.value = c[k];
+    const t = $('c' + k.charAt(0).toUpperCase() + k.slice(1) + 'Txt');
+    if (t) t.textContent = c[k].toUpperCase();
+  });
+  const pv = $('cPreview');
+  if (pv) {
+    pv.innerHTML = [['fba', 'FBA'], ['fbm', 'FBM'], ['amz', 'AMZ']].map(([k, lab]) => {
+      const col = c[k];
+      return '<span style="padding:3px 9px;border-radius:8px;font-size:12px;border:1px solid ' + col + '55;border-left:3px solid ' + col +
+        ';background:' + col + '1a;color:#333"><b style="color:#fff;background:' + col + ';padding:0 5px;border-radius:4px;margin-right:6px">' + lab + '</b>搞薯条 · 可售 · 品牌 LYCFC</span>';
+    }).join('');
+  }
+}
+
+function bind() {
+  $('save').onclick = save;
+  $('reset').onclick = () => {
+    if (!confirm('把所有【行为设置】恢复成默认值？（各站定价参数不受影响，仍可在采集器面板「⚙ 定价」里改）')) return;
+    S = Object.assign({}, DEF);
+    chrome.storage.local.set({ settings: S }, () => {
+      render();
+      try { chrome.runtime.sendMessage({ type: 'SETTINGS_CHANGED' }, () => void chrome.runtime.lastError); } catch (e) {}
+      msg('✓ 已恢复默认', 'ok');
+    });
+  };
+  ['cFba', 'cFbm', 'cAmz'].forEach((id) => {
+    const el = $(id);
+    if (el) el.addEventListener('input', () => {
+      S.zylColors = {
+        fba: $('cFba').value, fbm: $('cFbm').value, amz: $('cAmz').value,
+      };
+      renderColors();
+    });
+  });
+  $('fxFetch').onclick = fetchRates;
+  segBind('pickSeg', 'logisticsPick');
+  segBind('scopeSeg', 'defaultScope');
+  segBind('modeSeg', 'defaultFillMode');
+  ['margin', 'useLiveFx', 'defaultWeightKg', 'rankFreshMin', 'maxRows', 'autoVariantFetch', 'defaultStock', 'defaultLeadDays', 'autoSubmit', 'apiDirect', 'defaultFollowPreset', 'erpBase']
+    .forEach((id) => { $(id).addEventListener('change', dirty); $(id).addEventListener('input', dirty); });
+
+  $('erpTest').onclick = async () => {
+    const base = String($('erpBase').value || DEF.erpBase).replace(/\/+$/, '');
+    $('erpMeta').textContent = '测试中…';
+    try {
+      const r = await fetch(base + '/api/health', { signal: AbortSignal.timeout(10000) });
+      const j = await r.json().catch(() => ({}));
+      $('erpMeta').innerHTML = '<span class="ok">✓ 连上了</span> ' + esc(base) + (j && j.total != null ? (' · 商品库 ' + j.total + ' 条') : '');
+    } catch (e) {
+      $('erpMeta').innerHTML = '<span class="bad">✗ 连不上</span> ' + esc(base) + ' —— 确认 ERP 后端已启动';
+    }
+  };
+
+  // 导出 / 导入
+  $('expBtn').onclick = () => {
+    const data = { __zvSettings: 1, exportedAt: new Date().toISOString(), settings: S, pricing: P };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'zying-settings-' + new Date().toISOString().slice(0, 10) + '.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    msg('✓ 已导出', 'ok');
+  };
+  // ★ 物流报价表导入 / 清除
+  $('fqImport').onclick = () => { fqImportFolder().catch((e) => msg('✗ 导入失败: ' + e.message, 'bad')); };
+  $('fqImportFile').onclick = () => $('fqFile').click();
+  $('fqFile').onchange = (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    fqTakeFile(f).catch((er) => msg('✗ 导入失败: ' + er.message, 'bad'));
+    e.target.value = '';
+  };
+  $('fqClear').onclick = () => {
+    if (!confirm('清除已导入的物流报价表？（之后查询回落到 ERP 的报价表）')) return;
+    FQ = null;
+    chrome.storage.local.set({ freightQuote: null }, () => {
+      renderFq();
+      try { chrome.runtime.sendMessage({ type: 'FREIGHT_QUOTE_CHANGED' }, () => void chrome.runtime.lastError); } catch (e2) {}
+      msg('✓ 已清除导入的报价表', 'ok');
+    });
+  };
+
+  $('impBtn').onclick = () => $('impFile').click();
+  $('impFile').onchange = (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const fr = new FileReader();
+    fr.onload = () => {
+      try {
+        const j = JSON.parse(String(fr.result));
+        if (!j || typeof j !== 'object') throw new Error('不是 JSON 对象');
+        if (j.settings) S = Object.assign({}, DEF, j.settings);
+        if (j.pricing) P = Object.assign({ margin: 0.3, net: {}, fx: {}, adj: {}, useLiveFx: false }, j.pricing);
+        chrome.storage.local.set({ settings: S, pricing: P }, () => {
+          render();
+          try { chrome.runtime.sendMessage({ type: 'SETTINGS_CHANGED' }, () => void chrome.runtime.lastError); } catch (er) {}
+          msg('✓ 已导入并保存', 'ok');
+        });
+      } catch (er) { msg('✗ 导入失败: ' + er.message, 'bad') }
+    };
+    fr.readAsText(f);
+  };
+
+  // 本地数据清理
+  $('clrRow').onclick = () => {
+    chrome.storage.local.get(['rowdata'], (o) => {
+      const n = Object.keys((o && o.rowdata) || {}).length;
+      if (!confirm('清空本地填写数据？\n\n将删除 ' + n + ' 行的 采购成本/物流报价/手填承受价/已上传标记（ERP 里的上架记录不受影响）。')) return;
+      chrome.storage.local.set({ rowdata: {} }, () => { renderData(); msg('✓ 已清空本地填写数据', 'ok') });
+    });
+  };
+  $('clrPend').onclick = () => {
+    chrome.storage.local.get(['pendingUploads'], (o) => {
+      const n = ((o && o.pendingUploads) || []).length;
+      if (!confirm('清空待上传队列？\n\n将删除 ' + n + ' 条排队记录（ERP 上架记录不受影响）。')) return;
+      chrome.storage.local.set({ pendingUploads: [] }, () => { renderData(); msg('✓ 已清空待上传队列', 'ok') });
+    });
+  };
+  /* ★ 2026-09-28 用户反馈「设置里删完了还有虚拟数据」:
+   *   工作台(bench) 里那 13 条示例行(__demo:true) 以前只能去 popup 点「清空工作台」——
+   *   而那个按钮会把真实扫描的行一起清掉。这里只删带 __demo 标记的示例行, 真数据一条不动。
+   *   顺带把示例留下的 rowdata 空壳/预填也清掉(它们的 key = 站点|ASIN, 先收集再删)。 */
+  /* ══ 店铺管理(2026-10-06) —— 上架器登录时自动记录的店铺, 这里可查看/删除 ══
+   *   数据源: chrome.storage.local.shops(键=账号名, 由 bridge.js 的 refreshShop 写入)
+   *   删除只清本机记录, 不会影响 ifast 服务器上的任何数据。 */
+  function initShops() {
+    const anchor = document.getElementById('clrDemo');
+    if (!anchor || document.getElementById('zv-shops')) return;
+    const row = anchor.closest('div') || anchor.parentElement;
+    const wrap = document.createElement('div');
+    wrap.id = 'zv-shops';
+    wrap.setAttribute('style', 'margin-top:14px;border-top:1px solid rgba(255,255,255,.10);padding-top:12px');
+    wrap.innerHTML = '<div style="font-weight:700;font-size:13.5px;margin-bottom:6px">🏬 店铺（上架器登录时自动记录）</div>' +
+      '<div id="zv-shops-list" style="font-size:12px;line-height:1.9"></div>' +
+      '<div style="margin-top:8px"><button id="zv-shops-refresh" class="btn2">立即检测登录</button> ' +
+      '<button id="zv-shops-clear" class="btn2">清空全部店铺记录</button></div>' +
+      /* ★ 2026-10-07 新增: 「重复上架拦截」总开关(存在 ERP, 跟数据走 —— 换浏览器/换机器状态一致) */
+      '<div style="margin-top:10px;padding:8px 10px;border:1px solid rgba(255,255,255,.12);border-radius:8px">' +
+        '<label style="display:flex;align-items:center;gap:8px;cursor:pointer">' +
+          '<input type="checkbox" id="zv-blocking" style="width:15px;height:15px">' +
+          '<span style="font-weight:600">⛔ 重复上架拦截</span>' +
+        '</label>' +
+        '<div id="zv-blocking-desc" style="font-size:11.5px;color:#9a9a9a;line-height:1.7;margin-top:4px"></div>' +
+        '<div id="zv-blocking-msg" style="font-size:11.5px;margin-top:4px"></div>' +
+      '</div>' +
+      '<div id="zv-shops-msg" style="font-size:11.5px;color:#9a9a9a;margin-top:6px"></div>';
+    (row && row.parentElement ? row.parentElement : document.body).insertBefore(wrap, row ? row.nextSibling : null);
+    renderShops();
+    initBlocking();
+    document.getElementById('zv-shops-refresh').onclick = () => {
+      const m = document.getElementById('zv-shops-msg');
+      m.textContent = '检测中…（需要先打开一个 ifast 页面并已登录）';
+      chrome.runtime.sendMessage({ type: 'SHOP_REFRESH' }, (r) => {
+        /* ★ 2026-10-07 两处修: ① 必须读 lastError(否则 Unchecked runtime.lastError);
+         *   ② 店铺名可能是个对象 → 直接拼会显示成 [object Object](实测踩到)。 */
+        const le = chrome.runtime.lastError;
+        if (le) { m.textContent = '检测失败: 后台无响应(' + (le.message || '端口已关') + ') —— 扩展可能刚更新, 刷新本页再试'; renderShops(); return }
+        const nm = r && r.shop ? (r.shop.name || r.shop.shop || String(r.shop)) : '';
+        m.textContent = r && r.ok ? ('✓ 当前店铺: ' + nm + (r.isNew ? '（新记录）' : '')) : ('未登录或检测失败: ' + ((r && r.error) || '未知'));
+        renderShops();
+      });
+    };
+    document.getElementById('zv-shops-clear').onclick = () => {
+      if (!confirm('清空全部店铺记录？（只清本机记录, 不影响 ifast 上的数据; 下次登录会重新记录）')) return;
+      chrome.storage.local.set({ shops: {}, currentShop: null }, () => {
+        document.getElementById('zv-shops-msg').textContent = '✓ 已清空全部店铺记录';
+        renderShops();
+      });
+    };
+    document.getElementById('zv-shops-list').addEventListener('click', (e) => {
+      const b = e.target && e.target.closest ? e.target.closest('[data-zv-del]') : null;
+      if (!b) return;
+      const key = b.getAttribute('data-zv-del');
+      if (!confirm('删除店铺「' + key + '」的本机记录？（不影响 ifast 上的数据）')) return;
+      chrome.storage.local.get(['shops', 'currentShop'], (o) => {
+        const shops = (o && o.shops) || {};
+        delete shops[key];
+        const cur = (o && o.currentShop) === key ? null : (o && o.currentShop);
+        chrome.storage.local.set({ shops: shops, currentShop: cur }, () => {
+          document.getElementById('zv-shops-msg').textContent = '✓ 已删除店铺「' + key + '」的本机记录';
+          renderShops();
+        });
+      });
+    });
+  }
+  /* ★ 2026-10-07 新增: 「重复上架拦截」开关 —— 与 ERP 同步(存在 shops.json, 跟数据走)。
+   *   关闭后: 同 ASIN + 同站点已上架也【不再拦】, 重复上传照常提交(由 ifast 决定是否重复上架)。 */
+  function initBlocking() {
+    const cb = document.getElementById('zv-blocking');
+    if (!cb) return;
+    const desc = document.getElementById('zv-blocking-desc');
+    const msg = document.getElementById('zv-blocking-msg');
+    const paint = (r) => {
+      /* ★ 2026-10-07: 回调式 sendMessage 必须读 lastError → 否则"后台没回"会留 Unchecked runtime.lastError */
+      const le = chrome.runtime.lastError;
+      if (le) { if (msg) { msg.style.color = '#ffb4b4'; msg.textContent = '读取拦截开关失败: 后台无响应(' + (le.message || '端口已关') + ') —— 刷新本页再试'; } return }
+      if (!r || !r.ok) { if (msg) { msg.style.color = '#ffb4b4'; msg.textContent = '读取失败: ' + ((r && r.error) || '后台无响应'); } return }
+      const j = r.result || {};
+      cb.checked = j.enabled !== false;
+      if (desc) desc.textContent = j.desc || '';
+      if (msg) {
+        msg.style.color = j.enabled === false ? '#ffd79a' : '#9a9a9a';
+        msg.textContent = (j.at ? ('设置于 ' + j.at + '　') : '') + (j.note || '') + (j.dupRows ? ('　(已留痕拦截记录 ' + j.dupRows + ' 条)') : '');
+      }
+    };
+    chrome.runtime.sendMessage({ type: 'LISTING_BLOCKING' }, paint);
+    cb.onchange = () => {
+      if (msg) { msg.style.color = '#9a9a9a'; msg.textContent = '保存中…'; }
+      chrome.runtime.sendMessage({ type: 'LISTING_BLOCKING', payload: { enabled: cb.checked } }, (r) => {
+        const le = chrome.runtime.lastError;                 // ★ 同上: 不读就会报 Unchecked runtime.lastError
+        if (le || !r || !r.ok) {
+          if (msg) { msg.style.color = '#ffb4b4'; msg.textContent = '保存失败: ' + ((r && r.error) || (le && le.message) || '后台无响应'); }
+          cb.checked = !cb.checked; return;
+        }
+        chrome.runtime.sendMessage({ type: 'LISTING_BLOCKING' }, paint);
+        try { chrome.tabs.query({ url: 'https://www.ifast.top/*' }, (ts) => (ts || []).forEach((t) => { try { chrome.tabs.sendMessage(t.id, { type: 'SETTINGS_CHANGED' }, () => void chrome.runtime.lastError) } catch (e) {} })); } catch (e) {}
+      });
+    };
+  }
+  function renderShops() {
+    const box = document.getElementById('zv-shops-list');
+    if (!box) return;
+    chrome.storage.local.get(['shops', 'currentShop'], (o) => {
+      const shops = (o && o.shops) || {};
+      const cur = o && o.currentShop;
+      const keys = Object.keys(shops);
+      if (!keys.length) { box.innerHTML = '<span style="color:#9a9a9a">还没有记录 —— 打开 ifast 上架页并登录后会自动记录</span>'; return; }
+      box.innerHTML = keys.map((k) => {
+        const v = shops[k] || {};
+        const groups = (v.sellingGroups || []).map((x) => x.name).filter(Boolean).slice(0, 4).join('、');
+        return '<div style="padding:4px 0;border-bottom:1px dashed rgba(255,255,255,.08)">' +
+          (k === cur ? '🟢 ' : '⚪ ') + '<b>' + k + '</b>' +
+          ' <span style="color:#9a9a9a">' + ((v.countries || []).join('/') || '未知站点') +
+          ' · 跟卖组 ' + ((v.sellingGroups || []).length) + (groups ? ('(' + groups + ')') : '') +
+          ' · 上架 ' + (v.listedCount == null ? '?' : v.listedCount) +
+          ' · 最近见到 ' + (v.lastSeen || '?') + '</span>' +
+          ' <button data-zv-del="' + k + '" class="btn2" style="padding:1px 7px;font-size:11px">删除</button></div>';
+      }).join('');
+    });
+  }
+  try { initShops(); } catch (e) {}
+  $('clrDemo').onclick = () => {
+    chrome.storage.local.get(['bench', 'rowdata'], (o) => {
+      const b = (o && o.bench) || [];
+      const demo = b.filter((x) => x && x.__demo === true);
+      if (!demo.length) { msg('✓ 没有示例数据了（工作台共 ' + b.length + ' 行）', 'ok'); return }
+      if (!confirm('清掉工作台里的 ' + demo.length + ' 条示例数据？\n\n（你自己扫描的真实行不受影响）')) return;
+      const demoKeys = {};
+      demo.forEach((x) => { try { demoKeys[String(x.site || '').toLowerCase() + '|' + String(x.asin || '').toUpperCase()] = 1 } catch (e) {} });
+      const rd = Object.assign({}, (o && o.rowdata) || {});
+      let rdKilled = 0;
+      Object.keys(rd).forEach((k) => { if (demoKeys[k]) { delete rd[k]; rdKilled++ } });
+      chrome.storage.local.set({ bench: b.filter((x) => !(x && x.__demo === true)), rowdata: rd }, () => {
+        renderData();
+        msg('✓ 已清掉 ' + demo.length + ' 条示例数据' + (rdKilled ? ('（连带 ' + rdKilled + ' 条示例填写记录）') : '') + ' —— 刷新采集器页面即可看到', 'ok');
+      });
+    });
+  };
+}
+
+load(() => { bind(); render(); });
+
+/* 店铺管理初始化 */
+setTimeout(() => { try { initShops(); } catch (e) {} }, 600);
+
+/* ===== 税率设置（2026-11-23）: 写入 zyp_v3_settings，面板「税率%」列直接使用 ===== */
+function renderTax() {
+  const sel = $('taxSite'), val = $('taxVal'), lock = $('taxLock');
+  if (!sel || !val || !lock) return;
+  const site = sel.value || 'DE';
+  const cur = (ZT.taxBySite || {})[site];
+  val.value = (cur == null ? '' : cur);
+  lock.checked = !!ZT.taxLock;
+  sel.onchange = function () { renderTax(); };
+  val.onchange = function () { saveTaxFromUI(); };
+  lock.onchange = function () { saveTaxFromUI(); };
+}
+function saveTaxFromUI() {
+  const sel = $('taxSite'), val = $('taxVal'), lock = $('taxLock');
+  if (!sel || !val) return;
+  const site = sel.value || 'DE';
+  const raw = val.value.trim();
+  if (!ZT.taxBySite || typeof ZT.taxBySite !== 'object') ZT.taxBySite = {};
+  if (raw === '') delete ZT.taxBySite[site];
+  else ZT.taxBySite[site] = Number(raw);
+  ZT.taxLock = !!(lock && lock.checked);
+  chrome.storage.local.get(['zyp_v3_settings'], (o) => {
+    const z = (o && o.zyp_v3_settings) || {};
+    z.taxBySite = Object.assign({}, z.taxBySite || {}, ZT.taxBySite);
+    z.taxLock = !!ZT.taxLock;
+    chrome.storage.local.set({ zyp_v3_settings: z }, () => {
+      try { chrome.runtime.sendMessage({ type: 'SETTINGS_CHANGED', zyp: z }, () => void chrome.runtime.lastError); } catch (e) {}
+      msg('✓ 税率已保存: ' + site + ' = ' + (raw === '' ? '(清空)' : raw), 'ok');
+    });
+  });
+}

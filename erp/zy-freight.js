@@ -20,7 +20,10 @@ function ensureSurchargeSeed() {
     const f = path.join(DATA, 'zy-freight-surcharge.json');
     if (!fs.existsSync(f)) {
       fs.mkdirSync(DATA, { recursive: true });
-      fs.writeFileSync(f, JSON.stringify({ '云途普货': 40 }, null, 1), 'utf8');
+      /* ★ 2026-11-17 默认附加费【按国家】：DE/FR/IT/ES 各 +40（与智赢客户端显示一致），GB/AU 不加。
+ *   之前默认全局 '云途普货':40 → 新机器 GB/FR 被统一加价 40（GB 200g 报 70+，本机 30+）。
+ *   要调价: POST /api/zy/freight/surcharge {"map":{"云途普货@DE":40}} */
+fs.writeFileSync(f, JSON.stringify({ '云途普货@DE': 40, '云途普货@FR': 40, '云途普货@IT': 40, '云途普货@ES': 40 }, null, 1), 'utf8');   // ★ 2026-11-17 智赢客户端对 DE/FR/IT/ES 四个欧盟站点各 +40（GB/AU 不加）
     }
   } catch (e) {}
 }

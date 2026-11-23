@@ -13,6 +13,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const http = require('http');
+const crypto = require('crypto');
 
 const DATA = process.env.ZYING_DATA || path.join(os.homedir(), '.zying-erp', 'data');
 const FILE = path.join(DATA, 'ifast-cookie.json');
@@ -56,11 +57,145 @@ async function captureCookieFromBrowser() {
     await send('Network.enable');
     const ck = await send('Network.getCookies', { urls: [BASE + '/'] });
     const cookies = (ck && ck.cookies) || [];
-    if (!cookies.length) throw new Error('浏览器里没有 ifast 的 cookie（先登录 ifast.top）');
+    if (!cookies.length) throw new Error('浏览器里没有 ifast 的 cookie（先在采集浏览器登录 ifast.top）');
     const str = cookies.map((c) => c.name + '=' + c.value).join('; ');
+    /* ★ 2026-11-21 同步前先验证登录态：页面停在 /login 或 cookie 已过期时，别把旧 cookie 覆盖成废数据 */
+    let valid = false, why = '';
+    try {
+      const r2 = await fetch(BASE + '/amazon/selling//user/selling.json', { headers: { cookie: str, 'user-agent': 'Mozilla/5.0', 'x-requested-with': 'XMLHttpRequest' } });
+      const t2 = await r2.text();
+      let j2 = null; try { j2 = JSON.parse(t2); } catch (e) {}
+      valid = !!(j2 && (j2.code === 0 || j2.code === '' || j2.code == null));
+      if (!valid) why = j2 ? ('code=' + j2.code + ' msg=' + (j2.msg || '')) : '返回不是 JSON（被踢回登录页）';
+    } catch (e2) { why = String((e2 && e2.message) || e2); }
+    if (!valid) {
+      throw new Error('浏览器里的 ifast 页面未登录或登录已过期（' + why + '）—— 先在采集浏览器里打开 ifast.top 登录，再点同步');
+    }
     saveCookie(str);
     return { ok: true, cookie: str, count: cookies.length };
   } finally { try { ws.close(); } catch (e) {} }
+}
+
+/* ---------- 已保存账号（多账号切换） ---------- */
+const ACCT_FILE = path.join(DATA, 'ifast-accounts.json');
+const KEY_FILE = path.join(DATA, '.ifast-acct.key');
+function acctKey() {
+  try { const k = fs.readFileSync(KEY_FILE); if (k && k.length === 32) return k; } catch (e) {}
+  const k = crypto.randomBytes(32);
+  try { fs.mkdirSync(DATA, { recursive: true }); fs.writeFileSync(KEY_FILE, k, { mode: 0o600 }); } catch (e) {}
+  return k;
+}
+function acctEnc(txt) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', acctKey(), iv);
+  const d = Buffer.concat([c.update(String(txt), 'utf8'), c.final()]);
+  return 'v1:' + Buffer.concat([iv, c.getAuthTag(), d]).toString('base64');
+}
+function acctDec(s) {
+  const t = String(s || '');
+  if (t.indexOf('v1:') !== 0) return '';
+  const b = Buffer.from(t.slice(3), 'base64');
+  const iv = b.subarray(0, 12), tag = b.subarray(12, 28), d = b.subarray(28);
+  const c = crypto.createDecipheriv('aes-256-gcm', acctKey(), iv);
+  c.setAuthTag(tag);
+  return Buffer.concat([c.update(d), c.final()]).toString('utf8');
+}
+function acctLoad() {
+  try { const o = JSON.parse(fs.readFileSync(ACCT_FILE, 'utf8')); return { accounts: Array.isArray(o.accounts) ? o.accounts : [], active: o.active || '' }; }
+  catch (e) { return { accounts: [], active: '' }; }
+}
+function acctStore(o) {
+  try { fs.mkdirSync(DATA, { recursive: true }); fs.writeFileSync(ACCT_FILE, JSON.stringify(o, null, 1), 'utf8'); try { fs.chmodSync(ACCT_FILE, 0o600); } catch (e) {} } catch (e) {}
+}
+function acctList() {
+  const o = acctLoad();
+  return {
+    active: o.active || '',
+    accounts: o.accounts.map((a) => ({ username: a.username, note: a.note || '', savedAt: a.savedAt || null, lastLoginAt: a.lastLoginAt || null })),
+  };
+}
+function acctSave(username, password, note) {
+  const u = String(username || '').trim();
+  if (!u || !password) throw new Error('需要账号和密码');
+  const o = acctLoad();
+  const i = o.accounts.findIndex((a) => a.username === u);
+  const rec = { username: u, p: acctEnc(password), note: String(note || ''), savedAt: new Date().toISOString(), lastLoginAt: i >= 0 ? (o.accounts[i].lastLoginAt || null) : null };
+  if (i >= 0) o.accounts[i] = rec; else o.accounts.push(rec);
+  acctStore(o);
+  return { ok: true, username: u };
+}
+function acctDelete(username) {
+  const o = acctLoad();
+  const before = o.accounts.length;
+  o.accounts = o.accounts.filter((a) => a.username !== String(username));
+  if (o.active === String(username)) o.active = '';
+  acctStore(o);
+  return { ok: true, removed: before - o.accounts.length };
+}
+function acctSetActive(username) {
+  const o = acctLoad();
+  o.active = String(username || '');
+  const a = o.accounts.find((x) => x.username === o.active);
+  if (a) a.lastLoginAt = new Date().toISOString();
+  acctStore(o);
+}
+async function acctLogin(username) {
+  const o = acctLoad();
+  const a = o.accounts.find((x) => x.username === String(username));
+  if (!a) throw new Error('没有保存这个账号: ' + username);
+  const pw = acctDec(a.p);
+  if (!pw) throw new Error('本地保存的密码无法解密（密钥文件可能丢失），请重新填密码保存');
+  const r = await login(a.username, pw, true);
+  acctSetActive(a.username);
+  return r;
+}
+
+/* ---------- 账号密码登录 ---------- */
+/** 用 ifast 账号密码登录，成功后把 cookie 存本机（与浏览器同步同一份） */
+async function login(username, password, remember) {
+  const u = String(username || '').trim();
+  const p = String(password || '');
+  if (!u || !p) throw new Error('需要 ifast 账号和密码');
+  const jar = [];
+  const pushCookies = (arr) => {
+    for (const c of (arr || [])) {
+      const kv = String(c).split(';')[0];
+      const name = kv.split('=')[0];
+      const i = jar.findIndex((x) => x.split('=')[0] === name);
+      if (i >= 0) jar[i] = kv; else jar.push(kv);
+    }
+  };
+  const getSet = (r) => (r.headers && r.headers.getSetCookie ? r.headers.getSetCookie() : []);
+  /* ① 先拿匿名 session */
+  const g = await fetch(BASE + '/login', { headers: { 'user-agent': 'Mozilla/5.0' }, redirect: 'manual' });
+  pushCookies(getSet(g));
+  /* ② 提交账号密码 */
+  const body = new URLSearchParams({ username: u, password: p, remember: remember === false ? 'off' : 'on' }).toString();
+  const r = await fetch(BASE + '/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', 'user-agent': 'Mozilla/5.0', cookie: jar.join('; ') },
+    body,
+    redirect: 'manual',
+  });
+  pushCookies(getSet(r));
+  const html = await r.text();
+  const cookieStr = jar.join('; ');
+  /* ③ 校验：拿跟卖方案接口，code=0 才算登录成功 */
+  let j = null;
+  try {
+    const vr = await fetch(BASE + '/amazon/selling//user/selling.json', { headers: { cookie: cookieStr, 'user-agent': 'Mozilla/5.0', 'x-requested-with': 'XMLHttpRequest' }, redirect: 'manual' });
+    const vt = await vr.text();
+    try { j = JSON.parse(vt); } catch (e) {}
+  } catch (e) {}
+  const ok = !!(j && (j.code === 0 || j.code === '' || j.code == null));
+  if (!ok) {
+    const m = html.match(/errorMsg\s*=\s*["']([^"']+)["']/);
+    const why = (m && m[1]) || (j && j.msg) || '账号或密码错误';
+    const err = new Error(why); err.code = (j && j.code) || null; throw err;
+  }
+  saveCookie(cookieStr);
+  const st = await status();
+  return { ok: true, user: u, shops: st.shops || [], sites: st.sites || [], cookieAt: (loadCookie().at || null) };
 }
 
 /* ---------- 请求 ---------- */
@@ -196,7 +331,7 @@ async function status() {
 }
 
 module.exports = {
-  subUsers,
+  subUsers, login, acctList, acctSave, acctDelete, acctSetActive, acctLogin,
   BASE, loadCookie, saveCookie, captureCookieFromBrowser, status,
   shops, sites, siteIdOf, listItems, asinSearch,
   addItems, upload, onOff, pause, remove, setSelling, duplicates,

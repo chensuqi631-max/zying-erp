@@ -170,6 +170,28 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const nowMs = () => Date.now();
 
 /** 查询归一化(缓存 key 用): 去空格/标点、转小写；中日韩字符保留 */
+/* ★ 2026-11-03 「精确搜索」的统一判定（英国/WIPO 共用）：
+ *   把商标名归一化成"去标点 + 小写 + 去重词 + 排序"的词集合再比较 ——
+ *     APPLE / APPLE APPLE APPLE / Apple &Apple / APPLE / APPLE  → 同一个词 → 视为精确同名 ✓
+ *     APPLETON / APPLEBEE'S / Apple juice                        → 词集合不同 → 不算 ✗
+ *   为什么不用简单 substring：会把 APPLETON 当成 APPLE 的命中，等于没"精确"。 */
+function normBrandTokens(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter((t, i, a) => a.indexOf(t) === i)
+    .sort()
+    .join(' ');
+}
+function isExactBrand(title, term) {
+  const a = normBrandTokens(title), b = normBrandTokens(term);
+  if (!a || !b) return false;
+  return a === b;
+}
+
 function normTerm(s) {
   return String(s == null ? '' : s)
     .toLowerCase()
@@ -208,6 +230,282 @@ async function httpJson(url, init = {}) {
     if (!txt) { const e = new Error('空响应体'); e.status = r.status; throw e; }
     try { return JSON.parse(txt); } catch { const e = new Error('返回不是 JSON: ' + txt.slice(0, 120)); throw e; }
   } finally { clearTimeout(timer); }
+}
+
+/** 取纯文本（HTML/XML）—— httpJson 只接受 JSON，官网页要单独走这里 */
+async function httpText(url, init = {}) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+  try {
+    const r = await fetch(url, { ...init, signal: ctl.signal });
+    const txt = await r.text();
+    if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; e.body = txt.slice(0, 300); throw e; }
+    return txt;
+  } finally { clearTimeout(timer); }
+}
+
+/* ══════════════ 数据源: IP Australia 澳大利亚官方商标（2026-11-03）══════════════
+ * 官网搜索是 Angular 壳，但 /trademarks/search/quick/result/summary?q= 返回的是
+ * 【服务端渲染好的结果表】（#summaryTable），所以不需要浏览器、不需要 API key。
+ * 实测（2026-11-03，APPLE）：200 text/html、100 行/页、"Page 1 of 20"、无验证码。
+ * 表头: # / Number / Image / Words / Status / Owner / Class
+ *   · Number 链接 /trademarks/search/view/<id>  → 详情页
+ *   · Status 细胞里有 <i class="status registered"> + 文本 + <p class="lowerStatus">
+ *   · Image 只有图形商标才有（cdn2.search.ipaustralia.gov.au），词商标为空
+ */
+const IPA_BASE = 'https://search.ipaustralia.gov.au';
+/** 解 HTML 实体 + 去标签（只用于本文件的表格单元格） */
+function ipaText(s) {
+  return String(s || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'")
+    .replace(/&#\d+;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function parseIpaSummary(html, limit) {
+  const i0 = String(html).indexOf('id="summaryTable"');
+  if (i0 < 0) return [];
+  const end = String(html).indexOf('</table>', i0);
+  const tbl = String(html).slice(i0, end > i0 ? end : undefined);
+  const chunks = tbl.split(/<tr class="(?:swap-color)?"\s*>/).slice(1);
+  const rows = [];
+  for (const raw of chunks) {
+    const cells = raw.split('</td>').map(ipaText);
+    if (cells.length < 7) continue;
+    const numM = raw.match(/\/trademarks\/search\/view\/(\d+)/);
+    const imgM = raw.match(/src="(https:\/\/cdn2\.search\.ipaustralia\.gov\.au[^"]+)"/);
+    const keyM = raw.match(/class="status ([a-z\-]+)"/);
+    const number = (numM && numM[1]) || cells[1];
+    const statusText = cells[4].replace(/\s{2,}/g, ' ');
+    const nice = cells[6].split(/[,\s]+/).map((x) => parseInt(x, 10)).filter(Boolean);
+    if (!number) continue;
+    rows.push({
+      source: 'ipa-au', sourceName: 'IP Australia 澳大利亚知识产权局', kind: 'trademark',
+      id: String(number),
+      title: cells[3] || '',
+      type: imgM ? 'Figurative' : 'Word',
+      office: 'AU', officeName: '澳大利亚',
+      protection: ['AU'],
+      status: statusText,
+      /* 官网单元格同时给「状态短语」和 <i class="status xxx">，两个都喂给分组器更稳 */
+      statusGroup: tmStatusGroup(statusText + ' ' + ((keyM && keyM[1]) || '')),
+      owner: cells[5] || '',
+      nice,
+      filed: '', registeredAt: '', expiry: '',
+      images: imgM ? [imgM[1]] : [],
+      detailUrl: number ? IPA_BASE + '/trademarks/search/view/' + number : '',
+      mediaUrl: number ? IPA_BASE + '/trademarks/search/view/' + number : '',
+    });
+    if (limit && rows.length >= limit) break;
+  }
+  return rows;
+}
+async function searchIpaAu(term, opts = {}) {
+  const limit = Math.max(1, Math.min(100, Number(opts.limit) || 30));
+  const key = 'ipa-au|' + normTerm(term) + '|' + limit;
+  const hit = cacheGet(key);
+  if (hit) return { ...hit, cached: true };
+  const url = IPA_BASE + '/trademarks/search/quick/result/summary?q=' + encodeURIComponent(term);
+  const html = await enqueue('search.ipaustralia.gov.au', () => withRetry(() => httpText(url, {
+    headers: { 'user-agent': UA, accept: 'text/html,application/xhtml+xml', 'accept-language': 'en-AU,en;q=0.9' },
+  })));
+  const items = parseIpaSummary(html, limit);
+  const totalM = html.match(/found\s+([\d,]+)\s+(?:trade\s*marks?|results?)/i) || html.match(/([\d,]+)\s+results?/i);
+  const total = totalM ? Number(String(totalM[1]).replace(/,/g, '')) : items.length;
+  const out = { source: 'ipa-au', sourceName: 'IP Australia 澳大利亚知识产权局', ok: true, total, returned: items.length, items };
+  cacheSet(key, out);
+  return out;
+}
+
+/* ══════════════ 数据源: UKIPO 英国官方商标（2026-11-03 逆向接入）══════════════
+ * 事实链（实测，别再重复试错）：
+ *   ① 裸 HTTP：任何路径都 403 + "Service Captcha"（Cloudflare 边缘，无 cf_clearance）
+ *   ② 真实浏览器：首页弹 Cloudflare Turnstile，但【约 3~13 秒会自动过】，种下 cf_clearance
+ *   ③ 过了之后搜索是 GET 接口（POST /ipo-tmtext 会 303 跳到这里）：
+ *        GET /ipo-tmtext/page/Results?wordSearchPhrase=<词>&searchType=WORD&wordSearchType=EXACT&pageSize=50&page=1
+ *   ④ 应用层还有一条业务规则：命中 >1000 条时 400「Refine your criteria, there are more than 1,000 results」
+ *      → 所以默认用 EXACT（SIMILAR 对常见词必炸）
+ *   ⑤ 结果页是服务端渲染的列表：每条纹号 / Status / Mark text / File date / Classes
+ * 所以：cookie 只能靠浏览器引导一次（本机 Edge/CDP），之后纯 HTTP 查询，会话 20 分钟后自动续。
+ */
+const UKIPO_BASE = 'https://trademarks.ipo.gov.uk';
+const UKIPO_SESSION_FILE = path.join(DATA_DIR, 'ukipo-session.json');
+const UKIPO_SESSION_TTL = 20 * 60 * 1000;
+const UKIPO_STEP_TIMEOUT = 60000;   // UKIPO 一次检索要 3 个请求(GET 首页/POST/结果页)，单步给 60s      // cf_clearance 实测约 30 分钟，取 20 分钟保守续期
+let ukipoSession = null;
+let ukipoBootstrap = null;
+let ukipoBlockedUntil = 0;      // ★ 需要人工验证时的冷却时间戳（10 分钟），避免反复弹标签页
+/** 由 server.js 注入：用采集浏览器开一次官网，等 cf_clearance 落地并返回 cookie 串 */
+function setUkipoBootstrap(fn) { ukipoBootstrap = typeof fn === 'function' ? fn : null; }
+function loadUkipoSession() {
+  if (ukipoSession) return ukipoSession;
+  try { ukipoSession = JSON.parse(fs.readFileSync(UKIPO_SESSION_FILE, 'utf8')); } catch { ukipoSession = null; }
+  return ukipoSession;
+}
+function saveUkipoSession(s) {
+  ukipoSession = s;
+  try { fs.writeFileSync(UKIPO_SESSION_FILE, JSON.stringify(s)); } catch { /* ignore */ }
+}
+async function ensureUkipoSession(force) {
+  const s = loadUkipoSession();
+  if (!force && s && s.cookies && nowMs() - (s.at || 0) < UKIPO_SESSION_TTL) return s;
+  if (nowMs() < ukipoBlockedUntil) {
+    throw new Error('UKIPO 需要先人工过一次人机校验（Cloudflare Turnstile）：在采集浏览器里打开 https://trademarks.ipo.gov.uk/ipo-tmtext 完成验证后重试；' +
+      Math.max(1, Math.round((ukipoBlockedUntil - nowMs()) / 60000)) + ' 分钟内不会再弹页面');
+  }
+  if (!ukipoBootstrap) throw new Error('UKIPO 需要一次浏览器会话引导，但插件未注入 bootstrap');
+  const got = await ukipoBootstrap();
+  if (got && got.needManual) {
+    ukipoBlockedUntil = nowMs() + 10 * 60 * 1000;   // 10 分钟冷却：别再反复开标签页
+    throw new Error('UKIPO 被 Cloudflare 要求人工验证（Turnstile 没过）：已在采集浏览器里打开 UKIPO 页面，' +
+      '手动点一下验证后 10 分钟内重试即可；其他数据源（WIPO/EUIPO/IPA）不受影响');
+  }
+  const cookies = typeof got === 'string' ? got : (got && got.cookies);
+  const ua = (got && got.ua) || '';
+  if (!cookies) throw new Error('UKIPO 会话引导失败：浏览器没拿到 cf_clearance（Turnstile 没过）');
+  const ns = { cookies, ua, at: nowMs() };
+  saveUkipoSession(ns);
+  return ns;
+}
+/** 结果页 HTML → items（列：纹号 / Status / Mark text / File date / Classes） */
+function parseUkipoResults(html) {
+  const text = String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]*>/g, '\n')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n\s*\n+/g, '\n')
+    .trim();
+  const totalM = text.match(/found\s+([\d,]+)\s+marks?/i);
+  const total = totalM ? Number(totalM[1].replace(/,/g, '')) : null;
+  const items = [];
+  const re = /([A-Z]{2}\d{8,})\s*\n+\s*Status:\s*\n*\s*([^\n]{1,40})\s*\n+\s*Mark text:\s*\n*\s*([\s\S]{1,160}?)\s*\n+\s*File date:\s*\n*\s*([^\n]{4,30})\s*\n+\s*Classes:\s*\n*\s*([\d,\s]{1,60})/g;
+  let m;
+  while ((m = re.exec(text))) {
+    const number = m[1];
+    const status = m[2].trim();
+    const mark = m[3].replace(/\s+/g, ' ').trim();
+    const filed = m[4].trim();
+    const nice = m[5].split(/[,\s]+/).map((x) => parseInt(x, 10)).filter(Boolean);
+    const office = number.slice(0, 2) === 'UK' ? 'GB' : number.slice(0, 2);
+    items.push({
+      source: 'ukipo', sourceName: 'UKIPO 英国知识产权局', kind: 'trademark',
+      id: number, title: mark, type: /^[A-Z]{2}\d/.test(mark) ? '' : 'Word',
+      office, officeName: '英国', protection: ['GB'],
+      status, statusGroup: tmStatusGroup(status),
+      owner: '', nice, filed, registeredAt: '', expiry: '',
+      images: [],
+      detailUrl: UKIPO_BASE + '/ipo-tmcase/page/Results/1/' + number,
+      mediaUrl: UKIPO_BASE + '/ipo-tmcase/page/Results/1/' + number,
+    });
+  }
+  return { total, items };
+}
+/** 取 UKIPO 页面（带会话 cookie）；命中人机校验就抛 stale，让上层重新引导会话 */
+async function ukipoGetText(url, sess, extraHeaders) {
+  const r = await fetch(url, {
+    redirect: 'follow',
+    signal: AbortSignal.timeout(UKIPO_STEP_TIMEOUT),
+    headers: Object.assign({
+      'user-agent': sess.ua || UA, cookie: sess.cookies, referer: UKIPO_BASE + '/ipo-tmtext',
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }, extraHeaders || {}),
+  });
+  const txt = await r.text();
+  if (r.status === 403 || /Service Captcha|challenge-platform|Just a moment/i.test(txt)) {
+    const e = new Error('UKIPO 会话失效（被要求人机校验）'); e.stale = true; throw e;
+  }
+  return txt;
+}
+/** 一次完整检索：GET 首页拿 csrfToken → POST 建条件（303 自动跟随到结果页）→ 返回结果页 HTML */
+async function ukipoSearchRaw(term, sess) {
+  const t0 = Date.now();
+  const home = await ukipoGetText(UKIPO_BASE + '/ipo-tmtext', sess);
+  const csrf = (home.match(/name="csrfToken"[^>]*value="([^"]+)"/) || [])[1];
+  console.log('[ukipo] 首页 ' + (Date.now() - t0) + 'ms, csrf=' + (csrf ? 'ok' : '无'));
+  if (!csrf) { const e = new Error('UKIPO 首页没拿到 csrfToken（会话无效）'); e.stale = true; throw e; }
+  const form = new URLSearchParams({
+    csrfToken: csrf, sectionIndex: '0', searchType: 'WORD', wordSearchType: 'EXACT',
+    wordSearchPhrase: term, wordSearchMatchType: 'ALLWORDS', firstOperator: 'NO', secondOperator: 'NO',
+    /* ★ 截止日期必须 <= 今天：填未来日期会被应用层判 400（实测 12/1 就拒） */
+    'filedFrom.day': '1', 'filedFrom.month': '1', filedFrom: '1876',
+    /* ★ 2026-11-04 修时区坑：UKIPO 按【英国时间(UTC)】判"今天不能晚于 X"，
+       *   本地时间 00:0x 已经是次日，用本地日期会被判「Date must be no later than 3/11/2026」→ 400。
+       *   必须用 UTC 的年/月/日。 */
+    'filedTo.day': String(new Date().getUTCDate()), 'filedTo.month': String(new Date().getUTCMonth() + 1), filedTo: String(new Date().getUTCFullYear()),
+    legalStatus: 'ALLLEGALSTATUSES', pageSize: '50',
+  }).toString();
+  const r = await fetch(UKIPO_BASE + '/ipo-tmtext', {
+    method: 'POST',
+    redirect: 'follow',
+    signal: AbortSignal.timeout(UKIPO_STEP_TIMEOUT),
+    headers: {
+      'user-agent': sess.ua || UA, cookie: sess.cookies, 'content-type': 'application/x-www-form-urlencoded',
+      origin: UKIPO_BASE, referer: UKIPO_BASE + '/ipo-tmtext',
+      accept: 'text/html,application/xhtml+xml',
+    },
+    body: form,
+  });
+  const txt = await r.text();
+  console.log('[ukipo] POST ' + (Date.now() - t0) + 'ms, status=' + r.status + ', len=' + txt.length);
+  if (r.status === 403) { const e = new Error('UKIPO 会话失效（403）'); e.stale = true; throw e; }
+  /* ★ 2026-11-03 实测：UKIPO 把"查无结果"也用 HTTP 400 返回，正文是
+   *   "No trade marks matching your search criteria were found" —— 这不是错误，是"没有同名商标"，
+   *   必须当成 total=0 正常返回，否则整站查重会显示红色失败。 */
+  if (/No trade marks matching your search criteria/i.test(txt)) {
+    const e = new Error('UKIPO 无同名商标'); e.noResults = true; throw e;
+  }
+  /* 应用层业务规则：命中 >1000 条会 400 并给这句提示 —— 不能当反爬，也不能瞎重试 */
+  if (/more than 1,000 results/i.test(txt)) {
+    throw new Error('UKIPO 命中超过 1000 条（官方限制），请用更精确的品牌词或改用 WIPO');
+  }
+  if (r.status >= 400) {
+    const plain = txt.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    const adv = (plain.match(/To continue, please address the following:\s*(.{0,160})/i) || [])[1] || plain.slice(0, 160);
+    throw new Error('UKIPO 拒绝检索(HTTP ' + r.status + '): ' + adv);
+  }
+  return txt;
+}
+async function searchUkipo(term, opts = {}) {
+  const limit = Math.max(1, Math.min(100, Number(opts.limit) || 30));
+  const key = 'ukipo|' + normTerm(term) + '|' + limit;
+  const hit = cacheGet(key);
+  if (hit) return { ...hit, cached: true };
+  let sess = await ensureUkipoSession(false);
+  let html = '';
+  const emptyOut = () => {
+    const o = { source: 'ukipo', sourceName: 'UKIPO 英国知识产权局', ok: true, total: 0, returned: 0, items: [] };
+    cacheSet(key, o);
+    return o;
+  };
+  try {
+    html = await ukipoSearchRaw(term, sess);
+  } catch (e) {
+    if (e && e.noResults) return emptyOut();
+    if (!(e && (e.stale || e.status === 403))) throw e;
+    sess = await ensureUkipoSession(true);        // 会话过期 → 重新引导一次（浏览器过一次 Turnstile）
+    try {
+      html = await ukipoSearchRaw(term, sess);
+    } catch (e2) {
+      if (e2 && e2.noResults) return emptyOut();
+      throw e2;
+    }
+  }
+  const parsed = parseUkipoResults(html);
+  /* ★ 2026-11-03 精确：API 层已用 wordSearchType=EXACT，这里再按词集合相等过滤一遍
+   *   （"APPLE APPLE" 这类重复词算精确，"APPLETON" 不算） */
+  const items = opts.exact === false ? parsed.items : parsed.items.filter((it) => isExactBrand(it.title, term));
+  const out = {
+    source: 'ukipo', sourceName: 'UKIPO 英国知识产权局', ok: true,
+    total: opts.exact === false ? (parsed.total == null ? parsed.items.length : parsed.total) : items.length,
+    returned: Math.min(items.length, limit), items: items.slice(0, limit),
+  };
+  cacheSet(key, out);
+  return out;
 }
 
 /* ============================ 磁盘缓存 ============================ */
@@ -511,12 +809,22 @@ async function searchEuipoTm(term, opts = {}) {
     };
   });
 
+  /* ★ 2026-11-03 用户要求：欧盟商标也走精确 —— EUIPO 接口本身是 CONTAINS 检索，
+   *   会把 "MELLOW PINEAPPLE"/"GREEN APPLE" 这类整句商标捞回来，混进近似判定抬高等级。
+   *   这里与英国/WIPO 用同一把尺子：归一化词集合相等才算同名。 */
+  const wantExact = opts.exact !== false;
+  if (wantExact) items = items.filter((it) => isExactBrand(it.title, term));
+
   if (Array.isArray(opts.nice) && opts.nice.length) {
     const want = new Set(opts.nice.map(Number));
     items = items.filter((it) => it.nice.some((n) => want.has(n)));
   }
 
-  const out = { source: 'euipo-tm', sourceName: 'EUIPO 欧盟知识产权局', total: d.total || 0, items, cached: false };
+  const out = {
+    source: 'euipo-tm', sourceName: 'EUIPO 欧盟知识产权局',
+    total: d.total || 0, numFound: d.total || 0, exactMode: wantExact, exactSampled: items.length,
+    items, cached: false,
+  };
   cacheSet(key, out);
   return out;
 }
@@ -620,22 +928,30 @@ async function searchWipoBrand(term, opts = {}) {
   // ★ 不按 office 过滤(接口的 office 只能单值), 拉多一些再按「目标市场保护范围」筛:
   //   上英国站时 GB 记录可能排在几十条之后, 只取 30 条会漏。上限 100 是接口允许的最大页。
   const rows = Math.max(50, Math.min(100, limit * 3));
-  const strategy = opts.strategy === 'Fuzzy' ? 'Fuzzy' : 'Simple';
+  /* ★ 2026-11-03 用户要求：WIPO 必须按「精确」查。API 的 strategy 取 Exact（比 Simple 更严），
+     *   再用 isExactBrand 做结果层过滤 —— 因为 Exact 仍会带出 "APPLE APPLE APPLE" 这类重复词变形。 */
+    const strategy = opts.strategy === 'Fuzzy' ? 'Fuzzy' : (opts.strategy === 'Simple' ? 'Simple' : 'Exact');
+    const wantExact = opts.exact !== false;
   const key = 'wipo-brand|' + normTerm(term) + '|' + rows + '|' + strategy;
   const hit = cacheGet(key);
   if (hit) return { ...hit, cached: true };
 
   const r = await enqueue('api.branddb.wipo.int', () => withRetry(() => wipoBrand.searchBrand(term, { rows, strategy })));
-  let items = (r.docs || []).map(mapWipoRow);
+    let items = (r.docs || []).map(mapWipoRow);
+    if (wantExact) items = items.filter((it) => isExactBrand(it.title, term));   // ★ 精确：只留同一词集合
 
   if (Array.isArray(opts.nice) && opts.nice.length) {
     const want = new Set(opts.nice.map(Number));
     items = items.filter((it) => it.nice.some((n) => want.has(n)));
   }
 
+  /* ★ 2026-11-03 精确模式：r.numFound 是 API(Exact 策略) 的总命中，items 已按词集合相等过滤。
+   *   把两者都带出来，界面/日志才分得清"库里共多少" vs "本次取样里精确多少"。 */
   const out = {
     source: 'wipo-brand', sourceName: 'WIPO 全球品牌库',
-    total: r.numFound || items.length, items, cached: false,
+    total: r.numFound || items.length, numFound: r.numFound || items.length,
+    exactMode: wantExact, exactSampled: items.length,
+    items, cached: false,
   };
   cacheSet(key, out);
   return out;
@@ -650,13 +966,6 @@ const PROVIDERS = {
     home: 'https://www.tmdn.org/tmview/',
     note: '欧盟知识产权局运维的全球聚合库；一个接口覆盖中国、美国、欧盟、英国、日本、韩国等。',
     run: searchTmview,
-  },
-  uspto: {
-    id: 'uspto', name: 'USPTO 美国专利商标局', short: '美国商标', scope: '美国',
-    kind: 'trademark', method: 'api', ready: true,
-    home: 'https://tmsearch.uspto.gov/',
-    note: '官方检索前端同款接口；含有效/已注册标志位、USPTO 状态码、商品服务项。',
-    run: searchUspto,
   },
   'euipo-tm': {
     id: 'euipo-tm', name: 'EUIPO 欧盟商标 (EUTM)', short: '欧盟商标', scope: '欧盟',
@@ -679,18 +988,25 @@ const PROVIDERS = {
     note: '★ 英国/澳洲/国际注册(WO) 唯一可用的商标源；Altcha PoW 握手 + AES 解密已在本地实现，每 2s 一次、约 10 次重建会话。',
     run: searchWipoBrand,
   },
+  'ipa-au': {
+    id: 'ipa-au', name: 'IP Australia 澳大利亚知识产权局', short: '澳洲商标', scope: '澳大利亚',
+    kind: 'trademark', method: 'html', ready: true,
+    home: 'https://search.ipaustralia.gov.au/trademarks/search/quick',
+    note: '★ 澳大利亚官方库（比 WIPO 更全更实时）：服务端渲染的结果表直接解析，无需 API key / 浏览器，单次约 2-12s。',
+    run: searchIpaAu,
+  },
+  ukipo: {
+    id: 'ukipo', name: 'UKIPO 英国知识产权局', short: '英国商标', scope: '英国',
+    kind: 'trademark', method: 'api', ready: true,
+    home: 'https://trademarks.ipo.gov.uk/ipo-tmtext/',
+    note: '★ 官方库（2026-11-03 逆向接入）：Edge 过一次 Cloudflare Turnstile 取 cf_clearance，之后纯 HTTP 直查 GET /ipo-tmtext/page/Results?wordSearchPhrase=…&wordSearchType=EXACT；会话 20 分钟自动续期。',
+    run: searchUkipo,
+  },
   'wipo-design': {
     id: 'wipo-design', name: 'WIPO 全球外观设计库', short: 'WIPO 外观', scope: '全球 (海牙体系)',
     kind: 'design', method: 'browser', ready: false,
     home: 'https://designdb.wipo.int/designdb/en/',
     note: '⚠️ JSF 会话 + qz 状态载荷、结果是 HTML 而非 JSON，需浏览器自动化。',
-    run: null,
-  },
-  cnipa: {
-    id: 'cnipa', name: '中国商标网 (CNIPA)', short: '中国商标', scope: '中国',
-    kind: 'trademark', method: 'browser', ready: false,
-    home: 'https://sbj.cnipa.gov.cn/',
-    note: '⚠️ 有风控且需登录。中国商标已由 TMview 覆盖，暂不需单独接。',
     run: null,
   },
 };
@@ -699,7 +1015,7 @@ const PROVIDERS = {
  * search() 会按目标站点自动裁剪(上英国站会自动跳过欧盟局, 上德国站会自动跳过美国局)。
  * ★ 2026-10-19: tmview 不再列为默认 —— 本机 tmdn.org 网络不可达(fetch failed), 放进默认会让
  *   每次查重白等 34s; 且它失败时旧逻辑会误报「无冲突」。WIPO 已能覆盖它的全球范围(含 GB/AU)。 */
-const DEFAULT_SOURCES = ['wipo-brand', 'euipo-tm', 'euipo-rcd', 'uspto'];
+const DEFAULT_SOURCES = ['wipo-brand', 'euipo-tm', 'euipo-rcd', 'ipa-au', 'ukipo'];   // ★ 2026-11-03: 移除 uspto/cnipa, 加澳/英官方库
 
 function providerList() {
   return Object.values(PROVIDERS).map((p) => ({
@@ -751,8 +1067,31 @@ function assess(hits, opt = {}) {
   const req = market && Array.isArray(market.requires) && market.requires.length ? new Set(market.requires) : null;
   const mktName = market ? market.name : '全部市场';
 
-  /** 这条记录在目标市场有没有效力 */
+  /* ★★ 2026-11-03 用户口径（欧盟四国专用）：高危评分只认「商品站点的本国注册」。
+   *   例如上德国站：只有 office='DE' 的德国国家注册参与打分；
+   *   · EUIPO 的欧盟商标（office='EM'，一件覆盖 27 国）—— 按用户决定【不计入高危】，折叠为提示
+   *   · WIPO 国际注册（office='WO'）、其它成员国的国家注册（FR/IT/ES…）—— 同样不计入
+   *   非欧盟站（英国/澳洲等）保持原来「保护范围覆盖该市场即计入」的口径。 */
+  /* ★ 2026-11-03 修正：marketFromSites() 返回的对象只有 {sites,requires,offices,name,flag,label}，
+   *   没有 cc/region —— 之前直接读 market.cc 导致严格口径从未生效（EM 商标照样算高危）。
+   *   这里改用 market.sites[0] 反查 AMAZON_SITES，拿到真实 cc 与 region。 */
+  const siteIds0 = Array.isArray(market && market.sites) ? market.sites : [];
+  const siteEntry0 = siteIds0.length ? AMAZON_SITES[siteIds0[0]] : null;
+  const siteCc = (siteEntry0 && siteEntry0.cc) || (market && market.requires && market.requires[0]) || '';
+  const isEuSite = siteEntry0
+    ? siteEntry0.region === 'EU'
+    : !!(siteCc && Array.isArray(EU_MEMBERS) && EU_MEMBERS.indexOf(siteCc) >= 0);
+  const strictNational = !!(isEuSite && siteIds0.length === 1 && siteCc && opt.euHighMode !== 'wide');
+  const strictCc = strictNational ? siteCc : '';
+  /** 这条记录在目标市场有没有效力（是否参与打分） */
   const inMarket = (h) => {
+    if (strictNational && h.kind !== 'design') {
+      /* 严格口径只作用于商标：只认站点本国的国家注册；
+       * 外观设计(RCD) 是欧盟一体权利，仍按"保护范围覆盖本站"算（它最高只到 medium，属线索）。 */
+      if (String(h.office || '').toUpperCase() !== strictCc) return false;
+      const p = Array.isArray(h.protection) ? h.protection : [];
+      return p.length ? p.indexOf(strictCc) >= 0 : true;
+    }
     if (!req) return true;                                  // 没指定站点 → 退回全球口径
     const p = Array.isArray(h.protection) ? h.protection : [];
     if (p.length) return p.some((x) => req.has(x));         // 有保护范围 → 精确判断
@@ -760,6 +1099,11 @@ function assess(hits, opt = {}) {
   };
   const scoped = hits.filter(inMarket);
   const others = hits.filter((h) => !inMarket(h));
+  /* 严格口径下，把"覆盖本国但非本国注册"的记录单独标出来，提示里要说清楚（否则用户以为漏查） */
+  const othersCoveringSite = strictNational
+    ? hits.filter((h) => h.kind !== 'design' && !inMarket(h) && (Array.isArray(h.protection) ? h.protection.indexOf(strictCc) >= 0 : false))
+    : [];
+  const othersEutm = othersCoveringSite.filter((h) => String(h.office || '').toUpperCase() === 'EM');
 
   const isExact = (h) => { const t = tight(h.title); return !!t && (t === term || t.replace(/^(the|a|an)/, '') === term); };
   const isNear = (h) => {
@@ -897,7 +1241,12 @@ function assess(hits, opt = {}) {
     const detail = Object.keys(byOffice).sort((a, b) => byOffice[b] - byOffice[a])
       .slice(0, 8).map((k) => k + ' ' + byOffice[k]).join(' / ');
     const othersAlive = others.filter((h) => h.statusGroup === 'alive').length;
-    reasons.push(`ℹ️ 另有 ${others.length} 条记录只在你没选的其它市场有效（有效 ${othersAlive} 条）: ${detail} —— 不影响你上${mktName}，已折叠。`);
+    reasons.push(strictNational
+      ? `ℹ️ 另有 ${others.length} 条记录不参与本站评分（有效 ${othersAlive} 条）: ${detail} —— 按「只算${strictCc}本国注册」的口径已折叠。`
+      : `ℹ️ 另有 ${others.length} 条记录只在你没选的其它市场有效（有效 ${othersAlive} 条）: ${detail} —— 不影响你上${mktName}，已折叠。`);
+    if (strictNational && othersCoveringSite.length) {
+      reasons.push(`ℹ️ 其中 ${othersCoveringSite.length} 条其实【覆盖${mktName}但不是${strictCc}本国注册】（欧盟商标 EUTM ${othersEutm.length} 件、WIPO 国际注册等）—— 按当前口径不计入高危；要计入可传 euHighMode='wide'。`);
+    }
   }
 
   if (LEVEL_RANK[level] <= LEVEL_RANK.low) {
@@ -936,7 +1285,8 @@ function assess(hits, opt = {}) {
 const SOURCE_REGIONS = {
   tmview: null,            // null = 全球聚合, 永远要查
   'wipo-brand': null,      // 全球(含马德里指定国) → 永远要查
-  uspto: 'US',
+  'ipa-au': 'AU',        // ★ 2026-11-03 澳大利亚官方库（AU 站才查）
+  ukipo: 'GB',           // ★ 2026-11-03 英国官方库（GB 站才查；目前 ready=false）
   'euipo-tm': 'EM',
   'euipo-rcd': 'EM',
 };
@@ -971,10 +1321,35 @@ async function search(term, opt = {}) {
     });
   }
 
+  /* ★★ 2026-11-03 修「假绿」（比"无法判定"更危险的路径）：
+   *   若所选数据源被站点裁剪【全部跳过】（例如英国站只勾了 EUIPO、澳洲站只勾了 EUIPO），
+   *   原逻辑会走到"没有任何命中 → level=none → ✅ 可以上"，等于一个库都没查却给了放行结论。
+   *   现在：直接返回 unknown + 明确原因（没有数据源被执行），并提示该站点该用哪些源。 */
+  if (!srcIds.length) {
+    const detail = (skipped.length ? skipped.map((s0) => s0.sourceName + ': ' + s0.reason).join('；') : '所选数据源不可用或未接入');
+    const mkName = market ? market.name : '全部市场';
+    return {
+      ok: true, term: q, noSources: true, skipped, sources: [], items: [], total: 0,
+      market: market ? { sites: market.sites, name: market.name, requires: market.requires, offices: market.offices, label: market.label } : null,
+      risk: {
+        level: 'unknown', score: 0,
+        advice: '⚠️ 无法判定 —— 所选数据源与' + mkName + '无关，本次没有查询任何商标库（' + detail + '）。' +
+          '请改选该站点相关的数据源：英国=WIPO/UKIPO，欧盟(德/法/意/西)=WIPO/EUIPO，澳洲=WIPO/IP Australia。',
+        reasons: ['❌ 没有数据源被执行：' + detail],
+        trademark: { level: 'unknown', score: 0, total: 0, alive: 0, pending: 0, dead: 0, exactAlive: 0 },
+        design: { level: 'unknown', score: 0, total: 0, alive: 0, pending: 0, dead: 0, exactAlive: 0 },
+        counts: { total: 0, scoped: 0, otherMarkets: 0, alive: 0, pending: 0, dead: 0 },
+        exact: { alive: 0, aliveAnyClass: 0, pending: 0, dead: 0 },
+        filters: { nice: [], locarno: [], hasNiceFilter: false, hasLocFilter: false },
+      },
+    };
+  }
+
   const limit = Math.max(1, Math.min(100, Number(opt.limit) || 30));
-  const settled = srcIds.length ? await Promise.all(srcIds.map(async (id) => {
+  let attachedFallback = null;      // ★ 2026-11-03 兜底记录（原选源 → 补查 wipo）
+  const runOne = async (id) => {
     const P = PROVIDERS[id];
-    if (!P.ready || !P.run) return { id, ok: false, error: '该数据源需要浏览器自动化，暂未接入', items: [], total: 0 };
+    if (!P.ready || !P.run) return { id, ok: false, error: '该数据源未接入：' + (String(P.note || '').replace(/^⚠️?\s*/, '').slice(0, 120) || '需要浏览器自动化'), items: [], total: 0 };
     try {
       const r = await P.run(q, {
         offices: wantOffices, nice: opt.nice, locarno: opt.locarno, limit,
@@ -984,7 +1359,43 @@ async function search(term, opt = {}) {
     } catch (e) {
       return { id, ok: false, error: (e && e.message) || String(e), items: [], total: 0, sourceName: P.name };
     }
-  })) : [];
+  };
+  let settled = srcIds.length ? await Promise.all(srcIds.map(runOne)) : [];
+  /* ★ 2026-11-03 失败源自动重试一次（用户看到「❓ 无法判定」的真实原因）：
+   *   判定 unknown 的条件是"全部数据源失败"。实测只要 WIPO 会话抖动、或 UKIPO 会话刚过期，
+   *   一次瞬时失败就会把整条判成"无法判定"（明明数据源能查、商品也没冲突）。
+   *   这里对失败且 ready 的源串行重试一次（间隔 900ms），重试成功就采用新结果；
+   *   仍失败才在错误信息后标注「（已重试仍失败）」，让界面能区分"真的查不了"和"暂时没查成"。 */
+  const __failedIdx = settled
+    .map((s0, i) => (s0 && !s0.ok && PROVIDERS[s0.id] && PROVIDERS[s0.id].ready && PROVIDERS[s0.id].run ? i : -1))
+    .filter((i) => i >= 0);
+  const retried = [];
+  if (__failedIdx.length) {
+    await new Promise((r) => setTimeout(r, 900));
+    for (const i of __failedIdx) {
+      const id = settled[i].id;
+      const again = await runOne(id);
+      retried.push({ source: id, ok: !!again.ok, error: again.ok ? null : (again.error || null) });
+      if (again.ok) settled[i] = again;
+      else settled[i] = Object.assign({}, settled[i], { error: String(settled[i].error || '') + '（已重试仍失败）' });
+    }
+  }
+
+  /* ★★ 2026-11-03 兜底（本轮 8 条 unknown 的根因）：
+   *   当用户只勾了一个源（例如英国站只勾 UKIPO），而它恰好失败（命中>1000 / 会话失效 / 超时），
+   *   整条就被判成"无法判定"——明明 WIPO 能查。现在：全失败时自动补查 WIPO 一次（若它没被选/没跑过），
+   *   结论改用补查结果，并在 reasons 里明确写"原选数据源失败，已用 WIPO 兜底，可能有漏网"。 */
+  try {
+    const allFailed = settled.length > 0 && settled.every((x) => !x || !x.ok);
+    const wipoRan = settled.some((x) => x && x.id === 'wipo-brand' && x.ok);
+    if ((allFailed || settled.length === 0) && !wipoRan && PROVIDERS['wipo-brand'] && PROVIDERS['wipo-brand'].ready) {
+      const fb = await runOne('wipo-brand');
+      if (fb && fb.ok) {
+        attachedFallback = { from: settled.map((x) => x && x.id).filter(Boolean), to: 'wipo-brand' };
+        settled = settled.concat([Object.assign({}, fb, { fallback: true })]);
+      }
+    }
+  } catch (e) { /* 兜底失败不影响主流程 */ }
 
   const results = settled.map((s) => ({
     source: s.id, sourceName: s.sourceName || PROVIDERS[s.id].name,
@@ -1013,7 +1424,7 @@ async function search(term, opt = {}) {
     || (ORDER[a.statusGroup] ?? 9) - (ORDER[b.statusGroup] ?? 9)
     || String(b.filed || '').localeCompare(String(a.filed || '')));
 
-  const risk = assess(all, { term: q, nice: opt.nice, locarno: opt.locarno, market });
+  const risk = assess(all, { term: q, nice: opt.nice, locarno: opt.locarno, market, euHighMode: opt.euHighMode });
 
   /* ★ 数据源健康度 —— 查询失败 ≠ 没有冲突。
    *   旧逻辑把所有数据源都失败当成 0 条命中 → level='none' → 文案写「✅ 可以上」,
@@ -1078,7 +1489,7 @@ function brandVerdict(risk) {
 module.exports = {
   search, assess, brandVerdict, providerList, siteList, marketFromSites,
   PROVIDERS, DEFAULT_SOURCES, OFFICES, officeName, AMAZON_SITES, EU_MEMBERS,
-  cacheStats, cacheClear, normTerm, tight,
+  cacheStats, cacheClear, normTerm, tight, setUkipoBootstrap, _searchUkipo: searchUkipo,
   parseNiceList, tmStatusGroup, designStatusGroup,
   _searchTmview: searchTmview, _searchUspto: searchUspto,
   _searchEuipoTm: searchEuipoTm, _searchEuipoRcd: searchEuipoRcd,

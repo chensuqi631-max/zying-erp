@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>智赢采集器 · 设置</title>
+<style>
+  :root {
+    --bg: #000; --fg: #fff; --muted: #9a9a9a; --line: rgba(255,255,255,.14);
+    --card: #15171b; --card2: #1d2025; --green: #52c41a; --blue: #1890ff; --amber: #ffb454; --red: #ff4d4f;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 5px; border: 2px solid transparent; background-clip: content-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg); padding: 0 0 40px;
+    font: 13px/1.5 "Inter","SF Pro Text","PingFang SC","Microsoft YaHei",-apple-system,sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--card); border-bottom: 1px solid var(--line);
+  }
+  .logo { display: flex; flex-direction: column; line-height: 1.25; }
+  .logo-name { font-weight: 700; font-size: 15px; }
+  .logo-sub { font-size: 10.5px; color: var(--muted); letter-spacing: .3px; }
+  #hint { flex: 1; font-size: 11.5px; color: var(--muted); min-width: 160px; }
+  button {
+    border: 1px solid var(--line); background: transparent; color: var(--fg); border-radius: 8px;
+    padding: 5px 11px; cursor: pointer; font-family: inherit; font-size: 12px; white-space: nowrap;
+    transition: background .15s, color .15s;
+  }
+  button:hover { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+  button.primary { background: var(--fg); color: var(--bg); font-weight: 600; border-color: var(--fg); }
+  button.primary:hover { opacity: .85; }
+  button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
+  button.danger:hover { background: var(--red); border-color: var(--red); color: #fff; }
+  main { max-width: 940px; margin: 0 auto; padding: 14px 16px; }
+  section {
+    border: 1px solid var(--line); border-radius: var(--radius); background: var(--card);
+    margin-bottom: 12px; overflow: hidden;
+  }
+  section > h2 {
+    margin: 0; padding: 9px 14px; font-size: 13px; font-weight: 600; background: var(--card2);
+    border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 8px;
+  }
+  section > h2 .tag { font-size: 10.5px; font-weight: 400; color: var(--muted); }
+  .row { display: flex; align-items: flex-start; gap: 12px; padding: 10px 14px; border-top: 1px solid var(--line); }
+  .row:first-of-type { border-top: 0; }
+  .row > .lab { flex: 0 0 190px; font-size: 12.5px; padding-top: 3px; }
+  .row > .ctl { flex: 1; min-width: 200px; }
+  .row > .ctl .sub { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .sub b { color: #cfe3ff; font-weight: 600; }
+  input[type=number], input[type=text], select {
+    background: #000; color: var(--fg); border: 1px solid var(--line); border-radius: 7px;
+    padding: 5px 8px; font-family: inherit; font-size: 12px; min-width: 90px;
+  }
+  input[type=number] { text-align: right; }
+  input:focus, select:focus { outline: none; border-color: var(--blue); }
+  label.ck { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; cursor: pointer; user-select: none; }
+  input[type=checkbox] { width: 15px; height: 15px; accent-color: var(--blue); cursor: pointer; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg span { padding: 5px 12px; cursor: pointer; font-size: 12px; border-left: 1px solid var(--line); }
+  .seg span:first-child { border-left: 0; }
+  .seg span.on { background: var(--fg); color: var(--bg); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { padding: 5px 8px; border-top: 1px solid var(--line); text-align: left; }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; }
+  td.num { text-align: right; font-family: ui-monospace, Consolas, monospace; }
+  .pill { display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 10.5px; border: 1px solid var(--line); }
+  .pill.live { color: var(--blue); border-color: rgba(24,144,255,.5); }
+  .pill.tbl { color: var(--muted); }
+  .warn { color: var(--amber); }
+  .ok { color: var(--green); }
+  .bad { color: var(--red); }
+  #msg { font-size: 12px; }
+  .foot { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 2px; }
+  .note { font-size: 11.5px; color: var(--muted); padding: 8px 14px; border-top: 1px solid var(--line); background: rgba(255,255,255,.02); }
+  code { background: var(--card2); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">
+    <span class="logo-name">智赢采集器 · 设置</span>
+    <span class="logo-sub">GAOSHUTIAO · SETTINGS</span>
+  </div>
+  <span id="hint">改完点「保存」生效；采集器页面会立即用上新参数（无需刷新）</span>
+  <span id="msg"></span>
+  <button id="reset" title="把所有设置恢复成默认值(不影响站点定价参数)">恢复默认</button>
+  <button id="save" class="primary">保存</button>
+</header>
+
+<main>
+    <section>
+    <h2>🧾 税率 <span class="tag">到手比例 / 税率（分站点）</span></h2>
+    <div class="row">
+      <div class="lab">国家/站点</div>
+      <div class="ctl">
+        <select id="taxSite">
+          <option value="DE">德国（DE）</option>
+          <option value="UK">英国（UK）</option>
+          <option value="AU">澳大利亚（AU）</option>
+          <option value="ES">西班牙（ES）</option>
+          <option value="IT">意大利（IT）</option>
+          <option value="FR">法国（FR）</option>
+        </select>
+        <div class="sub">选择要修改税率的国家（面板表格里的「税率%」列也用这里的值）</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">税率（%）</div>
+      <div class="ctl">
+        <input type="number" id="taxVal" step="0.01" min="0" max="100" style="width:90px">
+        <label class="ck" style="margin-left:12px"><input type="checkbox" id="taxLock"> <span>锁定税率</span></label>
+        <div class="sub">定价表口径: 英国 0.68 · 德国 0.68 · 澳大利亚 0.85（西/意/法默认 0.68）；填 0.68 = 到手比例，填 20 = 旧百分比兼容</div>
+      </div>
+    </div>
+  </section>
+<section>
+    <h2>💰 算价 <span class="tag">承受价格 = (采购成本 + 物流成本) × (1 + 利润率) ÷ 到手比例 ÷ 汇率 + 本币调整</span></h2>
+    <div class="row">
+      <div class="lab">利润率</div>
+      <div class="ctl">
+        <input type="number" id="margin" step="0.01" min="0" max="5" style="width:90px">
+        <div class="sub">定价表里的 <b>B 列</b>（0.3 = 加 30% 利润）。填 0 = 只保本。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">汇率来源</div>
+      <div class="ctl">
+        <label class="ck"><input type="checkbox" id="useLiveFx"> <span>英/德/澳 也用 ERP 实时汇率</span></label>
+        <div class="sub">
+          不勾（默认）= 英/德/澳 用你定价表里写死的 9.07 / 7.8 / 4.73（结果稳定可复现）；
+          勾上 = 这三站也走下面的实时汇率（承受价会随汇率每天小幅度漂）。<br>
+          其它站点（美/日/加/法…）定价表里没有汇率，<b>一直</b>走实时汇率。
+        </div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">各站定价参数</div>
+      <div class="ctl">
+        <div class="sub" style="margin-top:0">
+          到手比例 / 汇率 / 本币调整 是**分站点**的，在采集器面板上点「<b>⚙ 定价</b>」改（那里能一眼对照全部 19 个站点）。
+        </div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">ERP 实时汇率</div>
+      <div class="ctl">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="mini" id="fxFetch">⇄ 拉取 / 刷新</button>
+          <span class="sub" id="fxMeta" style="margin:0">—</span>
+        </div>
+        <div class="sub" id="fxTable" style="margin-top:6px">—</div>
+      </div>
+    </div>
+  </section>
+
+
+
+  <section>
+    <h2>🚚 物流成本</h2>
+    <div class="row">
+      <div class="lab">取哪个渠道的报价</div>
+      <div class="ctl">
+        <div class="seg" id="pickSeg">
+          <span data-v="lowest">最低价</span>
+          <span data-v="second">次低价</span>
+        </div>
+        <div class="sub">同一个重量往往有多个渠道（如英国 3 个）。默认取最低；想留点余量可选次低。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">默认重量（kg）</div>
+      <div class="ctl">
+        <input type="number" id="defaultWeightKg" step="0.01" min="0" style="width:90px">
+        <div class="sub">页面采不到重量时用它查物流（填 <b>0</b> = 不启用，仍要求手填）。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">物流报价表</div>
+      <div class="ctl">
+        <div class="foot">
+          <button class="mini" id="fqImport">📥 导入物流报价表（选文件夹）</button>
+          <button class="mini" id="fqImportFile">📄 选单个文件</button>
+          <button class="mini danger" id="fqClear">清除</button>
+          <input type="file" id="fqFile" accept=".xlsx,.xlsm,.json,.csv,.tsv" style="display:none">
+        </div>
+        <div class="sub" id="fqMeta">未导入 —— 查询走 ERP（<code>127.0.0.1:3088</code>）的物流报价表</div>
+        <div class="sub">
+          点「导入物流报价表」后选一个<b>文件夹</b>，插件会自动找里面的
+          <code>.xlsx</code> / <code>.json</code> / <code>.csv</code> 报价表并读进本地；
+          之后面板上「按重量查物流成本」<b>优先用这张表</b>（表里没有的国家/重量才回落到 ERP）。<br>
+          表格格式：每 3 列一组「站点名｜重量｜价格」，站点名支持 德国/法国/英国/澳大利亚/意大利/西班牙 或 DE/FR/GB/AU/IT/ES，
+          重量写 <code>200g</code>/<code>200</code>/<code>0.2</code>（kg）都认。
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>📥 采集行为</h2>
+    <div class="row">
+      <div class="lab">详情页自动直采变体</div>
+      <div class="ctl">
+        <label class="ck"><input type="checkbox" id="autoVariantFetch"> <span>多变体商品页自动逐个抓各变体的商品页</span></label>
+        <div class="sub">关掉可以省流量/更快，需要时在面板上手动点「⇩ 采集全部变体」。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">排名快照新鲜度</div>
+      <div class="ctl">
+        <input type="number" id="rankFreshMin" step="5" min="1" max="1440" style="width:90px"> <span class="sub" style="display:inline">分钟</span>
+        <div class="sub">排名是实时值、会漂。超过这个时长的页采快照会被标成「快照旧·」，提示你重抓。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">面板最多显示</div>
+      <div class="ctl">
+        <input type="number" id="maxRows" step="50" min="20" max="2000" style="width:90px"> <span class="sub" style="display:inline">行</span>
+        <div class="sub">行太多会卡；超出的只是不显示，数据仍入库。</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>📤 上传/上架默认值 <span class="tag">采集器「上传」弹窗每次打开时的默认</span></h2>
+    <div class="row">
+      <div class="lab">默认上传范围</div>
+      <div class="ctl">
+        <div class="seg" id="scopeSeg">
+          <span data-v="one">只上这一个变体</span>
+          <span data-v="family">整族</span>
+        </div>
+        <div class="sub">「只上这一个」= ifast 多变体列表里只勾你点的那一行，族里其它一个都不选。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">默认上传方式</div>
+      <div class="ctl">
+        <div class="seg" id="modeSeg">
+          <span data-v="auto">自动</span>
+          <span data-v="single">单个添加</span>
+          <span data-v="multi">多变体添加</span>
+        </div>
+        <div class="sub">「自动」= 族里 ≥2 个变体就走多变体添加，只有一个就走单个添加。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">默认库存 / 备货周期</div>
+      <div class="ctl">
+        <input type="number" id="defaultStock" step="1" min="0" style="width:80px"> <span class="sub" style="display:inline">件</span>
+        &nbsp;·&nbsp;
+        <input type="number" id="defaultLeadDays" step="1" min="0" style="width:80px"> <span class="sub" style="display:inline">天</span>
+        <div class="sub">上传弹窗第一次打开时用这两值预填（之后以你在弹窗里改的为准）。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">默认跟卖时间</div>
+      <div class="ctl">
+        <select id="defaultFollowPreset">
+          <option value="allday">全天跟卖（00:00-24:00）</option>
+          <option value="midnight">午夜（01:00-08:00）</option>
+          <option value="midnight-sharp">午夜正根（23:00-07:00）</option>
+        </select>
+        <div class="sub">对应 ifast「导入导出 → 添加跟卖」里的跟卖时间下拉。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">自动填表并保存</div>
+      <div class="ctl">
+        <label class="ck"><input type="checkbox" id="autoSubmit"> <span>点「上传」后自动到 ifast「添加跟卖」填好并点保存</span></label>
+        <div class="sub">
+          关掉 = 只把数据推到 ERP 上架记录，等你到 ifast 页面手动点「➡ 填入并保存」。<br>
+          <span class="warn">注意：开启时保存按钮会被真正点击（会上架）；只想核对请用 ifast 面板上的「只填不提交」。</span>
+        </div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">API 直连上架</div>
+      <div class="ctl">
+        <label class="ck"><input type="checkbox" id="apiDirect"> <span>直接调 ifast 接口提交，不打开「添加跟卖」弹窗</span></label>
+        <div class="sub">
+          开启后只走 2 个请求（查变体 + 提交），不翻页、不点勾选框，也不会因为变体多而漏勾。<br>
+          关掉 = 回到原来的页面点击流程（开弹窗 → 切 Tab → 查询 → 翻页 → 逐个勾 → 点保存）。<br>
+          <span class="warn">API 直连失败会自动回退到页面流程；但若提交请求已经发出，就不回退（防止同一批变体上两次）。</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>🔌 连接与维护</h2>
+    <div class="row">
+      <div class="lab">ERP 地址</div>
+      <div class="ctl">
+        <input type="text" id="erpBase" style="width:250px" placeholder="http://127.0.0.1:3088">
+        <button class="mini" id="erpTest">测试连接</button>
+        <div class="sub" id="erpMeta">本地智赢 ERP（默认 <code>http://127.0.0.1:3088</code>）</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">配置备份</div>
+      <div class="ctl">
+        <div class="foot">
+          <button class="mini" id="expBtn">导出设置</button>
+          <button class="mini" id="impBtn">导入设置</button>
+          <input type="file" id="impFile" accept=".json" style="display:none">
+        </div>
+        <div class="sub">导出内容包含：行为设置 + 各站定价参数（利润率/到手比例/汇率/本币调整）。</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">本地数据</div>
+      <div class="ctl">
+        <div class="foot">
+          <button class="mini danger" id="clrRow">清空本地填写数据</button>
+          <button class="mini danger" id="clrPend">清空待上传队列</button>
+          <button class="mini danger" id="clrDemo">只清示例数据</button>
+        </div>
+        <div class="sub" id="dataMeta">—</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="note">
+    设置存在扩展本地（<code>chrome.storage.local</code>）的 <code>settings</code> / <code>pricing</code> 两个键里；
+    采集器面板、ifast 上架面板、工作台三处共用同一份，改完立刻生效，不用重装扩展。
+  </div>
+</main>
+<section>
+    <h2>🎨 搞薯条面板配色 <span class="tag">商品列表页，每张卡片下方那行信息（BG/品牌/价格/排名）的底色</span></h2>
+    <div class="row">
+      <div class="lab">FBA 商品</div>
+      <div class="ctl">
+        <input type="color" id="cFba" style="width:56px;height:30px;padding:0;border:1px solid #ccc;border-radius:6px;background:#fff">
+        <span id="cFbaTxt" class="sub" style="margin-left:8px"></span>
+        <div class="sub">亚马逊代发（FBA）——默认<b>红色</b></div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">FBM 商品</div>
+      <div class="ctl">
+        <input type="color" id="cFbm" style="width:56px;height:30px;padding:0;border:1px solid #ccc;border-radius:6px;background:#fff">
+        <span id="cFbmTxt" class="sub" style="margin-left:8px"></span>
+        <div class="sub">卖家自发货（FBM）——默认<b>绿色</b></div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">AMZ 自营</div>
+      <div class="ctl">
+        <input type="color" id="cAmz" style="width:56px;height:30px;padding:0;border:1px solid #ccc;border-radius:6px;background:#fff">
+        <span id="cAmzTxt" class="sub" style="margin-left:8px"></span>
+        <div class="sub">亚马逊自营（ShipByAmazon）——默认<b>蓝色</b></div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="lab">预览</div>
+      <div class="ctl">
+        <div id="cPreview" style="display:inline-flex;flex-wrap:wrap;gap:8px"></div>
+        <div class="sub">改完点底部「保存设置」。已打开的 Amazon 列表页会<b>立刻变色</b>（不用刷新）。</div>
+      </div>
+    </div>
+  </section>
+
+<script src="settings.js"></script>
+</body>
+</html>

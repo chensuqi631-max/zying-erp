@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>商品管理 · 搞薯条 ERP</title>
+<style>
+  body { margin: 0; font: 13px/1.5 "Microsoft YaHei", sans-serif; background: #14161a; color: #dfe3ea; }
+  header { padding: 12px 16px; border-bottom: 1px solid #262b33; display: flex; gap: 12px; align-items: center; }
+  h1 { font-size: 16px; margin: 0; }
+  .filters { padding: 10px 16px; display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; border-bottom: 1px solid #262b33; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #9aa4b2; }
+  select, input { background: #1c2027; color: #e6eaf0; border: 1px solid #303743; border-radius: 6px; padding: 5px 8px; font-size: 13px; }
+  button { background: #2d6cdf; color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; }
+  button:hover { background: #3a7bf0; }
+  button:disabled { opacity: .45; cursor: default; }
+  .stat { padding: 8px 16px; color: #9aa4b2; }
+  .stat b { color: #fff; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #22262c; white-space: nowrap; }
+  th { color: #8b96a5; font-weight: 600; position: sticky; top: 0; background: #171a1f; }
+  tr:hover { background: #1a1e24; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+  .tag.listed { background: rgba(74,168,110,.18); color: #6fd39a; border: 1px solid rgba(111,211,154,.35); }
+  .tag.unlisted { background: rgba(120,120,120,.18); color: #b9c0ca; border: 1px solid rgba(185,192,202,.25); }
+  .muted { color: #6f7987; }
+  .pager { padding: 10px 16px; display: flex; gap: 10px; align-items: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🍟 搞薯条 ERP · 商品管理</h1>
+  <span class="muted">数据来自 127.0.0.1:3088 同一套筛选逻辑</span>
+</header>
+
+<div class="filters">
+  <label>上架状态
+    <select id="f-listed">
+      <option value="">不限</option>
+      <option value="1">仅已上架</option>
+      <option value="0">仅未上架</option>
+    </select>
+  </label>
+  <label>上架店铺
+    <select id="f-shop"><option value="">全部</option></select>
+  </label>
+  <label>数据冲突
+    <select id="f-conflict">
+      <option value="">不限</option>
+      <option value="1">仅冲突</option>
+    </select>
+  </label>
+  <label>BG 状态
+    <select id="f-bg">
+      <option value="">不限</option>
+      <option value="OK">可售</option>
+      <option value="APPROVAL_REQUIRED">需批准</option>
+      <option value="NOT_ELIGIBLE">不可售</option>
+      <option value="ASIN_NOT_FOUND">ASIN 不存在</option>
+    </select>
+  </label>
+  <label>关键词
+    <input id="f-q" placeholder="ASIN / 标题 / 品牌" style="width:180px">
+  </label>
+  <button id="btn-query">查询</button>
+</div>
+
+<div class="stat" id="stat">加载中…</div>
+<table>
+  <thead><tr><th>ASIN</th><th>状态</th><th>站点</th><th>店铺</th><th>标题</th><th>价格</th><th>评分</th><th>评论数</th><th>BG</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<div class="pager">
+  <button id="btn-prev">上一页</button>
+  <span id="pginfo" class="muted"></span>
+  <button id="btn-next">下一页</button>
+</div>
+
+<script>
+(async function () {
+  const $ = (id) => document.getElementById(id);
+  const PAGE = 50;
+  let offset = 0, total = 0;
+  let listedSet = new Set();
+
+  try {
+    const j = await (await fetch('/api/products/listed-set')).json();
+    (j.asins || []).forEach((a) => listedSet.add(String(a).toUpperCase()));
+  } catch (e) {}
+  try {
+    const j = await (await fetch('/api/products/shop-names')).json();
+    const sel = $('f-shop');
+    (j.items || []).slice(0, 40).forEach((s) => {
+      const o = document.createElement('option');
+      o.value = s.name; o.textContent = s.name + ' (' + s.count + ')';
+      sel.appendChild(o);
+    });
+  } catch (e) {}
+
+  function buildFilter() {
+    const f = {};
+    const listed = $('f-listed').value; if (listed) f.listed = listed;
+    const shop = $('f-shop').value; if (shop) f.shop = shop;
+    const conflict = $('f-conflict').value; if (conflict) f.conflict = conflict;
+    const bg = $('f-bg').value; if (bg) f.bgStatus = bg;
+    return f;
+  }
+
+  async function load() {
+    const filter = buildFilter();
+    const q = $('f-q').value.trim();
+    const qs = '?limit=' + PAGE + '&offset=' + offset + '&filter=' + encodeURIComponent(JSON.stringify(filter)) + (q ? '&q=' + encodeURIComponent(q) : '');
+    const t0 = performance.now();
+    const j = await (await fetch('/api/products' + qs)).json();
+    const ms = Math.round(performance.now() - t0);
+    total = j.total != null ? j.total : 0;
+    const items = j.items || [];
+    $('stat').innerHTML = '命中 <b>' + total + '</b> 条 · 本页 ' + items.length + ' 条 · 耗时 ' + ms + 'ms · '
+      + '上架状态：<b>' + ($('f-listed').value === '1' ? '仅已上架' : $('f-listed').value === '0' ? '仅未上架' : '不限') + '</b>'
+      + ($('f-shop').value ? ' · 店铺：<b>' + $('f-shop').value + '</b>' : '')
+      + ($('f-conflict').value ? ' · <b>仅数据冲突</b>' : '')
+      + ($('f-bg').value ? ' · BG：<b>' + $('f-bg').value + '</b>' : '')
+      + (q ? ' · 关键词：<b>' + q + '</b>' : '');
+    $('pginfo').textContent = '第 ' + (Math.floor(offset / PAGE) + 1) + ' 页 / 共 ' + Math.max(1, Math.ceil(total / PAGE)) + ' 页';
+    $('btn-prev').disabled = offset <= 0;
+    $('btn-next').disabled = offset + PAGE >= total;
+    const rows = items.map((x) => {
+      const isL = listedSet.has(String(x.asin || '').toUpperCase()) || x.ifastListed === true;
+      return '<tr>'
+        + '<td>' + (x.asin || '') + '</td>'
+        + '<td><span class="tag ' + (isL ? 'listed' : 'unlisted') + '">' + (isL ? '已上架' : '未上架') + '</span></td>'
+        + '<td>' + (x.site || '') + '</td>'
+        + '<td>' + (x.shop || '<span class="muted">—</span>') + '</td>'
+        + '<td title="' + String(x.title || '').replace(/"/g, '&quot;') + '">' + String(x.title || '').slice(0, 60) + '</td>'
+        + '<td>' + (x.price != null ? x.price + ' ' + (x.currency || '') : '<span class="muted">—</span>') + '</td>'
+        + '<td>' + (x.rating != null ? x.rating : '<span class="muted">—</span>') + '</td>'
+        + '<td>' + (x.reviews != null ? x.reviews : '<span class="muted">—</span>') + '</td>'
+        + '<td>' + (x.bgStatus || '<span class="muted">—</span>') + '</td>'
+        + '</tr>';
+    }).join('');
+    $('rows').innerHTML = rows || '<tr><td colspan="9" class="muted">没有数据</td></tr>';
+  }
+
+  $('btn-query').onclick = () => { offset = 0; load(); };
+  $('btn-prev').onclick = () => { offset = Math.max(0, offset - PAGE); load(); };
+  $('btn-next').onclick = () => { offset += PAGE; load(); };
+  ['f-listed', 'f-shop', 'f-conflict', 'f-bg'].forEach((id) => $(id).onchange = () => { offset = 0; load(); });
+  $('f-q').onkeydown = (e) => { if (e.key === 'Enter') { offset = 0; load(); } };
+  load();
+})();
+</script>
+</body>
+</html>

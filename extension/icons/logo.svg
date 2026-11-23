@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="256" height="256">
+  <rect width="64" height="64" fill="#14161a" rx="14"/>
+  <!-- 薯条 -->
+  <rect x="20" y="12" width="6" height="20" rx="2.4" fill="#f7c948" transform="rotate(-8 23 22)"/>
+  <rect x="29" y="8"  width="6" height="24" rx="2.4" fill="#ffd75e"/>
+  <rect x="38" y="11" width="6" height="21" rx="2.4" fill="#f7c948" transform="rotate(8 41 21)"/>
+  <rect x="24" y="16" width="5" height="18" rx="2" fill="#ffdf7e" transform="rotate(-3 26 25)"/>
+  <!-- 薯条盒 -->
+  <path d="M16 32 L48 32 L43.5 54 Q43 56.5 40.5 56.5 L23.5 56.5 Q21 56.5 20.5 54 Z" fill="#e63946"/>
+  <path d="M16 32 L48 32 L46.6 37 L17.4 37 Z" fill="#c92f3c"/>
+  <!-- 增长箭头 -->
+  <path d="M32 50 L27 43.5 L30.3 43.5 L30.3 39 L33.7 39 L33.7 43.5 L37 43.5 Z" fill="#fff3d6"/>
+</svg>

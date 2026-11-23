@@ -1,23 +1,27 @@
 {
   "name": "zying-erp",
-  "version": "1.2.4",
-  "description": "智赢ERP 搞薯条：亚马逊选品/跟卖分析（采集 · 商品库 · 统一筛选 · FBA/FBM/自营利润测算 · 找货源以图搜图 · 导出Excel）— DeepSeek Harness 插件",
+  "version": "1.3.0",
+  "description": "搞薯条 · 智赢ERP：亚马逊选品/跟卖/上架一体化（多链接全流程采集 · 智赢数据源 · 多站点 BG·排名·配送·价格 · FBA/FBM 利润测算 · ifast 上架 · 多站点 BG 面板）— DeepSeek Harness 插件 + 浏览器扩展",
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
     "amazon",
+    "erp",
     "选品",
     "跟卖",
-    "erp",
+    "bg",
+    "ifast",
     "profit-calculator",
-    "product-research"
+    "product-research",
+    "extension"
   ],
-  "author": "智赢ERP <2457136010@qq.com>",
-  "license": "UNLICENSED",
+  "author": "搞薯条 · 智赢ERP",
+  "license": "MIT",
   "type": "module",
   "main": "index.js",
   "engines": {
-    "node": ">=18"
+    "node": ">=18",
+    "dsh": ">=0.2.1"
   },
   "exports": {
     ".": "./index.js",
@@ -31,8 +35,13 @@
     "!erp/data",
     "!erp/*.md",
     "!erp/data/**",
+    "extension",
+    "docs",
+    "assets",
     "cordis.patch.yml",
     "README.md",
+    "INSTALL-AGENT.md",
+    "AGENTS.md",
     "LICENSE"
   ],
   "dsh": {
@@ -42,5 +51,11 @@
     "client": {
       "platform": "web"
     }
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/REPLACE-OWNER/zying-erp.git"
+  },
+  "homepage": "https://github.com/REPLACE-OWNER/zying-erp",
+  "icon": "assets/icon.png"
 }

@@ -58,41 +58,80 @@ export function apply(ctx) {
    * （报 Failed to fetch，请求根本到不了 3088 —— 实测服务端请求日志为空）。
    * 官方插件同样用 connection.fetch.register 走同源，这里照做。
    */
-  try { ctx.inject(['connection'], (scope) => {
-    const connection = scope.get('connection');
-    if (!connection || !connection.fetch || typeof connection.fetch.register !== 'function') return;
-    scope.effect(() => connection.fetch.register({
-      path: '/api/zying-proxy',
-      methods: ['POST'],
-      requestBody: 'buffered',
-      async fetch(request) {
-        const json = (status, payload) => new Response(JSON.stringify(payload), {
-          status, headers: { 'content-type': 'application/json' },
-        });
-        if (request.method !== 'POST') return json(405, { ok: false, error: '只支持 POST' });
-        let body;
-        try { body = await request.json(); } catch (e) { return json(400, { ok: false, error: '请求体不是合法 JSON' }); }
-        const p = String((body && body.path) || '');
-        if (!p.startsWith('/api/')) return json(400, { ok: false, error: 'path 必须以 /api/ 开头' });
-        const method = String((body && body.method) || 'GET').toUpperCase();
-        try {
-          if (!(await isUp(1200))) await ensureErp().catch(() => null);
-          const opt = { method, headers: {} };
-          if (body && body.body !== undefined && body.body !== null && method !== 'GET') {
-            opt.headers['content-type'] = 'application/json';
-            opt.body = typeof body.body === 'string' ? body.body : JSON.stringify(body.body);
-          }
-          const r = await fetch(API + p, opt);
-          const t = await r.text();
-          let js = null, jsonError = null;
-          try { js = t ? JSON.parse(t) : null; } catch (e) { jsonError = String((e && e.message) || e); }
-          return json(200, { ok: r.ok, status: r.status, json: js, text: t, jsonError });
-        } catch (e) {
-          return json(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) });
+  /* ★ 2026-11-15 修 proxy-unavailable：DSH 桌面端页面在 dsh-app:// 下无法直连 127.0.0.1:3088，
+ *   必须靠 connection.fetch.register 把 /api/zying-proxy 挂到 DSH 自己的 web 服务上。
+ *   实测 0.2.1-rc.5 已支持该 API（内置插件就在用），所以这里：
+ *     ① 优先直接注册（ctx.get('connection')），成功打日志；
+ *     ② 不成功则用规范 Cordis 子插件（inject:['connection']）再注册一次；
+ *     ③ 仍不成功则退回 ctx.inject 写法。
+ *   三条路任一成功，客户端就不会再报 proxy-unavailable。 */
+  const proxyRoute = {
+    path: '/api/zying-proxy',
+    methods: ['POST'],
+    requestBody: 'buffered',
+    async fetch(request) {
+      const json = (status, payload) => new Response(JSON.stringify(payload), {
+        status, headers: { 'content-type': 'application/json' },
+      });
+      if (request.method !== 'POST') return json(405, { ok: false, error: '只支持 POST' });
+      let body;
+      try { body = await request.json(); } catch (e) { return json(400, { ok: false, error: '请求体不是合法 JSON' }); }
+      const p = String((body && body.path) || '');
+      if (!p.startsWith('/api/')) return json(400, { ok: false, error: 'path 必须以 /api/ 开头' });
+      const method = String((body && body.method) || 'GET').toUpperCase();
+      try {
+        if (!(await isUp(1200))) await ensureErp().catch(() => null);
+        const opt = { method, headers: {} };
+        if (body && body.body !== undefined && body.body !== null && method !== 'GET') {
+          opt.headers['content-type'] = 'application/json';
+          opt.body = typeof body.body === 'string' ? body.body : JSON.stringify(body.body);
         }
-      },
-    }), 'zying-erp: 同源代理 /api/zying-proxy');
-  }); } catch (e) { /* 宿主不支持 connection.fetch 时静默降级（客户端会走直连兜底） */ }
+        const r = await fetch(API + p, opt);
+        const t2 = await r.text();
+        let js = null, jsonError = null;
+        try { js = t2 ? JSON.parse(t2) : null; } catch (e) { jsonError = String((e && e.message) || e); }
+        return json(200, { ok: r.ok, status: r.status, json: js, text: t2, jsonError });
+      } catch (e) {
+        return json(200, { ok: false, error: String((e && e.message) || e).slice(0, 300) });
+      }
+    },
+  };
+  let proxyRegistered = false;
+  const regDirect = () => {
+    const c = (typeof ctx.get === 'function') ? ctx.get('connection') : null;
+    if (!c || !c.fetch || typeof c.fetch.register !== 'function') return false;
+    ctx.effect(() => c.fetch.register(proxyRoute), 'zying-erp: /api/zying-proxy');
+    console.log('[zying-erp] 同源代理已注册(direct): /api/zying-proxy');
+    return true;
+  };
+  try { proxyRegistered = regDirect(); } catch (e) { console.log('[zying-erp] 代理 direct 注册失败: ' + ((e && e.message) || e)); }
+  if (!proxyRegistered && typeof ctx.plugin === 'function') {
+    try {
+      ctx.plugin({
+        name: 'zying-proxy', inject: ['connection'],
+        apply(ctx2) {
+          ctx2.effect(() => ctx2.connection.fetch.register(proxyRoute), 'zying-erp: /api/zying-proxy');
+          console.log('[zying-erp] 同源代理已注册(child): /api/zying-proxy');
+        },
+      });
+      proxyRegistered = true;
+    } catch (e) { console.log('[zying-erp] 代理 child 注册失败: ' + ((e && e.message) || e)); }
+  }
+  if (!proxyRegistered && typeof ctx.inject === 'function') {
+    try {
+      ctx.inject(['connection'], (scope) => {
+        const c = scope.get && scope.get('connection');
+        if (!c || !c.fetch || typeof c.fetch.register !== 'function') {
+          console.log('[zying-erp] 代理未注册：当前 DSH 没有 connection.fetch.register');
+          return;
+        }
+        scope.effect(() => c.fetch.register(proxyRoute), 'zying-erp: /api/zying-proxy');
+        console.log('[zying-erp] 同源代理已注册(inject): /api/zying-proxy');
+      });
+      proxyRegistered = true;
+    } catch (e) { console.log('[zying-erp] 代理 inject 注册失败: ' + ((e && e.message) || e)); }
+  }
+  if (!proxyRegistered) console.log('[zying-erp] ⚠ 同源代理未注册：客户端会报 proxy-unavailable');
 
   // 自动拉起本地后端: 市场一键安装的用户装完插件、重启 DSH 就能直接用
   // (已在运行则什么都不做, 不会干扰手动启动的开发环境)

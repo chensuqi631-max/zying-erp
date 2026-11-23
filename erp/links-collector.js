@@ -560,7 +560,7 @@ const EXPR_READ_SHOP = `(() => {
       return off ? String(off.textContent || '').trim() : null;
     })();
     const ratingEl = el.querySelector('.a-icon-alt, [aria-label*="out of 5"]');
-    const reviewEl = el.querySelector('a[aria-label*="ratings"], .a-size-base.s-underline-text');
+    const reviewEl = el.querySelector('a[aria-label*="ratings"], a[aria-label*="Bewertungen"], a[href*="#customerReviews"], .a-size-base.s-underline-text');
     const imgEl = el.querySelector('img.s-image');
 
     const rec = {
@@ -568,7 +568,7 @@ const EXPR_READ_SHOP = `(() => {
       title: titleEl ? titleEl.textContent.trim().slice(0, 90) : null,
       price: priceTxt,
       rating: ratingEl ? (ratingEl.getAttribute('aria-label') || ratingEl.textContent || '').trim().slice(0, 30) : null,
-      reviews: reviewEl ? reviewEl.textContent.trim().slice(0, 20) : null,
+      reviews: reviewEl ? (reviewEl.getAttribute('aria-label') || reviewEl.textContent || '').trim().slice(0, 40) : null,   /* ★ 2026-11-16 计数在 aria-label（"4 ratings"），textContent 只有 "(4)" */
       image: imgEl ? imgEl.getAttribute('src') : null,
       productUrl: 'https://' + location.hostname + '/dp/' + asin,
       brand, brandLink, brandLinkIndex: brandEl ? (String(brandEl.href).match(/index=([^&]+)/) || [])[1] || null : null,

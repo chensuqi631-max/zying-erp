@@ -30,7 +30,10 @@ const SELLER = 'https://seller.zying.net/api';
 const MELI = 'https://meli.zying.net/api';
 const ERP_API = 'https://erp.zying.net/api';
 const CDP_PORT = Number(process.env.ZYING_CDP_PORT || 9222);
-const EXT_ID = 'pembniiibielncgmegepmgcbkieljieh';
+/* ★ 2026-11-15 插件 ID 会随版本变化：实测 gmnnic… 是当前在用的智赢选品插件，
+ *   旧值 pembnii… 已不存在 → bootstrap 永远读不到 token。这里改成「候选 ID 列表 + 兜底扫描」。 */
+const EXT_IDS = ['gmnnicmdgiafgenphemmdcigmdkpolabhb', 'gmnnicmdgiafgenphemmdcigkpolabhb', 'pembniiibielncgmegepmgcbkieljieh'];
+const EXT_ID = EXT_IDS[0];
 
 /* ============================ 签名器 ============================ */
 let _signer = null;
@@ -197,8 +200,14 @@ async function bootstrapFromPlugin() {
   try { await fetch('http://127.0.0.1:3088/api/collect/api-selftest').catch(() => {}); } catch (e) {}
   for (let i = 0; i < 4; i++) {
     const list = await cdpJSON('/json/list').catch(() => []);
-    const sw = (list || []).find((t) => String(t.url || '').includes(EXT_ID) && String(t.url || '').includes('background'));
-    if (sw && sw.webSocketDebuggerUrl) {
+    /* 先按候选 ID 找；找不到就把所有扩展 SW 都试一遍（ID 变了也不影响） */
+    const allSw = (list || []).filter((t) => String(t.url || '').includes('chrome-extension://') && /background/i.test(String(t.url || '')));
+    const ordered = allSw.slice().sort((a, b) => {
+      const score = (u) => (EXT_IDS.some((id) => String(u).includes(id)) ? 0 : 1);
+      return score(a.url) - score(b.url);
+    });
+    for (const sw of ordered) {
+      if (!sw.webSocketDebuggerUrl) continue;
       const t = await evalInTarget(sw.webSocketDebuggerUrl, STORAGE_EXPR);
       if (t) return saveToken(t, { source: 'plugin-sw' });
     }
@@ -477,7 +486,7 @@ async function bgCheck(aid, asin) {
  *  @param aids 店铺账号 id 数组（不传 = 当前账号下所有店铺）
  *  @returns [{aid, abbr, name, status, error, accountDisabled, ms}]
  */
-async function bgProbeMulti(asin, aids) {
+async function bgProbeMulti(asin, aids, opts) {
   const asinU = String(asin || '').toUpperCase();
   if (!/^[A-Z0-9]{10}$/.test(asinU)) throw new Error('asin 不合法');
   let list = [];
@@ -492,25 +501,35 @@ async function bgProbeMulti(asin, aids) {
   } else {
     list = await accounts();
   }
-  const out = [];
-  for (const a of list) {
-    const t0 = Date.now();
-    try {
-      const r = await bgCheck(a.id, asinU);
-      out.push({
-        aid: a.id, abbr: a.abbr || null, name: a.name || null,
-        status: r.ok ? r.status : 'ERROR',
-        error: r.ok ? null : (r.message || '检测失败'),
-        accountDisabled: !r.ok && !!r.accountDisabled,
-        usable: a.usable,
-        ms: Date.now() - t0,
-      });
-    } catch (e) {
-      out.push({ aid: a.id, abbr: a.abbr || null, name: a.name || null, status: 'ERROR', error: String((e && e.message) || e).slice(0, 160), accountDisabled: false, usable: a.usable, ms: Date.now() - t0 });
+  /* ★ 2026-11-20 改为【小并发】查多个店铺（原来串行 + 每店 250ms，6 店要 4~6 秒）
+   *   并发上限 3，单店之间留 120ms 抖动，避免触发限流；返回顺序与 list 一致。 */
+  const conc = Math.max(1, Math.min(4, Number((opts && opts.concurrency) || 3)));
+  const out = new Array(list.length);
+  let cursor = 0;
+  const worker = async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= list.length) return;
+      const a = list[i];
+      const t0 = Date.now();
+      try {
+        const r = await bgCheck(a.id, asinU);
+        out[i] = {
+          aid: a.id, abbr: a.abbr || null, name: a.name || null,
+          status: r.ok ? r.status : 'ERROR',
+          error: r.ok ? null : (r.message || '检测失败'),
+          accountDisabled: !r.ok && !!r.accountDisabled,
+          usable: a.usable,
+          ms: Date.now() - t0,
+        };
+      } catch (e) {
+        out[i] = { aid: a.id, abbr: a.abbr || null, name: a.name || null, status: 'ERROR', error: String((e && e.message) || e).slice(0, 160), accountDisabled: false, usable: a.usable, ms: Date.now() - t0 };
+      }
+      await new Promise((r) => setTimeout(r, 120));   // 防限流抖动
     }
-    await new Promise((r) => setTimeout(r, 250));   // 防限流
-  }
-  return out;
+  };
+  await Promise.all(Array.from({ length: Math.min(conc, list.length) }, worker));
+  return out.filter(Boolean);
 }
 
 /* ══════════════════════════════════════════════════════════════════

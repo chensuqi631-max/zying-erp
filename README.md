@@ -1,71 +1,82 @@
-# 智赢ERP · 搞薯条 (zying-erp)
+# 搞薯条 · 智赢ERP（zying-erp）for DeepSeek Harness
 
-亚马逊选品 / 跟卖分析工具，作为 **DeepSeek Harness (DSH) 插件**使用：装好后 DSH 界面顶部会多一个 **「搞薯条」** 页签，同时给模型注册一组采集工具（可以在对话里直接说"采集这个链接"）。
+亚马逊选品 / 跟卖 / 上架一体化工作台，DSH 插件 + 浏览器扩展双端：
 
-> ⚠️ **本软件是商业授权软件，不是开源软件**：源码未公开，使用需要授权（见下面的"授权"）。
-> 未授权时程序能装、能启动，但所有数据接口都会返回 403，并在界面/工具里显示你的设备指纹。
+- **DSH 插件**：11 个 `zying_*` 工具 + 四个界面页签（采集面板 / 商品管理 / 知产查重 / 选品归档）
+- **ERP 后端**：本机 `127.0.0.1:3088`，采集编排、商品库、BG 多站点检测、算价、ifast 上架、运费报价、授权
+- **浏览器扩展**：亚马逊商品页 🍟 面板（多站点 BG·排名·配送·价格·上架状态 / 变体算价 / ifast）+ 列表页采集条
 
----
+> 安装步骤见 **[INSTALL-AGENT.md](INSTALL-AGENT.md)**（给 AI 与人看的逐步说明）。
+> 本仓库包含**整套系统全部源码**：插件、ERP 后端、浏览器扩展、完整文档。
 
-## 安装（一条命令）
+## 截图
 
-```bash
-dsh plugin --profile web add <包名或安装标识>
+| 商品页多站点 BG / 价格 / 上架状态 | 面板内置设置（含税率） |
+|---|---|
+| ![bg](assets/screenshots/panel-bg-sites.png) | ![settings](assets/screenshots/panel-settings.png) |
+
+| 初始价逐行锁定 | ifast 上架状态 |
+|---|---|
+| ![lock](assets/screenshots/panel-price-lock.png) | ![ifast](assets/screenshots/panel-ifast.png) |
+
+## 功能一览
+
+| 模块 | 能力 |
+|---|---|
+| 采集 | 多链接（店铺/搜索/类目/榜单/商品页）、全流程采集（网页→数据源基础信息→规则过滤→全店 BG→只保留可售）、商品跟卖、批量跟卖、批量品牌、列表页直采、类目搜索 |
+| 商品库 | 统一筛选、可售状态（任意站点可售即算可售）、分店铺 BG、排名/配送/价格、导出 Excel |
+| BG | 多站点（UK/DE/FR/IT/ES/AU）按店铺检测，面板表格与商品库同步 |
+| 算价 | FBA/FBM/AMZ 利润测算、按站点税率/汇率/本币调整、逐字段锁定、低价与承受价对比 |
+| 上架 | ifast 直连（登录/站点/跟卖方案/上架/在架查询）、重复上架拦截、上架台账、回收站 |
+| 其他 | 商标查重、蓝海词、找货源以图搜图、实时运费报价、授权（设备指纹 license.key）|
+
+## 目录结构
+
+```
+.
+├── index.js                # DSH 插件入口（工具注册 + /api/zying-proxy + 自动拉起 ERP）
+├── lib/
+│   ├── client.js           # DSH 界面（4 个页签）
+│   └── erp-launcher.js     # 用 Electron 以 Node 模式启动 erp/server.js 3088
+├── erp/                    # ERP 后端（server.js 等 32 个模块）
+├── extension/              # 浏览器扩展（Edge/Chrome MV3，加载这个目录）
+├── docs/                   # 架构/设计/前端/操作/接口/数据字典/踩坑
+├── assets/screenshots/     # 市场截图
+├── INSTALL-AGENT.md        # 安装与验收（AI 可执行）
+├── package.json
+└── cordis.patch.yml
 ```
 
-装完 **完全退出 DSH 再重新启动**（插件只在启动时加载），刷新页面即可看到「搞薯条」页签。
+## 快速安装（简述）
 
-插件**自带本地后端**：DSH 启动时会自动把它拉起来（监听 `127.0.0.1:3088`），数据存放在 `~/.zying-erp/data`（不在 node_modules 里，升级插件不会丢数据）。
+```powershell
+# 1) 用插件市场安装（推荐）
+#    DSH → 插件 → 插件市场 → 搜索「搞薯条 / 智赢ERP」→ 安装
 
-也可以从 DSH 的市场界面里搜 **搞薯条** 一键安装。
+# 2) 或命令行
+dsh plugin --profile web add "https://github.com/chensuqi631-max/zying-erp/releases/download/v1.3.0/zying-erp-1.3.0.tgz"
 
----
+# 3) 重启 DSH（完全退出再打开）→ ERP 自动在 3088 启动
+Invoke-RestMethod http://127.0.0.1:3088/api/health   # ok=true
 
-## 授权（怎么开通）
+# 4) 放授权文件 license.key（向作者申请，绑定设备指纹）
+Invoke-RestMethod http://127.0.0.1:3088/api/license/status
 
-1. 装完后让 AI 调用工具 **`zying_health`**，或在浏览器打开 <http://127.0.0.1:3088/api/license/status>
-2. 把它返回的 **设备指纹**（形如 `B833D41F8D436EEF`）发给授权方
-3. 收到 `license.key` 后放到数据目录：`~/.zying-erp/data/license.key`（Windows: `C:\Users\<你>\.zying-erp\data\license.key`）
-4. 重新打开页签即可（后端每次请求都会重新读授权，无需重启）
+# 5) 登录智赢账号（面板 ⚙ → 👤 智赢账号管理，或 /api/zy/login）
 
-授权与设备绑定、可设到期日与功能位（采集 / 导出 / 图搜 / 利润测算）。
+# 6) 加载浏览器扩展：edge://extensions → 开发人员模式 → 加载解压缩 → 选 extension/
+```
 
----
-
-## 功能
-
-| 模块 | 说明 |
-|---|---|
-| 采集 | 类目搜索采集 · 批量品牌采集 · 批量跟卖店铺采集（全程驱动本机 Edge，无第三方 API） |
-| 商品管理 | 商品库、统一筛选面板（站点/类目/价格/评分/评论/FBA/A+/排名/商标数…）、导出 Excel |
-| 利润测算 | FBA / FBM / 自营三口径，各国税费自动获取，佣金按类目费率，盈亏平衡价与目标利润率价 |
-| 找货源 | 以图搜图跳转（1688 / 阿里巴巴 / Bing / Yandex …），货源记录与主备供货、比价 |
-| 工具 | 模型可调用：`zying_health` / 列表页直采 / 筛选采集 / 跟卖并行采集 / 停止 |
-
----
+完整步骤、验收命令、排错见 [INSTALL-AGENT.md](INSTALL-AGENT.md)。
 
 ## 运行要求
 
-| 依赖 | 说明 |
-|---|---|
-| DeepSeek Harness | 插件宿主 |
-| Node.js 18+ | 运行本地后端（DSH 自带的 Node 也能用；手动安装时需系统 Node） |
-| Microsoft Edge | 采集需要以 `--remote-debugging-port=9222` 启动的 Edge，并在其中登录亚马逊 |
-| 智赢采集扩展（可选） | 装上后能多采到 尺寸 / 重量 / 商标 / 月销量 |
+- Windows 10/11 x64，DeepSeek Harness 桌面端
+- 采集浏览器：Edge 以 `--remote-debugging-port=9222` 启动（headed，**不要 headless**）
+- 授权：`%USERPROFILE%\.zying-erp\data\license.key`（Ed25519，设备指纹绑定）
+- 智赢账号：面板内登录后写 token（`%USERPROFILE%\.zying-erp\data\zy-tokens.json`）
+- 数据目录：`%USERPROFILE%\.zying-erp\data`（商品库/台账/规则/回收站，备份就拷它）
 
----
+## 许可
 
-## 常见问题
-
-| 现象 | 处理 |
-|---|---|
-| 装了但界面没有页签 | **没重启 DSH**（最常见）；确认装到了你在用的 profile；`dsh --profile web --dump-config` 里能看到 `zying-collect` 才算挂上 |
-| 页签显示"本机未授权" | 正常，把卡片上的设备指纹发给授权方换 `license.key` |
-| 提示"系统未启动" | 后端没起来：看 `~/.zying-erp/data` 是否可写；手动启动：`node <插件目录>/erp/server.js 3088` |
-| 采集不动 | 检查 Edge 调试端口：浏览器打开 <http://127.0.0.1:9222/json/version> 有响应才算就绪；没有就先完全退出 Edge 再带参数启动 |
-
----
-
-## License
-
-专有软件，保留所有权利（Proprietary, All Rights Reserved）。使用需获得授权。详见 `LICENSE`。
+商业授权软件：可安装、可启动，但未获 `license.key` 时所有数据接口返回 403。授权请联系作者。

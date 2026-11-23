@@ -1,36 +1,21 @@
-专有软件许可 (Proprietary License)
-Copyright (c) 2026 智赢ERP (搞薯条). All Rights Reserved.
-版权所有，保留一切权利。
+MIT License
 
-本软件（含插件界面、本地后端程序、以及随附的文档与数据格式，以下统称"本软件"）是
-受著作权法保护的专有软件，**不是开源软件**，也不适用任何开源许可协议。
+Copyright (c) 2026 搞薯条 · 智赢ERP
 
-一、授权使用
-  1. 仅在获得著作权人签发的有效授权文件（license.key）的前提下，被授权方可以在其
-     被授权的设备上安装、运行本软件，用于自身业务。
-  2. 授权范围（设备数量、有效期、可用功能）以授权文件内的声明为准。授权文件与设备
-     绑定，不得转让、复制到未授权设备。
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-二、禁止行为（未经著作权人事先书面许可）
-  1. 复制、传播、出售、出租、转授权、分销本软件或其任何部分；
-  2. 公开发布、上传至代码托管平台或软件仓库（含 npm、GitHub、各类"插件市场"等），
-     但著作权人自行发布的官方渠道除外；
-  3. 反向工程、反编译、反汇编、去除或规避授权校验、水印、设备绑定等技术措施；
-  4. 修改、改编、制作衍生作品，或移除、隐藏本软件中的版权与授权声明；
-  5. 将本软件的全部或部分代码、数据模型、费率表用于开发同类产品或服务。
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-三、第三方组件
-  本软件可能包含或依赖第三方组件，该等组件适用其各自的许可条款。本许可不改变第三方
-  组件原有的许可条件。
-
-四、免责声明
-  本软件按"现状"提供，不附带任何明示或默示的担保。因使用或无法使用本软件而产生的
-  任何直接或间接损失，著作权人不承担责任。使用者应自行遵守亚马逊等平台的服务条款
-  与所在地区法律法规，因使用本软件产生的合规责任由使用者自负。
-
-五、终止
-  被授权方违反本许可任一条款，授权自动终止，应立即停止使用并删除本软件的全部副本。
-
-六、其他
-  本许可的订立、生效、解释与争议解决适用中华人民共和国法律。
-  如需商业授权、批量授权或定制开发，请联系著作权人。
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
