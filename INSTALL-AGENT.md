@@ -1,4 +1,4 @@
-# INSTALL-AGENT.md — 搞薯条（zying-erp）安装与验收（AI 可执行）
+# INSTALL-AGENT.md — 搞薯条ERP（zying-erp）安装与验收（AI 可执行）
 
 > 目标读者：AI Agent 或工程师。目标：在 Windows 机器上把「DSH 插件 + ERP 后端 + 浏览器扩展」装起来并通过第 7 节全部验收。
 > 本仓库是**完整源码**（插件 / ERP / 扩展 / 文档），不需要额外下载别的包。

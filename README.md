@@ -1,4 +1,4 @@
-# 搞薯条 · 智赢ERP（zying-erp）for DeepSeek Harness
+# 搞薯条ERP（zying-erp）for DeepSeek Harness
 
 亚马逊选品 / 跟卖 / 上架一体化工作台，DSH 插件 + 浏览器扩展双端：
 
@@ -51,7 +51,7 @@
 
 ```powershell
 # 1) 用插件市场安装（推荐）
-#    DSH → 插件 → 插件市场 → 搜索「搞薯条 / 智赢ERP」→ 安装
+#    DSH → 插件 → 插件市场 → 搜索「搞薯条ERP」→ 安装
 
 # 2) 或命令行
 dsh plugin --profile web add "https://github.com/chensuqi631-max/zying-erp/releases/download/v1.3.0/zying-erp-1.3.0.tgz"

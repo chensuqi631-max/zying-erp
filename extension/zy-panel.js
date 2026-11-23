@@ -277,7 +277,7 @@ try {
   /* ---------- 构建 ---------- */
   var wrap = document.createElement('div'); wrap.className = 'wrap';
   var hd = document.createElement('div'); hd.className = 'hd';
-  hd.innerHTML = '<b>🍟 搞薯条面板</b><span class="sp"></span>'
+  hd.innerHTML = '<b>🍟 搞薯条ERP</b><span class="sp"></span>'
     + '<button data-act="refresh">刷新</button>'
     + '<button data-act="settings" title="打开设置页（算价/物流/采集/上传默认值/连接）">⚙</button>'
     + '<button data-act="collapse">–</button>'
@@ -286,7 +286,7 @@ try {
   var ft = document.createElement('div'); ft.className = 'ft';
   wrap.appendChild(hd); wrap.appendChild(bd); wrap.appendChild(ft);
 root.appendChild(wrap);
-  var fab = document.createElement('div'); fab.className = 'fab'; fab.title = '搞薯条';
+  var fab = document.createElement('div'); fab.className = 'fab'; fab.title = '搞薯条ERP';
 /* ★ 2026-11-23 圆球换成项目 Logo（薯条盒 + 金色薯条 + 增长箭头） */
 fab.innerHTML = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\" width=\"100%\" height=\"100%\">\n  <circle cx=\"32\" cy=\"32\" r=\"30\" fill=\"#14161a\" stroke=\"#f2b705\" stroke-width=\"2.5\"/>\n  <rect x=\"20\" y=\"12\" width=\"6\" height=\"20\" rx=\"2.4\" fill=\"#f7c948\" transform=\"rotate(-8 23 22)\"/>\n  <rect x=\"29\" y=\"8\"  width=\"6\" height=\"24\" rx=\"2.4\" fill=\"#ffd75e\"/>\n  <rect x=\"38\" y=\"11\" width=\"6\" height=\"21\" rx=\"2.4\" fill=\"#f7c948\" transform=\"rotate(8 41 21)\"/>\n  <rect x=\"24\" y=\"16\" width=\"5\" height=\"18\" rx=\"2\" fill=\"#ffdf7e\" transform=\"rotate(-3 26 25)\"/>\n  <path d=\"M16 32 L48 32 L43.5 54 Q43 56.5 40.5 56.5 L23.5 56.5 Q21 56.5 20.5 54 Z\" fill=\"#e63946\"/>\n  <path d=\"M16 32 L48 32 L46.6 37 L17.4 37 Z\" fill=\"#c92f3c\"/>\n  <path d=\"M32 50 L27 43.5 L30.3 43.5 L30.3 39 L33.7 39 L33.7 43.5 L37 43.5 Z\" fill=\"#fff3d6\"/>\n  <path d=\"M18 24 Q20 14 30 11\" fill=\"none\" stroke=\"#ffffff\" stroke-opacity=\".18\" stroke-width=\"2\" stroke-linecap=\"round\"/>\n</svg>";
   root.appendChild(fab);

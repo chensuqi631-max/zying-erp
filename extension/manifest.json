@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "智赢采集器 v2",
-  "version": "2.11.26",
+  "name": "搞薯条ERP",
+  "version": "2.11.27",
   "description": "自研 Amazon 采集插件: 采集入库 → ERP 上架记录 → ifast 自动上架 · 多店铺隔离 · 重复上架拦截(可开关) · 已存在时用 item_edit.json 更新现有记录 · 修 ifast 请求头(X-Requested-With) · 商品面板(详情页/列表页BG)",
   "permissions": [
     "tabs",
@@ -118,5 +118,6 @@
         "<all_urls>"
       ]
     }
-  ]
+  ],
+  "short_name": "搞薯条ERP"
 }
